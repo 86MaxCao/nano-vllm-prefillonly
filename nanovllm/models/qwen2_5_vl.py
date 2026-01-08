@@ -592,16 +592,80 @@ class Qwen2_5_VisionEncoder(nn.Module):
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
-        cu_seqlens = torch.repeat_interleave(grids[:, 1] * grids[:, 2], grids[:, 0]).cumsum(dim=0, dtype=torch.int32)
+        # Calculate cu_seqlens for Flash Attention Varlen
+        # For each image, we have grids[:, 0] frames, each with grids[:, 1] * grids[:, 2] spatial tokens
+        spatial_tokens_per_frame = grids[:, 1] * grids[:, 2]  # [h * w for each image]
+        cu_seqlens = torch.repeat_interleave(spatial_tokens_per_frame, grids[:, 0]).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
+        
+        # Debug: log cu_seqlens calculation
+        if not hasattr(self, '_debug_cu_seqlens_logged'):
+            print(
+                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                f"=== CU Sequence Lengths Calculation ==="
+            )
+            print(
+                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                f"grids shape: {grids.shape}, values:\n{grids.cpu().tolist()}"
+            )
+            print(
+                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                f"spatial_tokens_per_frame: {spatial_tokens_per_frame.cpu().tolist()}"
+            )
+            print(
+                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                f"grids[:, 0] (temporal): {grids[:, 0].cpu().tolist()}"
+            )
+            print(
+                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                f"cu_seqlens (before pad): {cu_seqlens[1:].cpu().tolist()}"
+            )
+            print(
+                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                f"cu_seqlens (after pad): {cu_seqlens.cpu().tolist()}"
+            )
+            print(
+                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                f"hidden_states shape before blocks: {hidden_states.shape}"
+            )
+            self._debug_cu_seqlens_logged = True
 
         for block in self.vision.blocks:
             hidden_states = block(hidden_states, cu_seqlens, position_embeddings=position_embeddings)
 
         hidden_states = self.vision.merger(hidden_states)
+        
+        # Debug: log after merger
+        if not hasattr(self, '_debug_after_merger_logged'):
+            print(
+                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                f"hidden_states shape after merger: {hidden_states.shape}"
+            )
+            spatial_merge_size = self.config.spatial_merge_size
+            print(
+                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                f"spatial_merge_size: {spatial_merge_size}"
+            )
+            self._debug_after_merger_logged = True
 
         split_sizes = (grids.prod(-1) // (self.config.spatial_merge_size**2)).tolist()
         image_chunks = list(torch.split(hidden_states, split_sizes))
+        
+        # Debug: log split results
+        if not hasattr(self, '_debug_split_sizes_logged'):
+            print(
+                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                f"split_sizes: {split_sizes}"
+            )
+            print(
+                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                f"image_chunks lengths: {[chunk.shape[0] for chunk in image_chunks]}"
+            )
+            print(
+                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                f"Total hidden_states: {hidden_states.shape[0]}, sum of split_sizes: {sum(split_sizes)}"
+            )
+            self._debug_split_sizes_logged = True
 
         return image_chunks
 
@@ -661,12 +725,44 @@ class Qwen2_5_VisionEncoder(nn.Module):
             else:
                 flat = pixel_values
 
+            # Debug: log splitting details
+            if not hasattr(self, '_debug_vision_encoder_split_logged'):
+                print(
+                    f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
+                    f"=== Vision Encoder Flattened Input Processing ==="
+                )
+                print(
+                    f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
+                    f"pixel_values shape: {pixel_values.shape}, dim: {pixel_values.dim()}"
+                )
+                print(
+                    f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
+                    f"image_grid_thw shape: {image_grid_thw.shape}, values:\n{image_grid_thw.cpu().tolist()}"
+                )
+                print(
+                    f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
+                    f"tokens_per_image: {tokens_per_image} (total: {sum(tokens_per_image)})"
+                )
+                print(
+                    f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
+                    f"flat shape: {flat.shape} (expected: [{sum(tokens_per_image)}, {feature if pixel_values.dim() == 3 else pixel_values.shape[1]}])"
+                )
+                self._debug_vision_encoder_split_logged = True
+
             # Ensure pixel_values have the correct dtype
             proj_dtype = self.vision.patch_embed.proj.weight.dtype
             flat = flat.to(proj_dtype)
             
             splits = torch.split(flat, tokens_per_image, dim=0)
             token_list = [self._linear_patch_embed(chunk) for chunk in splits]
+            
+            # Debug: log split results
+            if not hasattr(self, '_debug_vision_encoder_splits_logged'):
+                print(
+                    f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
+                    f"Split into {len(splits)} chunks, token_list lengths: {[t.shape[0] for t in token_list]}"
+                )
+                self._debug_vision_encoder_splits_logged = True
 
             return self._run_vision_from_tokens(token_list, grids)
 
@@ -789,6 +885,8 @@ class Qwen2_5VLForConditionalGeneration(nn.Module):
         image_grid_thw: torch.Tensor | None = None,
         sequence_lengths: list[int] | None = None,
         vision_slices_per_seq: list[list[dict]] | None = None,
+        seq_image_indices: list[tuple[int, int]] | None = None,
+        seq_vision_placeholders: list[list[tuple[int, int]]] | None = None,
     ) -> torch.Tensor:
         if inputs_embeds is None:
             if input_ids is None:
@@ -852,6 +950,65 @@ class Qwen2_5VLForConditionalGeneration(nn.Module):
             if sum(sequence_lengths) != total_tokens:
                 raise ValueError("sum of sequence_lengths does not match total input tokens")
 
+            offsets = [0]
+            for length in sequence_lengths:
+                offsets.append(offsets[-1] + length)
+
+            # Debug: log inputs before vision encoder
+            if not hasattr(self, '_debug_qwen2_5vl_fallback_start_logged'):
+                print(
+                    f"[DEBUG qwen2.5vl.forward (fallback)] "
+                    f"=== Fallback Path Inputs ==="
+                )
+                print(
+                    f"[DEBUG qwen2.5vl.forward (fallback)] "
+                    f"pixel_values shape: {pixel_values.shape}, dtype: {pixel_values.dtype}, "
+                    f"device: {pixel_values.device}"
+                )
+                print(
+                    f"[DEBUG qwen2.5vl.forward (fallback)] "
+                    f"image_grid_thw shape: {image_grid_thw.shape if image_grid_thw is not None else None}, "
+                    f"dtype: {image_grid_thw.dtype if image_grid_thw is not None else None}"
+                )
+                if image_grid_thw is not None:
+                    if image_grid_thw.dim() == 2:
+                        print(
+                            f"[DEBUG qwen2.5vl.forward (fallback)] "
+                            f"image_grid_thw values:\n{image_grid_thw.cpu().tolist()}"
+                        )
+                    else:
+                        print(
+                            f"[DEBUG qwen2.5vl.forward (fallback)] "
+                            f"image_grid_thw values: {image_grid_thw.cpu().tolist()}"
+                        )
+                print(
+                    f"[DEBUG qwen2.5vl.forward (fallback)] "
+                    f"sequence_lengths: {sequence_lengths}, total_tokens: {total_tokens}, offsets: {offsets}"
+                )
+                if seq_image_indices:
+                    print(
+                        f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        f"seq_image_indices: {seq_image_indices}"
+                    )
+                if seq_vision_placeholders:
+                    print(
+                        f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        f"seq_vision_placeholders: {seq_vision_placeholders}"
+                    )
+                print(
+                    f"[DEBUG qwen2.5vl.forward (fallback)] "
+                    f"inputs_embeds shape: {inputs_embeds.shape}, dtype: {inputs_embeds.dtype}, "
+                    f"device: {inputs_embeds.device}"
+                )
+                # Log first few values of inputs_embeds before vision replacement
+                if inputs_embeds.numel() > 0:
+                    print(
+                        f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        f"inputs_embeds[0:5, 0:3] (first 5 tokens, first 3 dims):\n"
+                        f"{inputs_embeds[0:5, 0:3].cpu().tolist()}"
+                    )
+                self._debug_qwen2_5vl_fallback_start_logged = True
+
             # Get image embeddings from vision encoder
             image_tokens = self.visual(pixel_values, image_grid_thw)
             # image_tokens can be either:
@@ -861,110 +1018,331 @@ class Qwen2_5VLForConditionalGeneration(nn.Module):
             # Convert to list format for easier processing
             if isinstance(image_tokens, list):
                 image_embeddings = image_tokens
+                if not hasattr(self, '_debug_qwen2_5vl_image_tokens_logged'):
+                    print(
+                        f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        f"=== Vision Encoder Output ==="
+                    )
+                    print(
+                        f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        f"vision encoder returned list of {len(image_embeddings)} tensors"
+                    )
+                    for i, emb in enumerate(image_embeddings):
+                        print(
+                            f"[DEBUG qwen2.5vl.forward (fallback)] "
+                            f"Image {i}: shape={emb.shape}, dtype={emb.dtype}, "
+                            f"device={emb.device}, "
+                            f"mean={emb.mean().item():.6f}, std={emb.std().item():.6f}, "
+                            f"min={emb.min().item():.6f}, max={emb.max().item():.6f}"
+                        )
+                        if i < 3:  # Print first few values for first 3 images
+                            print(
+                                f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                f"Image {i} embedding[0, 0:5] (first token, first 5 dims):\n"
+                                f"{emb[0, 0:5].cpu().tolist()}"
+                            )
+                    self._debug_qwen2_5vl_image_tokens_logged = True
             else:
                 # Split tensor into list of per-image embeddings
                 num_images = image_tokens.shape[0]
                 image_embeddings = [image_tokens[i] for i in range(num_images)]
+                if not hasattr(self, '_debug_qwen2_5vl_image_tokens_logged'):
+                    print(
+                        f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        f"=== Vision Encoder Output ==="
+                    )
+                    print(
+                        f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        f"vision encoder returned tensor shape {image_tokens.shape}, "
+                        f"split into {len(image_embeddings)} embeddings"
+                    )
+                    for i, emb in enumerate(image_embeddings):
+                        print(
+                            f"[DEBUG qwen2.5vl.forward (fallback)] "
+                            f"Image {i}: shape={emb.shape}, dtype={emb.dtype}, "
+                            f"device={emb.device}, "
+                            f"mean={emb.mean().item():.6f}, std={emb.std().item():.6f}"
+                        )
+                        if i < 3:  # Print first few values for first 3 images
+                            print(
+                                f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                f"Image {i} embedding[0, 0:5] (first token, first 5 dims):\n"
+                                f"{emb[0, 0:5].cpu().tolist()}"
+                            )
+                    self._debug_qwen2_5vl_image_tokens_logged = True
             
-            # Get token IDs from config
-            vision_start_token_id = getattr(self.config, "vision_start_token_id", None)
-            image_token_id = getattr(self.config, "image_token_id", None)
-            vision_end_token_id = getattr(self.config, "vision_end_token_id", None)
-            
-            if vision_start_token_id is None or image_token_id is None or vision_end_token_id is None:
-                raise ValueError(
-                    "vision_start_token_id, image_token_id, and vision_end_token_id must be in config. "
-                    "Please check your model configuration."
-                )
-            
-            # Flatten input_ids if it's in batch format
-            if input_ids.dim() == 2:
-                input_ids_flat = input_ids.view(-1)
-            else:
-                input_ids_flat = input_ids
-            
-            # In Qwen2.5-VL, the placeholder format in input_ids is:
-            # <|vision_start|><|image_pad|>...<|image_pad|><|vision_end|>
-            # where the number of <|image_pad|> tokens equals num_tokens per image.
-            # However, vLLM's processor may have already expanded the placeholder
-            # to multiple image_token_id tokens. So we need to find consecutive
-            # sequences of image_token_id tokens.
-            input_ids_flat_cpu = input_ids_flat.cpu()
-            
-            # Find all image_token_id positions
-            is_image_token = input_ids_flat_cpu == image_token_id
-            image_token_positions = torch.nonzero(is_image_token, as_tuple=False).squeeze(1)
-            
-            if len(image_token_positions) == 0:
-                raise ValueError("No image token placeholders found in input_ids")
-            
-            # Group consecutive image_token_id positions into sequences
-            # Each sequence represents one image placeholder
-            image_placeholder_ranges = []
-            if len(image_token_positions) > 0:
-                start_idx = image_token_positions[0].item()
-                current_seq_start = start_idx
-                
-                for i in range(1, len(image_token_positions)):
-                    current_pos = image_token_positions[i].item()
-                    prev_pos = image_token_positions[i-1].item()
-                    
-                    if current_pos != prev_pos + 1:
-                        # Gap found, end current sequence
-                        seq_length = prev_pos - current_seq_start + 1
-                        image_placeholder_ranges.append((current_seq_start, seq_length))
-                        current_seq_start = current_pos
-                
-                # Add the last sequence
-                last_pos = image_token_positions[-1].item()
-                seq_length = last_pos - current_seq_start + 1
-                image_placeholder_ranges.append((current_seq_start, seq_length))
-            
-            num_placeholders = len(image_placeholder_ranges)
-            num_images = len(image_embeddings)
-            
-            if num_placeholders != num_images:
-                raise ValueError(
-                    f"Number of image placeholders ({num_placeholders}) does not match "
-                    f"number of images ({num_images}). Please check input_ids and image inputs."
-                )
-            
-            # Verify that each placeholder range matches the corresponding image embedding size
-            # Insert image embeddings at placeholder positions
             total_replaced = 0
-            for (placeholder_start, placeholder_length), image_emb in zip(
-                image_placeholder_ranges, image_embeddings
-            ):
-                num_tokens = image_emb.shape[0]
-                
-                if placeholder_length != num_tokens:
+            
+            # For multi-sequence scenarios, we MUST use seq_image_indices and seq_vision_placeholders
+            # The original fallback logic (scanning flattened input_ids) is incorrect for multi-sequence
+            # because it doesn't account for sequence boundaries in the flattened input_ids.
+            if seq_image_indices and len(seq_image_indices) == len(sequence_lengths):
+                if not hasattr(self, '_debug_qwen2_5vl_mapping_logged'):
+                    print(
+                        f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        f"Using seq_image_indices mapping for {len(sequence_lengths)} sequences"
+                    )
+                    self._debug_qwen2_5vl_mapping_logged = True
+                # Use seq_image_indices to correctly map images to sequences
+                for seq_idx, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+                    seq_length = end - start
+                    if seq_length <= 0:
+                        continue
+                    
+                    # Get image index range for this sequence
+                    img_start_idx, img_end_idx = seq_image_indices[seq_idx]
+                    
+                    # Collect all image embeddings for this sequence
+                    seq_image_embeds = image_embeddings[img_start_idx:img_end_idx]
+                    
+                    if not seq_image_embeds:
+                        continue
+                    
+                    # Concatenate all image embeddings for this sequence
+                    seq_vision_tokens = torch.cat([
+                        emb.to(inputs_embeds.device, inputs_embeds.dtype)
+                        for emb in seq_image_embeds
+                    ], dim=0)
+                    
+                    slice_len = seq_vision_tokens.size(0)
+                    if slice_len > seq_length:
+                        raise ValueError(
+                            f"Visual tokens ({slice_len}) exceed sequence length ({seq_length}) "
+                            f"for sequence {seq_idx}"
+                        )
+                    
+                    # Use vision_placeholders to get correct target_offset (like normal path)
+                    if seq_vision_placeholders and seq_idx < len(seq_vision_placeholders):
+                        placeholders = seq_vision_placeholders[seq_idx]
+                        if placeholders:
+                            # Use the first placeholder's offset (typically there's only one)
+                            if len(placeholders) == 1:
+                                target_offset, expected_length = placeholders[0]
+                                if expected_length != slice_len:
+                                    # Warn about mismatch
+                                    if not hasattr(self, f'_debug_length_mismatch_{seq_idx}_logged'):
+                                        print(
+                                            f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                            f"WARNING: Sequence {seq_idx} expected_length ({expected_length}) "
+                                            f"!= actual slice_len ({slice_len}), using actual length"
+                                        )
+                                        setattr(self, f'_debug_length_mismatch_{seq_idx}_logged', True)
+                                
+                                target_start = start + target_offset
+                                target_end = target_start + slice_len
+                                if target_end > end:
+                                    raise ValueError(
+                                        f"Visual token target range [{target_start}, {target_end}) "
+                                        f"is out of sequence bounds [{start}, {end})"
+                                    )
+                                
+                                if not hasattr(self, f'_debug_placement_{seq_idx}_logged'):
+                                    print(
+                                        f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                        f"=== Sequence {seq_idx} Vision Token Placement ==="
+                                    )
+                                    print(
+                                        f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                        f"Sequence {seq_idx}: placing {slice_len} vision tokens "
+                                        f"at offset {target_offset} (absolute position {target_start}:{target_end}), "
+                                        f"images [{img_start_idx}:{img_end_idx}]"
+                                    )
+                                    print(
+                                        f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                        f"Sequence {seq_idx}: seq_vision_tokens shape={seq_vision_tokens.shape}, "
+                                        f"dtype={seq_vision_tokens.dtype}, device={seq_vision_tokens.device}"
+                                    )
+                                    print(
+                                        f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                        f"Sequence {seq_idx}: seq_vision_tokens[0, 0:5] (first token, first 5 dims):\n"
+                                        f"{seq_vision_tokens[0, 0:5].cpu().tolist()}"
+                                    )
+                                    # Log inputs_embeds before replacement
+                                    print(
+                                        f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                        f"Sequence {seq_idx}: inputs_embeds[{target_start}:{target_start+3}, 0:3] "
+                                        f"BEFORE replacement:\n"
+                                        f"{inputs_embeds[target_start:target_start+3, 0:3].cpu().tolist()}"
+                                    )
+                                    setattr(self, f'_debug_placement_{seq_idx}_logged', True)
+                                
+                                inputs_embeds[target_start:target_end] = seq_vision_tokens
+                                visual_pos_mask[target_start:target_end] = True
+                                total_replaced += slice_len
+                                
+                                # Log inputs_embeds after replacement (only for first sequence)
+                                if seq_idx == 0 and not hasattr(self, f'_debug_after_replacement_{seq_idx}_logged'):
+                                    print(
+                                        f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                        f"Sequence {seq_idx}: inputs_embeds[{target_start}:{target_start+3}, 0:3] "
+                                        f"AFTER replacement:\n"
+                                        f"{inputs_embeds[target_start:target_start+3, 0:3].cpu().tolist()}"
+                                    )
+                                    setattr(self, f'_debug_after_replacement_{seq_idx}_logged', True)
+                            else:
+                                # Multiple placeholders - use first one
+                                target_offset, expected_length = placeholders[0]
+                                target_start = start + target_offset
+                                target_end = target_start + slice_len
+                                if target_end > end:
+                                    raise ValueError(
+                                        f"Visual token target range [{target_start}, {target_end}) "
+                                        f"is out of sequence bounds [{start}, {end})"
+                                    )
+                                inputs_embeds[target_start:target_end] = seq_vision_tokens
+                                visual_pos_mask[target_start:target_end] = True
+                                total_replaced += slice_len
+                        else:
+                            # No placeholders for this sequence - fallback to beginning
+                            inputs_embeds[start : start + slice_len] = seq_vision_tokens
+                            visual_pos_mask[start : start + slice_len] = True
+                            total_replaced += slice_len
+                    else:
+                        # No seq_vision_placeholders provided - fallback to beginning
+                        inputs_embeds[start : start + slice_len] = seq_vision_tokens
+                        visual_pos_mask[start : start + slice_len] = True
+                        total_replaced += slice_len
+            else:
+                # Fallback: original logic (only works correctly for single sequence)
+                # For multi-sequence scenarios, this logic is INCORRECT because it scans
+                # flattened input_ids without considering sequence boundaries.
+                # In prefill-only mode, we should always have seq_image_indices and seq_vision_placeholders.
+                if len(sequence_lengths) > 1:
                     raise ValueError(
-                        f"Placeholder length ({placeholder_length}) does not match "
-                        f"image embedding size ({num_tokens}) at position {placeholder_start}"
+                        f"Multi-sequence scenario detected ({len(sequence_lengths)} sequences) "
+                        f"but seq_image_indices not provided. The fallback logic using flattened "
+                        f"input_ids scanning is incorrect for multi-sequence scenarios. "
+                        f"Please ensure seq_image_indices and seq_vision_placeholders are provided."
                     )
                 
-                if placeholder_start + num_tokens > total_tokens:
+                # Get token IDs from config
+                vision_start_token_id = getattr(self.config, "vision_start_token_id", None)
+                image_token_id = getattr(self.config, "image_token_id", None)
+                vision_end_token_id = getattr(self.config, "vision_end_token_id", None)
+                
+                if vision_start_token_id is None or image_token_id is None or vision_end_token_id is None:
                     raise ValueError(
-                        f"Image tokens exceed sequence length: position {placeholder_start} + "
-                        f"tokens {num_tokens} > total {total_tokens}"
+                        "vision_start_token_id, image_token_id, and vision_end_token_id must be in config. "
+                        "Please check your model configuration."
                     )
                 
-                # Insert image embedding
-                image_emb = image_emb.to(inputs_embeds.device, inputs_embeds.dtype)
-                # Debug: check dimensions
-                if image_emb.shape[1] != inputs_embeds.shape[1]:
+                # Flatten input_ids if it's in batch format
+                if input_ids.dim() == 2:
+                    input_ids_flat = input_ids.view(-1)
+                else:
+                    input_ids_flat = input_ids
+                
+                # In Qwen2.5-VL, the placeholder format in input_ids is:
+                # <|vision_start|><|image_pad|>...<|image_pad|><|vision_end|>
+                # where the number of <|image_pad|> tokens equals num_tokens per image.
+                # However, vLLM's processor may have already expanded the placeholder
+                # to multiple image_token_id tokens. So we need to find consecutive
+                # sequences of image_token_id tokens.
+                input_ids_flat_cpu = input_ids_flat.cpu()
+                
+                # Find all image_token_id positions
+                is_image_token = input_ids_flat_cpu == image_token_id
+                image_token_positions = torch.nonzero(is_image_token, as_tuple=False).squeeze(1)
+                
+                if len(image_token_positions) == 0:
+                    raise ValueError("No image token placeholders found in input_ids")
+                
+                # Group consecutive image_token_id positions into sequences
+                # Each sequence represents one image placeholder
+                image_placeholder_ranges = []
+                if len(image_token_positions) > 0:
+                    start_idx = image_token_positions[0].item()
+                    current_seq_start = start_idx
+                    
+                    for i in range(1, len(image_token_positions)):
+                        current_pos = image_token_positions[i].item()
+                        prev_pos = image_token_positions[i-1].item()
+                        
+                        if current_pos != prev_pos + 1:
+                            # Gap found, end current sequence
+                            seq_length = prev_pos - current_seq_start + 1
+                            image_placeholder_ranges.append((current_seq_start, seq_length))
+                            current_seq_start = current_pos
+                    
+                    # Add the last sequence
+                    last_pos = image_token_positions[-1].item()
+                    seq_length = last_pos - current_seq_start + 1
+                    image_placeholder_ranges.append((current_seq_start, seq_length))
+                
+                num_placeholders = len(image_placeholder_ranges)
+                num_images = len(image_embeddings)
+                
+                if num_placeholders != num_images:
                     raise ValueError(
-                        f"Image embedding dimension mismatch: image_emb.shape={image_emb.shape}, "
-                        f"inputs_embeds.shape={inputs_embeds.shape} at position {placeholder_start}"
+                        f"Number of image placeholders ({num_placeholders}) does not match "
+                        f"number of images ({num_images}). Please check input_ids and image inputs."
                     )
-                inputs_embeds[placeholder_start : placeholder_start + num_tokens] = image_emb
-                visual_pos_mask[placeholder_start : placeholder_start + num_tokens] = True
-                total_replaced += num_tokens
+                
+                # Verify that each placeholder range matches the corresponding image embedding size
+                # Insert image embeddings at placeholder positions
+                for (placeholder_start, placeholder_length), image_emb in zip(
+                    image_placeholder_ranges, image_embeddings
+                ):
+                    num_tokens = image_emb.shape[0]
+                    
+                    if placeholder_length != num_tokens:
+                        raise ValueError(
+                            f"Placeholder length ({placeholder_length}) does not match "
+                            f"image embedding size ({num_tokens}) at position {placeholder_start}"
+                        )
+                    
+                    if placeholder_start + num_tokens > total_tokens:
+                        raise ValueError(
+                            f"Image tokens exceed sequence length: position {placeholder_start} + "
+                            f"tokens {num_tokens} > total {total_tokens}"
+                        )
+                    
+                    # Insert image embedding
+                    image_emb = image_emb.to(inputs_embeds.device, inputs_embeds.dtype)
+                    # Debug: check dimensions
+                    if image_emb.shape[1] != inputs_embeds.shape[1]:
+                        raise ValueError(
+                            f"Image embedding dimension mismatch: image_emb.shape={image_emb.shape}, "
+                            f"inputs_embeds.shape={inputs_embeds.shape} at position {placeholder_start}"
+                        )
+                    inputs_embeds[placeholder_start : placeholder_start + num_tokens] = image_emb
+                    visual_pos_mask[placeholder_start : placeholder_start + num_tokens] = True
+                    total_replaced += num_tokens
 
             vision_token_count = total_replaced
 
         if vision_token_count == 0:
             visual_pos_mask = None
+
+        # Debug: log final state before language model
+        if not hasattr(self, '_debug_qwen2_5vl_before_lm_logged'):
+            print(
+                f"[DEBUG qwen2.5vl.forward (fallback)] "
+                f"=== Before Language Model ==="
+            )
+            print(
+                f"[DEBUG qwen2.5vl.forward (fallback)] "
+                f"vision_token_count: {vision_token_count}, "
+                f"visual_pos_mask is not None: {visual_pos_mask is not None}"
+            )
+            if visual_pos_mask is not None:
+                visual_token_indices = torch.nonzero(visual_pos_mask, as_tuple=False).squeeze(1)
+                print(
+                    f"[DEBUG qwen2.5vl.forward (fallback)] "
+                    f"visual_pos_mask: {visual_pos_mask.sum().item()} True values out of {len(visual_pos_mask)}"
+                )
+                if len(visual_token_indices) > 0:
+                    print(
+                        f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        f"First 10 visual token positions: {visual_token_indices[:10].cpu().tolist()}"
+                    )
+            print(
+                f"[DEBUG qwen2.5vl.forward (fallback)] "
+                f"inputs_embeds shape: {inputs_embeds.shape}, "
+                f"inputs_embeds[0:5, 0:3] (first 5 tokens, first 3 dims):\n"
+                f"{inputs_embeds[0:5, 0:3].cpu().tolist()}"
+            )
+            self._debug_qwen2_5vl_before_lm_logged = True
 
         if positions is None:
             positions = torch.arange(

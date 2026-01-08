@@ -64,8 +64,9 @@ class GemmaReranker(GemmaForCausalLM):
             hidden_states: Hidden states from forward pass, shape [batch_size, seq_len, hidden_size]
             token_indices: Indices of tokens to extract scores from (within each sequence).
                           Shape: [batch_size] with values in [0, seq_len-1]
-                          If None, uses last token for each sequence.
-            attention_mask: Attention mask (unused, kept for API compatibility).
+                          If None, uses last non-padding token for each sequence.
+            attention_mask: Attention mask, shape [batch_size, seq_len]. If provided, uses it
+                          to find the last non-padding token for each sequence.
             
         Returns:
             scores: Reranking scores, shape [batch_size]
@@ -73,12 +74,22 @@ class GemmaReranker(GemmaForCausalLM):
         batch_size, seq_len, hidden_size = hidden_states.shape
         
         if token_indices is None:
-            # Use last token for each sequence
-            token_indices = torch.full(
-                (batch_size,), seq_len - 1,
-                dtype=torch.int64,
-                device=hidden_states.device,
-            )
+            # Use the actual last token position for each sequence (not padding position)
+            # Transformers uses logits[:, -1, :], but for padded sequences, we need to use
+            # the actual last token position (seq_len_actual - 1) instead of seq_len - 1
+            # to avoid getting padding positions (which are zeros in our implementation)
+            if attention_mask is not None:
+                # Calculate actual sequence lengths from attention_mask
+                seq_lens_actual = attention_mask.sum(dim=1)  # [batch_size]
+                # Use actual last token position for each sequence
+                token_indices = (seq_lens_actual - 1).to(torch.int64)
+            else:
+                # If no attention_mask, assume all sequences have the same length
+                token_indices = torch.full(
+                    (batch_size,), seq_len - 1,
+                    dtype=torch.int64,
+                    device=hidden_states.device,
+                )
         
         # Extract hidden states at specified positions
         batch_indices = torch.arange(batch_size, device=hidden_states.device)

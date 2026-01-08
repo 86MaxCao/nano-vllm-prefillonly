@@ -1,4 +1,5 @@
 import pickle
+import random
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -138,9 +139,14 @@ class ModelRunner:
 
         # Check if process group is already initialized
         if not dist.is_initialized():
+            # Always initialize process group (even for world_size=1) because
+            # code components like VocabParallelEmbedding call dist.get_rank()
+            # Use random port to avoid port conflicts when testing multiple models
+            # Port range: 10000-65535 (avoiding well-known ports)
+            port = random.randint(10000, 65535)
             dist.init_process_group(
                 "nccl",
-                "tcp://localhost:2333",
+                f"tcp://localhost:{port}",
                 world_size=self.world_size,
                 rank=rank,
             )
@@ -152,7 +158,7 @@ class ModelRunner:
                     f"Process group already initialized with "
                     f"world_size={current_world_size}, but config requires "
                     f"world_size={self.world_size}"
-        )
+                )
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch_dtype = getattr(hf_config, "torch_dtype", None)
@@ -198,6 +204,37 @@ class ModelRunner:
         )
         multimodal_model_type = getattr(config, "multimodal_model_type", "qwen3_vl")
         
+        # Determine target dtype for embedding/reranker models (before model creation)
+        # This ensures load_model loads weights directly in the target dtype
+        target_dtype = None
+        if self.is_embedding or self.is_reranker:
+            torch_dtype = getattr(hf_config, "torch_dtype", None)
+            if torch_dtype is None and hasattr(hf_config, "text_config"):
+                torch_dtype = getattr(hf_config.text_config, "torch_dtype", None)
+            
+            # Convert string dtype to torch.dtype if needed
+            if isinstance(torch_dtype, str):
+                if torch_dtype == "float16":
+                    torch_dtype = torch.float16
+                elif torch_dtype == "bfloat16":
+                    torch_dtype = torch.bfloat16
+                elif torch_dtype == "float32":
+                    torch_dtype = torch.float32
+                else:
+                    torch_dtype = None
+            
+            # If original dtype is float32 or None, use float16 for FlashAttention
+            if torch_dtype == torch.float32 or torch_dtype is None:
+                target_dtype = torch.float16
+            elif torch_dtype in (torch.float16, torch.bfloat16):
+                target_dtype = torch_dtype
+            else:
+                target_dtype = torch.float16  # Default to float16
+            
+            # Update default dtype to target_dtype for embedding/reranker models
+            # This ensures model parameters are created with the correct dtype
+            torch.set_default_dtype(target_dtype)
+        
         if self.is_embedding and embedding_type:
             # Load embedding models
             if embedding_type == "gemma2" and GEMMA2_AVAILABLE:
@@ -211,6 +248,9 @@ class ModelRunner:
                     pooling_type=pooling_type,
                     normalize=normalize_embeddings,
                 )
+                # Convert to target dtype before loading weights
+                if target_dtype is not None:
+                    self.model = self.model.to(target_dtype)
                 load_model(self.model, config.model)
             elif embedding_type == "qwen3" and QWEN3_EMBEDDING_AVAILABLE:
                 text_config = getattr(hf_config, "text_config", hf_config)
@@ -221,6 +261,9 @@ class ModelRunner:
                     pooling_type=pooling_type,
                     normalize=normalize_embeddings,
                 )
+                # Convert to target dtype before loading weights
+                if target_dtype is not None:
+                    self.model = self.model.to(target_dtype)
                 load_model(self.model, config.model)
             elif embedding_type == "llavanext" and LLAVANEXT_EMBEDDING_AVAILABLE:
                 self.model = LLaVANextEmbedding(
@@ -228,6 +271,9 @@ class ModelRunner:
                     pooling_type=pooling_type,
                     normalize=normalize_embeddings,
                 )
+                # Convert to target dtype before loading weights
+                if target_dtype is not None:
+                    self.model = self.model.to(target_dtype)
                 load_model(self.model, config.model)
             elif embedding_type == "qwen2_vl_gme" and QWEN2VL_GME_AVAILABLE:
                 from transformers import AutoConfig
@@ -237,6 +283,9 @@ class ModelRunner:
                     pooling_type=pooling_type,
                     normalize=normalize_embeddings,
                 )
+                # Convert to target dtype before loading weights
+                if target_dtype is not None:
+                    self.model = self.model.to(target_dtype)
                 load_model(self.model, config.model)
             elif embedding_type == "jina_v4" and JINA_V4_AVAILABLE:
                 from transformers import AutoConfig
@@ -247,6 +296,9 @@ class ModelRunner:
                     pooling_type=pooling_type,
                     normalize=normalize_embeddings,
                 )
+                # Convert to target dtype before loading weights
+                if target_dtype is not None:
+                    self.model = self.model.to(target_dtype)
                 load_model(self.model, config.model)
             else:
                 raise ValueError(f"Unsupported embedding type: {embedding_type}")
@@ -261,6 +313,9 @@ class ModelRunner:
                     is_original_reranker=is_original,
                     classifier_from_token=classifier_tokens,
                 )
+                # Convert to target dtype before loading weights
+                if target_dtype is not None:
+                    self.model = self.model.to(target_dtype)
                 load_model(self.model, config.model)
                 
                 # Convert original reranker weights if needed
@@ -274,6 +329,9 @@ class ModelRunner:
                     is_original_reranker=is_original,
                     classifier_from_token=classifier_tokens or ["Yes"],
                 )
+                # Convert to target dtype before loading weights
+                if target_dtype is not None:
+                    self.model = self.model.to(target_dtype)
                 load_model(self.model, config.model)
                 
                 # Convert original reranker weights if needed
@@ -289,11 +347,17 @@ class ModelRunner:
                     projector_dim=projector_dim,
                     use_flex_attention=use_flex_attention,
                 )
+                # Convert to target dtype before loading weights
+                if target_dtype is not None:
+                    self.model = self.model.to(target_dtype)
                 load_model(self.model, config.model)
             elif reranker_type == "jina_m0" and JINA_M0_AVAILABLE:
                 from transformers import AutoConfig
                 jina_m0_config = AutoConfig.from_pretrained(config.model, trust_remote_code=True)
                 self.model = JinaRerankerM0(jina_m0_config)
+                # Convert to target dtype before loading weights
+                if target_dtype is not None:
+                    self.model = self.model.to(target_dtype)
                 load_model(self.model, config.model)
             else:
                 raise ValueError(f"Unsupported reranker type: {reranker_type}")
@@ -329,13 +393,15 @@ class ModelRunner:
         self.model_dtype = embed_module.embed_tokens.weight.dtype
         self.sampler = Sampler()
         
-        # Ensure model dtype is correct for FlashAttention compatibility
-        # Check and convert model dtype if needed (for embedding/reranker models)
+        # Model dtype should already be correct (converted before load_model)
+        # But verify for safety (for embedding/reranker models)
         if self.is_embedding or self.is_reranker:
             model_dtype = next(self.model.parameters()).dtype
             if model_dtype == torch.float32:
-                print(f"[WARNING] Model dtype is {model_dtype}, converting to float16 for FlashAttention compatibility")
+                print(f"[WARNING] Model dtype is still {model_dtype} after loading, converting to float16 for FlashAttention compatibility")
                 self.model = self.model.to(torch.float16)
+                # Explicitly clear cache to free the float32 model memory
+                torch.cuda.empty_cache()
         
         self.warmup_model()
         self.allocate_kv_cache()
@@ -654,6 +720,34 @@ class ModelRunner:
                 print(f"[DEBUG prepare_prefill] max_seqlen_q: {max_seqlen_q}, max_seqlen_k: {max_seqlen_k}")
                 print(f"[DEBUG prepare_prefill] input_ids length: {len(input_ids)}")
                 print(f"[DEBUG prepare_prefill] slot_mapping length: {len(slot_mapping)}")
+                # Check input_ids at key positions (last tokens)
+                if len(input_ids) > 515:
+                    print(f"[DEBUG prepare_prefill] input_ids[514]: {input_ids[514]}")
+                    print(f"[DEBUG prepare_prefill] input_ids[515]: {input_ids[515]} (first seq last)")
+                    if len(input_ids) > 516:
+                        print(f"[DEBUG prepare_prefill] input_ids[516]: {input_ids[516]} (second seq start)")
+                if len(input_ids) > 941:
+                    print(f"[DEBUG prepare_prefill] input_ids[940]: {input_ids[940]}")
+                    print(f"[DEBUG prepare_prefill] input_ids[941]: {input_ids[941]} (second seq last)")
+                    if len(input_ids) > 942:
+                        print(f"[DEBUG prepare_prefill] input_ids[942]: {input_ids[942]} (third seq start)")
+                if len(input_ids) > 3914:
+                    print(f"[DEBUG prepare_prefill] input_ids[3913]: {input_ids[3913]}")
+                    print(f"[DEBUG prepare_prefill] input_ids[3914]: {input_ids[3914]} (last seq last)")
+                # Check if we have image_token_id to compare
+                if hasattr(self.config, 'hf_config') and hasattr(self.config.hf_config, 'image_token_id'):
+                    image_token_id = self.config.hf_config.image_token_id
+                    print(f"[DEBUG prepare_prefill] image_token_id: {image_token_id}")
+                    # Count image tokens in input_ids
+                    image_token_count = sum(1 for tid in input_ids if tid == image_token_id)
+                    print(f"[DEBUG prepare_prefill] image_token_count in input_ids: {image_token_count}")
+                    # Check if last token positions are image tokens
+                    if len(input_ids) > 515:
+                        is_img_515 = input_ids[515] == image_token_id
+                        print(f"[DEBUG prepare_prefill] input_ids[515] is image_token: {is_img_515}")
+                    if len(input_ids) > 941:
+                        is_img_941 = input_ids[941] == image_token_id
+                        print(f"[DEBUG prepare_prefill] input_ids[941] is image_token: {is_img_941}")
             self._debug_prepare_prefill_logged = True
         
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
@@ -1306,6 +1400,8 @@ class ModelRunner:
                 print(f"[WARNING] Model dtype is {model_dtype}, converting to float16 for FlashAttention compatibility")
                 self.model = self.model.to(torch.float16)
                 model_dtype = torch.float16
+                # Explicitly clear cache to free the float32 model memory
+                torch.cuda.empty_cache()
             else:
                 raise ValueError(
                     f"Model dtype {model_dtype} is not supported by FlashAttention. "
@@ -1562,6 +1658,8 @@ class ModelRunner:
                 print(f"[WARNING] Model dtype is {model_dtype}, converting to float16 for FlashAttention compatibility")
                 self.model = self.model.to(torch.float16)
                 model_dtype = torch.float16
+                # Explicitly clear cache to free the float32 model memory
+                torch.cuda.empty_cache()
             else:
                 raise ValueError(
                     f"Model dtype {model_dtype} is not supported by FlashAttention. "
@@ -2075,6 +2173,31 @@ class ModelRunner:
                         f"CPU vision cache ~{vision_mem_mb:.2f} MB"
                     )
         if self.rank == 0:
+            # Debug logits information
+            if not hasattr(self, '_debug_logits_info_logged'):
+                print(f"\n[DEBUG model_runner.run] Logits information:")
+                print(f"  logits shape: {logits.shape}")
+                print(f"  logits dtype: {logits.dtype}")
+                print(f"  logits device: {logits.device}")
+                print(f"  temperatures shape: {temperatures.shape}")
+                print(f"  temperatures dtype: {temperatures.dtype}")
+                if logits.numel() > 0:
+                    print(f"  logits min/max: {logits.min().item():.4f} / {logits.max().item():.4f}")
+                    print(f"  logits mean: {logits.mean().item():.4f}")
+                    print(f"  logits has NaN: {torch.isnan(logits).any().item()}")
+                    print(f"  logits has Inf: {torch.isinf(logits).any().item()}")
+                    print(f"  logits all zeros: {(logits == 0).all().item()}")
+                    # Check first few logits values
+                    if logits.shape[0] > 0 and logits.shape[1] > 0:
+                        print(f"  logits[0, :5]: {logits[0, :5].tolist()}")
+                        print(f"  logits[-1, :5]: {logits[-1, :5].tolist()}")
+                print(f"  is_prefill: {is_prefill}")
+                print(f"  sequence_lengths: {sequence_lengths}")
+                if seqs:
+                    print(f"  num_seqs: {len(seqs)}")
+                    print(f"  first seq len: {len(seqs[0])}")
+                self._debug_logits_info_logged = True
+            
             # Expand temperatures from batch format to varlen format if needed
             # Check if logits and temperatures shapes are compatible
             if logits.dim() == 2 and temperatures.dim() == 1:
@@ -2122,7 +2245,19 @@ class ModelRunner:
                         )
                 else:
                     # Shapes match - use as-is
+                    if not hasattr(self, '_debug_sampler_input_logged'):
+                        print(f"\n[DEBUG model_runner.run] Sampler input (shapes match):")
+                        print(f"  logits shape: {logits.shape}")
+                        print(f"  temperatures shape: {temperatures.shape}")
+                        print(f"  logits[0, :10]: {logits[0, :10].tolist()}")
+                        self._debug_sampler_input_logged = True
                     token_ids = self.sampler(logits, temperatures).tolist()
+                    if not hasattr(self, '_debug_sampler_output_logged'):
+                        print(f"\n[DEBUG model_runner.run] Sampler output:")
+                        print(f"  token_ids: {token_ids}")
+                        print(f"  token_ids type: {type(token_ids)}")
+                        print(f"  token_ids length: {len(token_ids) if isinstance(token_ids, list) else 'N/A'}")
+                        self._debug_sampler_output_logged = True
             else:
                 # Unexpected dimensions - use as-is (fallback)
                 token_ids = self.sampler(logits, temperatures).tolist()

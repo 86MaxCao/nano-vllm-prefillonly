@@ -202,3 +202,7 @@ deprecated/
 # Documentation directories
 docs/
 **/docs/
+
+# log directories
+log/
+**/log/

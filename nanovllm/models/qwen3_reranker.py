@@ -144,14 +144,16 @@ class Qwen3Reranker(Qwen3ForCausalLM):
         model_dtype = self.lm_head.weight.data.dtype
         model_device = self.lm_head.weight.data.device
 
-        # For ParallelLMHead, weights are sharded. Need to gather all
-        # shards to access arbitrary token IDs
-        if hasattr(self.lm_head, 'tp_size') and self.lm_head.tp_size > 1:
-            import torch.distributed as dist
-            # Gather all weight shards
+        # For ParallelLMHead, weights are always sharded (even when tp_size == 1)
+        # Need to gather all shards to access arbitrary token IDs
+        import torch.distributed as dist
+        tp_size = getattr(self.lm_head, 'tp_size', 1)
+        
+        if tp_size > 1:
+            # Multi-GPU case: gather all weight shards
             all_weights = [
                 torch.empty_like(self.lm_head.weight.data)
-                for _ in range(self.lm_head.tp_size)
+                for _ in range(tp_size)
             ]
             dist.all_gather(all_weights, self.lm_head.weight.data)
             if dist.get_rank() == 0:
@@ -172,13 +174,33 @@ class Qwen3Reranker(Qwen3ForCausalLM):
             # Broadcast from rank 0 to all ranks
             dist.broadcast(score_weight, src=0)
         else:
-            # Single GPU case: weights are not sharded
-            # Use [[true_id]] and [[false_id]] to keep 2D shape, matching vLLM
-            weight_true = self.lm_head.weight.data[[true_id]].to(torch.float32)  # [1, hidden_size]
-            weight_false = self.lm_head.weight.data[[false_id]].to(torch.float32)  # [1, hidden_size]
-            score_weight = (weight_true - weight_false).to(model_dtype)  # [1, hidden_size]
+            # Single GPU case: weights are still sharded (ParallelLMHead structure)
+            # Need to check if token IDs are in the current shard range
+            vocab_start_idx = self.lm_head.vocab_start_idx
+            vocab_end_idx = self.lm_head.vocab_end_idx
+            
+            # Check if both tokens are in the current shard
+            if (vocab_start_idx <= true_id < vocab_end_idx and 
+                vocab_start_idx <= false_id < vocab_end_idx):
+                # Both tokens are in current shard, can access directly
+                local_true_id = true_id - vocab_start_idx
+                local_false_id = false_id - vocab_start_idx
+                weight_true = self.lm_head.weight.data[[local_true_id]].to(torch.float32)
+                weight_false = self.lm_head.weight.data[[local_false_id]].to(torch.float32)
+                score_weight = (weight_true - weight_false).to(model_dtype)
+            else:
+                # Need to gather weights (shouldn't happen with tp_size == 1, but handle gracefully)
+                # For tp_size == 1, vocab_start_idx should be 0 and vocab_end_idx should be vocab_size
+                # So this branch should rarely be hit, but we handle it for safety
+                all_weights = [self.lm_head.weight.data]
+                full_weight = torch.cat(all_weights, dim=0)
+                weight_true = full_weight[[true_id]].to(torch.float32)
+                weight_false = full_weight[[false_id]].to(torch.float32)
+                score_weight = (weight_true - weight_false).to(model_dtype)
+            
             print(f"[DEBUG] Weight conversion:")
             print(f"[DEBUG]   true_id: {true_id}, false_id: {false_id}")
+            print(f"[DEBUG]   vocab_start_idx: {vocab_start_idx}, vocab_end_idx: {vocab_end_idx}")
             print(f"[DEBUG]   weight_true shape: {weight_true.shape}, mean: {weight_true.mean().item():.6f}, std: {weight_true.std().item():.6f}")
             print(f"[DEBUG]   weight_false shape: {weight_false.shape}, mean: {weight_false.mean().item():.6f}, std: {weight_false.std().item():.6f}")
             print(f"[DEBUG]   score_weight shape: {score_weight.shape}, mean: {score_weight.mean().item():.6f}, std: {score_weight.std().item():.6f}")
