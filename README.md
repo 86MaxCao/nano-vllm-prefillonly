@@ -38,12 +38,14 @@ When processing **hundreds of millions of images** at scale, the traditional vLL
 
 ## 📊 Performance Benchmarks
 
-### Test Configuration
+### 1. Qwen3-VL-2B-Instruct (Multimodal Generation)
+
+**Test Configuration:**
 - **Model**: Qwen3-VL-2B-Instruct
 - **Task**: Multimodal single-token generation
 - **Hardware**: Single H20 GPU
 
-### Speed Comparison
+**Speed Comparison:**
 
 | Inference Engine | Mean (s) | Median (s) | P90 (s) | P99 (s) | Speedup vs Transformers |
 |-----------------|----------|------------|---------|---------|------------------------|
@@ -51,7 +53,7 @@ When processing **hundreds of millions of images** at scale, the traditional vLL
 | Prefill-Only     | 0.5766   | 0.5349     | 0.7640  | 0.8717  | **2.10x faster** ⚡     |
 | Original nano-vllm | 0.5712 | 0.5667     | 0.6211  | 0.6246  | 2.12x faster            |
 
-### Memory Comparison (Peak)
+**Memory Comparison (Peak):**
 
 | Metric               | Transformers | Prefill-Only | Original nano-vllm | Prefill vs Original |
 |---------------------|--------------|--------------|---------------------|---------------------|
@@ -62,6 +64,80 @@ When processing **hundreds of millions of images** at scale, the traditional vLL
 | Fragmentation %     | 0.15%        | 2.08%        | 0.55%               | -                   |
 
 **Key Insight**: While prefill-only mode is slightly slower (0.99x) than original nano-vllm, it uses **only 10% of the memory**, making it ideal for high-throughput scenarios where memory efficiency is critical.
+
+---
+
+### 2. Qwen3-4B (Text Generation)
+
+**Test Configuration:**
+- **Model**: Qwen3-4B
+- **Task**: Text-only single-token generation
+
+**Speed Comparison:**
+
+| Inference Engine | Mean (s) | Median (s) | P90 (s) | P99 (s) | Speedup vs Transformers |
+|-----------------|----------|------------|---------|---------|------------------------|
+| Transformers     | 0.2367   | 0.2366     | 0.2377  | 0.2416  | 1.00x (baseline)       |
+| Prefill-Only     | 0.1352   | 0.1271     | 0.1568  | 0.2653  | **1.75x faster** ⚡     |
+| Original         | 0.1264   | 0.1248     | 0.1254  | 0.1311  | 1.87x faster            |
+
+**Memory Comparison (Peak):**
+
+| Metric               | Transformers | Prefill-Only | Original | Prefill vs Original |
+|---------------------|--------------|--------------|----------|---------------------|
+| Peak Memory         | 9040.87 MB   | 8007.38 MB   | 85825.38 MB | **10.72x less** 💾  |
+
+---
+
+### 3. Qwen3-Embedding-0.6B (Embedding Model)
+
+**Test Configuration:**
+- **Model**: Qwen3-Embedding-0.6B
+- **Task**: Text embedding for semantic search
+
+**Accuracy Comparison:**
+- Prefill-Only vs Transformers: Cosine Similarity: **0.999761** (min: 0.999707), Max Diff: 0.003435, Mean Diff: 0.000533
+- Original vs Transformers: Cosine Similarity: **0.999761** (min: 0.999707), Max Diff: 0.003435, Mean Diff: 0.000533
+
+**Speed Comparison:**
+
+| Inference Engine | Mean (s) | Median (s) | P90 (s) | P99 (s) | Speedup vs Transformers |
+|-----------------|----------|------------|---------|---------|------------------------|
+| Transformers     | 0.0366   | 0.0363     | 0.0373  | 0.0374  | 1.00x (baseline)       |
+| Prefill-Only     | 0.0246   | 0.0245     | 0.0257  | 0.0261  | **1.49x faster** ⚡     |
+| Original         | 0.0247   | 0.0248     | 0.0252  | 0.0257  | 1.48x faster            |
+
+**Memory Comparison (Peak):**
+
+| Metric               | Transformers | Prefill-Only | Original | Prefill vs Original |
+|---------------------|--------------|--------------|----------|---------------------|
+| Peak Memory         | 1190.87 MB   | 1192.38 MB   | 2316.02 MB | 1.94x less 💾       |
+
+---
+
+### 4. bge-multilingual-gemma2 (Multilingual Embedding Model)
+
+**Test Configuration:**
+- **Model**: bge-multilingual-gemma2
+- **Task**: Multilingual text embedding
+
+**Accuracy Comparison:**
+- Prefill-Only vs Transformers: Cosine Similarity: **0.999973** (min: 0.999939), Max Diff: 0.000886, Mean Diff: 0.000091
+- Original vs Transformers: Cosine Similarity: **0.999973** (min: 0.999939), Max Diff: 0.000886, Mean Diff: 0.000091
+
+**Speed Comparison:**
+
+| Inference Engine | Mean (s) | Median (s) | P90 (s) | P99 (s) | Speedup vs Transformers |
+|-----------------|----------|------------|---------|---------|------------------------|
+| Transformers     | 0.0715   | 0.0713     | 0.0717  | 0.0730  | 1.00x (baseline)       |
+| Prefill-Only     | 0.0449   | 0.0446     | 0.0463  | 0.0466  | **1.59x faster** ⚡     |
+| Original         | 0.0452   | 0.0430     | 0.0455  | 0.0631  | 1.58x faster            |
+
+**Memory Comparison (Peak):**
+
+| Metric               | Transformers | Prefill-Only | Original | Prefill vs Original |
+|---------------------|--------------|--------------|----------|---------------------|
+| Peak Memory         | 17677.26 MB  | 17677.25 MB  | 35303.30 MB | **2.00x less** 💾  |
 
 > **Note**: Further performance optimizations are under active development. The current implementation focuses on correctness and memory efficiency, with speed optimizations planned for future releases.
 
@@ -109,7 +185,28 @@ CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
 ```bash
 CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
     --modality text \
-    --model-path ~/.cache/huggingface/hub/Qwen3-0.6B
+    --model qwen3 \
+    --model-path ~/.cache/huggingface/hub/Qwen3-4B
+```
+
+### Text Embedding
+
+#### Qwen3-Embedding
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_embed \
+    --modality text \
+    --model qwen3-embedding \
+    --model-path ~/.cache/huggingface/hub/Qwen3-Embedding-0.6B
+```
+
+#### bge-multilingual-gemma2
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_embed \
+    --modality text \
+    --model gemma2 \
+    --model-path ~/.cache/huggingface/hub/bge-multilingual-gemma2
 ```
 
 > **Note**: Detailed usage examples and demos will be provided in future releases. For now, refer to the benchmark scripts in `examples/` directory.
@@ -124,10 +221,16 @@ CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
 - ✅ Memory-efficient inference without KV cache
 - ✅ Accuracy matching with Transformers baseline
 
+**Currently Supported Models:**
+- ✅ **Qwen3**: Text generation models (e.g., Qwen3-4B, Qwen3-0.6B)
+- ✅ **Qwen3-VL**: Multimodal generation models (e.g., Qwen3-VL-2B-Instruct)
+- ✅ **Qwen3-Embedding**: Embedding models for semantic search (e.g., Qwen3-Embedding-0.6B)
+- ✅ **bge-multilingual-gemma2**: Multilingual embedding models (e.g., bge-multilingual-gemma2)
+
 **In Progress:**
 - 🔄 **Model Support**: Adapting all 12 models from `bench_all.sh` (currently in development)
-  - Text-only: Qwen3-Embedding, Gemma2, Qwen3-Reranker, Jina-Reranker-V3, BGE-Reranker-V2-Gemma, Qwen3
-  - Multimodal: Jina-Embedding-V4, Jina-Reranker-M0, LLaVA-NeXT, Qwen2-VL, Qwen2.5-VL, Qwen3-VL
+  - Text-only: Qwen3-Reranker, Jina-Reranker-V3, BGE-Reranker-V2-Gemma
+  - Multimodal: Jina-Embedding-V4, Jina-Reranker-M0, LLaVA-NeXT, Qwen2-VL, Qwen2.5-VL
 - 🔄 Production-ready features and detailed demos
 
 ## 🏗️ Architecture
