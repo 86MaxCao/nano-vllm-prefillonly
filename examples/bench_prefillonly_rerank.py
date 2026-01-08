@@ -35,41 +35,46 @@ from transformers import (
 )
 
 from nanovllm import LLM
-
-# ============================================================================
-# Test Configuration: Image URLs and Prompts
-# ============================================================================
-# Test images from COCO (10 images for comprehensive testing)
-DEFAULT_IMAGE_URLS = (
-    "http://images.cocodataset.org/val2017/000000000285.jpg",
-    "http://images.cocodataset.org/val2017/000000000632.jpg",
-    "http://images.cocodataset.org/val2017/000000000724.jpg",
-    "http://images.cocodataset.org/val2017/000000000776.jpg",
-    "http://images.cocodataset.org/val2017/000000001000.jpg",
-    "http://images.cocodataset.org/val2017/000000001268.jpg",
-    "http://images.cocodataset.org/val2017/000000006012.jpg",
-    "http://images.cocodataset.org/val2017/000000190236.jpg",
-    "http://images.cocodataset.org/val2017/000000331352.jpg",
-    "http://images.cocodataset.org/val2017/000000517069.jpg",
+from examples.prompt import (
+    DEFAULT_IMAGE_URLS,
+    MULTIMODAL_RERANKING_QUERIES,
+    TEXT_RERANKING_QUERIES,
+    TEXT_RERANKING_DOCUMENTS,
 )
 
-# Test prompts for multimodal reranking (10 prompts matching the 10 images)
-# Comments indicate expected relevance score (高分=high score, 低分=low score)
-MULTIMODAL_RERANKING_QUERIES = (
-    "A bear in the image",  # 高分
-    "An outdoor scene",  # 低分
-    "An outdoor setting",  # 高分
-    "Multiple bears",  # 高分
-    "An outdoor environment",  # 高分
-    "An outdoor location",  # 高分
-    "Bananas or fruits",  # 高分
-    "An outdoor view",  # 低分
-    "An outdoor scene",  # 低分
-    "An outdoor setting",  # 高分
-)
 
 # Global variable to store model filter
 _MODEL_FILTER = None
+
+
+def get_model_dtype(model_path: str) -> torch.dtype:
+    """Get model dtype from config, matching nano-vllm's logic.
+    
+    Args:
+        model_path: Path to the model
+        
+    Returns:
+        torch.dtype: The dtype to use for the model
+    """
+    from transformers import AutoConfig
+    
+    hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch_dtype = getattr(hf_config, "torch_dtype", None)
+    if torch_dtype is None and hasattr(hf_config, "text_config"):
+        torch_dtype = getattr(hf_config.text_config, "torch_dtype", None)
+    if isinstance(torch_dtype, str):
+        resolved_dtype = getattr(torch, torch_dtype, None)
+        if resolved_dtype is None:
+            alias_map = {
+                "bf16": torch.bfloat16,
+                "fp16": torch.float16,
+                "float16": torch.float16,
+            }
+            resolved_dtype = alias_map.get(torch_dtype.lower())
+        torch_dtype = resolved_dtype
+    if torch_dtype is None:
+        torch_dtype = torch.float16
+    return torch_dtype
 
 
 def set_model_filter(model_name: Optional[str]):
@@ -700,7 +705,7 @@ class ComprehensiveRerankingTest(ComprehensiveTestBase):
         is_listwise: bool,
         instruction: Optional[str] = None,
         num_warmup: int = 5,
-        num_iterations: int = 10,
+        num_iterations: int = len(TEXT_RERANKING_QUERIES),
     ):
         super().__init__(model_path, num_warmup, num_iterations)
         self.queries = queries
@@ -755,20 +760,18 @@ class ComprehensiveRerankingTest(ComprehensiveTestBase):
                 tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
             
             # Load model using AutoModel
-            # Use torch.float16 for CUDA (Flash Attention 2 requires float16 or bfloat16)
-            try:
-                model = AutoModel.from_pretrained(
-                    self.model_path,
-                    dtype=torch.float16,
-                    trust_remote_code=True,
-                    attn_implementation="flash_attention_2",
-                )
-            except (ValueError, ImportError):
-                model = AutoModel.from_pretrained(
-                    self.model_path,
-                    dtype=torch.float16,
-                    trust_remote_code=True,
-                )
+            # Get dtype from model config (matching nano-vllm)
+            model_dtype = get_model_dtype(self.model_path)
+            # Flash Attention 2 only supports fp16 and bf16
+            # If dtype is float32, convert to float16
+            if model_dtype == torch.float32:
+                model_dtype = torch.float16
+            model = AutoModel.from_pretrained(
+                self.model_path,
+                dtype=model_dtype,
+                trust_remote_code=True,
+                attn_implementation="flash_attention_2",
+            )
             model = model.eval().cuda()
             
             # Format input: one query + all documents
@@ -805,9 +808,15 @@ class ComprehensiveRerankingTest(ComprehensiveTestBase):
             tokenizer = AutoTokenizer.from_pretrained(
                 self.model_path, padding_side="left"
             )
+            # Get dtype from model config (matching nano-vllm)
+            model_dtype = get_model_dtype(self.model_path)
+            # Flash Attention 2 only supports fp16 and bf16
+            # If dtype is float32, convert to float16
+            if model_dtype == torch.float32:
+                model_dtype = torch.float16
             model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
-                dtype=torch.float16,
+                dtype=model_dtype,
                 attn_implementation="flash_attention_2",
             ).eval().cuda()
             
@@ -829,10 +838,16 @@ class ComprehensiveRerankingTest(ComprehensiveTestBase):
                 self.model_path, padding_side="left", trust_remote_code=True
             )
             tokenizer.pad_token = tokenizer.eos_token
+            # Get dtype from model config (matching nano-vllm)
+            model_dtype = get_model_dtype(self.model_path)
+            # Flash Attention 2 only supports fp16 and bf16
+            # If dtype is float32, convert to float16
+            if model_dtype == torch.float32:
+                model_dtype = torch.float16
             model = (
                 AutoModelForCausalLM.from_pretrained(
                     self.model_path,
-                    dtype=torch.float16,
+                    dtype=model_dtype,
                     trust_remote_code=True,
                     attn_implementation="flash_attention_2",
                 )
@@ -1221,7 +1236,7 @@ class ComprehensiveMultimodalRerankingTest(ComprehensiveTestBase):
         documents: List[str],
         images: List[Image.Image],
         num_warmup: int = 5,
-        num_iterations: int = 10,
+        num_iterations: int = len(MULTIMODAL_RERANKING_QUERIES),
     ):
         super().__init__(model_path, num_warmup, num_iterations)
         self.queries = queries
@@ -1246,21 +1261,18 @@ class ComprehensiveMultimodalRerankingTest(ComprehensiveTestBase):
             processor.tokenizer.padding_side = "left"
         # jina-reranker-m0 official usage: use AutoModel.from_pretrained
         # with trust_remote_code=True to load the custom JinaVLForRanking class
-        try:
-            # Try with flash_attention_2 if available
-            model = AutoModel.from_pretrained(
-                self.model_path,
-                dtype=torch.float16,
-                trust_remote_code=True,
-                attn_implementation="flash_attention_2"
-            )
-        except (ImportError, ValueError, TypeError, RuntimeError):
-            # Fallback to default attention if flash_attention_2 not available
-            model = AutoModel.from_pretrained(
-                self.model_path,
-                dtype=torch.float16,
-                trust_remote_code=True
-            )
+        # Get dtype from model config (matching nano-vllm)
+        model_dtype = get_model_dtype(self.model_path)
+        # Flash Attention 2 only supports fp16 and bf16
+        # If dtype is float32, convert to float16
+        if model_dtype == torch.float32:
+            model_dtype = torch.float16
+        model = AutoModel.from_pretrained(
+            self.model_path,
+            dtype=model_dtype,
+            trust_remote_code=True,
+            attn_implementation="flash_attention_2"
+        )
         model.eval().cuda()
 
         # Format query-document pairs with images
@@ -1666,7 +1678,7 @@ class ComprehensiveMultimodalRerankingTest(ComprehensiveTestBase):
 def test_reranking_comprehensive(
     modality: str = "text",
     num_warmup: int = 5,
-    num_iterations: int = 10,
+    num_iterations: int = len(TEXT_RERANKING_QUERIES),
     batch_size: Optional[int] = None,
     model_path: Optional[str] = None,
     model: Optional[str] = None,
@@ -1685,18 +1697,9 @@ def test_reranking_comprehensive(
             raise ValueError("--model-path is required for text reranking test")
         model_path = os.path.expanduser(model_path)
 
-        # Base queries and documents
-        base_queries = [
-            "What is the capital of China?",
-            "Explain gravity",
-            "What is machine learning?",
-        ]
-
-        base_documents = [
-            "The capital of China is Beijing.",
-            "Gravity is a force that attracts two bodies.",
-            "Machine learning is a subset of artificial intelligence.",
-        ]
+        # Base queries and documents from prompt.py
+        base_queries = list(TEXT_RERANKING_QUERIES)
+        base_documents = list(TEXT_RERANKING_DOCUMENTS)
 
         # Get reranker type from model name (required)
         if model is None:
@@ -1900,8 +1903,8 @@ Examples:
     parser.add_argument(
         "--num-iterations",
         type=int,
-        default=10,
-        help="Number of benchmark iterations (default: 10)",
+        default=len(TEXT_RERANKING_QUERIES),
+        help=f"Number of benchmark iterations (default: {len(TEXT_RERANKING_QUERIES)}, from prompt.py)",
     )
 
     parser.add_argument(
@@ -1945,6 +1948,18 @@ def main():
     if not torch.cuda.is_available():
         print("Warning: CUDA not available, tests may be slow")
 
+    # Determine default iterations based on modality
+    default_text_iterations = len(TEXT_RERANKING_QUERIES)
+    default_multimodal_iterations = len(MULTIMODAL_RERANKING_QUERIES)
+    
+    # If user is using the default value (from parse_args), adjust it based on modality
+    if args.num_iterations == default_text_iterations:
+        if args.modality == "multimodal":
+            args.num_iterations = default_multimodal_iterations
+        elif args.modality == "all":
+            # For "all", keep text default (will be adjusted per test)
+            pass
+
     print(f"Warmup iterations: {args.num_warmup}")
     print(f"Benchmark iterations: {args.num_iterations}")
 
@@ -1955,10 +1970,13 @@ def main():
 
     if args.modality in ["text", "all"]:
         try:
+            text_iterations = args.num_iterations
+            if args.modality == "all" and args.num_iterations == default_text_iterations:
+                text_iterations = default_text_iterations
             test_reranking_comprehensive(
                 modality="text",
                 num_warmup=args.num_warmup,
-                num_iterations=args.num_iterations,
+                num_iterations=text_iterations,
                 batch_size=args.batch_size,
                 model_path=args.model_path,
                 model=args.model,
@@ -1970,10 +1988,13 @@ def main():
 
     if args.modality in ["multimodal", "all"]:
         try:
+            multimodal_iterations = args.num_iterations
+            if args.modality == "all" and args.num_iterations == default_text_iterations:
+                multimodal_iterations = default_multimodal_iterations
             test_reranking_comprehensive(
                 modality="multimodal",
                 num_warmup=args.num_warmup,
-                num_iterations=args.num_iterations,
+                num_iterations=multimodal_iterations,
                 batch_size=args.batch_size,
                 model_path=args.model_path,
                 model=args.model,

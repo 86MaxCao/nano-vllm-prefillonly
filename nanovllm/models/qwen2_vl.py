@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -17,6 +18,28 @@ from torch import nn
 from einops import rearrange, repeat
 
 logger = logging.getLogger(__name__)
+
+# Debug log file for Qwen2-VL
+_DEBUG_LOG_FILE = None
+_DEBUG_LOG_FILE_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "log", "qwen2vl_v4.logger"
+)
+
+
+def _debug_log(*args, **kwargs):
+    """Write debug message to both console and log file."""
+    global _DEBUG_LOG_FILE
+    if _DEBUG_LOG_FILE is None:
+        os.makedirs(os.path.dirname(_DEBUG_LOG_FILE_PATH), exist_ok=True)
+        _DEBUG_LOG_FILE = open(_DEBUG_LOG_FILE_PATH, "w", encoding="utf-8")
+    # Format message like print()
+    msg = " ".join(str(arg) for arg in args)
+    if kwargs:
+        msg += " " + " ".join(f"{k}={v}" for k, v in kwargs.items())
+    print(msg)
+    _DEBUG_LOG_FILE.write(msg + "\n")
+    _DEBUG_LOG_FILE.flush()
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
@@ -305,7 +328,15 @@ class Qwen2VLTextModel(nn.Module):
         config,
     ) -> None:
         super().__init__()
-        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+        # 根据 tp_size 选择使用标准 Embedding 还是 VocabParallelEmbedding
+        tp_size = dist.get_world_size() if dist.is_initialized() else 1
+        if tp_size == 1:
+            # 单 GPU：使用标准的 nn.Embedding，就像 Transformers 那样
+            self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        else:
+            # 多 GPU：使用 VocabParallelEmbedding 支持 tensor parallelism
+            self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
+
         self.layers = nn.ModuleList(
             [Qwen2VLTextDecoderLayer(config) for _ in range(config.num_hidden_layers)]
         )
@@ -753,11 +784,79 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         image_grid_thw: torch.Tensor | None = None,
         sequence_lengths: list[int] | None = None,
         vision_slices_per_seq: list[list[dict]] | None = None,
+        seq_image_indices: list[tuple[int, int]] | None = None,
+        seq_vision_placeholders: list[list[tuple[int, int]]] | None = None,
     ) -> torch.Tensor:
+        # Debug log for input_ids before processing
+        if not hasattr(self, '_debug_input_ids_logged'):
+            _debug_log(f"\n[DEBUG Qwen2VLForConditionalGeneration.forward] Input IDs:")
+            if input_ids is not None:
+                if isinstance(input_ids, torch.Tensor):
+                    input_ids_flat = input_ids.view(-1) if input_ids.dim() > 1 else input_ids
+                    _debug_log(f"  input_ids shape: {input_ids.shape}")
+                    _debug_log(f"  input_ids dtype: {input_ids.dtype}")
+                    _debug_log(f"  input_ids length: {len(input_ids_flat)}")
+                    # Check values at key positions
+                    if len(input_ids_flat) > 515:
+                        _debug_log(f"  input_ids[514]: {input_ids_flat[514].item()}")
+                        _debug_log(f"  input_ids[515]: {input_ids_flat[515].item()} (first seq last)")
+                        if len(input_ids_flat) > 516:
+                            _debug_log(f"  input_ids[516]: {input_ids_flat[516].item()} (second seq start)")
+                    if len(input_ids_flat) > 941:
+                        _debug_log(f"  input_ids[940]: {input_ids_flat[940].item()}")
+                        _debug_log(f"  input_ids[941]: {input_ids_flat[941].item()} (second seq last)")
+                    if len(input_ids_flat) > 3914:
+                        _debug_log(f"  input_ids[3913]: {input_ids_flat[3913].item()}")
+                        _debug_log(f"  input_ids[3914]: {input_ids_flat[3914].item()} (last seq last)")
+                    # Check image_token_id
+                    image_token_id = getattr(self.config, 'image_token_id', None)
+                    if image_token_id is not None:
+                        _debug_log(f"  image_token_id: {image_token_id}")
+                        image_token_count = (input_ids_flat == image_token_id).sum().item()
+                        _debug_log(f"  image_token_count in input_ids: {image_token_count}")
+                        # Check if last token positions are image tokens
+                        if len(input_ids_flat) > 515:
+                            is_img_515 = input_ids_flat[515].item() == image_token_id
+                            _debug_log(f"  input_ids[515] is image_token: {is_img_515}")
+                        if len(input_ids_flat) > 941:
+                            is_img_941 = input_ids_flat[941].item() == image_token_id
+                            _debug_log(f"  input_ids[941] is image_token: {is_img_941}")
+                else:
+                    _debug_log(f"  input_ids type: {type(input_ids)}")
+            else:
+                _debug_log(f"  input_ids is None")
+            if sequence_lengths:
+                _debug_log(f"  sequence_lengths: {sequence_lengths}")
+            self._debug_input_ids_logged = True
+        
         if inputs_embeds is None:
             inputs_embeds = self.get_input_embeddings(input_ids)
             if inputs_embeds.dim() == 3:
                 inputs_embeds = inputs_embeds.view(-1, inputs_embeds.shape[-1])
+            
+            # Debug log for embeddings after get_input_embeddings
+            if not hasattr(self, '_debug_embeddings_after_get_logged'):
+                _debug_log(f"\n[DEBUG Qwen2VLForConditionalGeneration.forward] After get_input_embeddings:")
+                _debug_log(f"  inputs_embeds shape: {inputs_embeds.shape}")
+                _debug_log(f"  inputs_embeds dtype: {inputs_embeds.dtype}")
+                if inputs_embeds.numel() > 0:
+                    _debug_log(f"  inputs_embeds min/max: {inputs_embeds.min().item():.4f} / {inputs_embeds.max().item():.4f}")
+                    _debug_log(f"  inputs_embeds mean: {inputs_embeds.mean().item():.4f}")
+                    _debug_log(f"  inputs_embeds all zeros: {(inputs_embeds == 0).all().item()}")
+                    # Check last token positions
+                    if sequence_lengths:
+                        offsets = [0]
+                        for length in sequence_lengths:
+                            offsets.append(offsets[-1] + length)
+                        for i, offset in enumerate(offsets[1:], 1):
+                            last_idx = offset - 1
+                            if last_idx >= 0 and last_idx < inputs_embeds.shape[0]:
+                                _debug_log(f"  Sequence {i} last token at index {last_idx}: inputs_embeds[{last_idx}, :5] = {inputs_embeds[last_idx, :5].tolist()}")
+                                if input_ids is not None:
+                                    input_ids_flat = input_ids.view(-1) if input_ids.dim() > 1 else input_ids
+                                    if last_idx < len(input_ids_flat):
+                                        _debug_log(f"    input_ids[{last_idx}] = {input_ids_flat[last_idx].item()}")
+                self._debug_embeddings_after_get_logged = True
         
         needs_clone = (pixel_values is not None and vision_slices_per_seq is None) or vision_slices_per_seq is not None
         if needs_clone: inputs_embeds = inputs_embeds.clone()
@@ -765,27 +864,209 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         vision_token_count = 0
 
         # --- Visual Replacement Logic ---
+        if not hasattr(self, '_debug_vision_replacement_check_logged'):
+            _debug_log(f"\n[DEBUG Qwen2VLForConditionalGeneration.forward] Vision replacement check:")
+            _debug_log(f"  pixel_values is not None: {pixel_values is not None}")
+            _debug_log(f"  seq_image_indices: {seq_image_indices}")
+            _debug_log(f"  sequence_lengths: {sequence_lengths}")
+            if seq_image_indices and sequence_lengths:
+                _debug_log(f"  len(seq_image_indices) == len(sequence_lengths): {len(seq_image_indices) == len(sequence_lengths)}")
+            self._debug_vision_replacement_check_logged = True
+        
         if pixel_values is not None:
-            image_embeds = self.visual(pixel_values, image_grid_thw)
-            if isinstance(image_embeds, list):
-                image_embeds = torch.cat(image_embeds, dim=0).to(
-                    inputs_embeds.device, inputs_embeds.dtype
-                )
+            # Check if we have seq_image_indices for multi-sequence mapping (like qwen3_vl)
+            if seq_image_indices and sequence_lengths and len(seq_image_indices) == len(sequence_lengths):
+                # Use seq_image_indices to correctly map images to sequences
+                offsets = [0]
+                for length in sequence_lengths:
+                    offsets.append(offsets[-1] + length)
+                
+                image_embeds_list = self.visual(pixel_values, image_grid_thw)
+                if isinstance(image_embeds_list, list):
+                    image_embeddings = image_embeds_list
+                else:
+                    # Split tensor into list of per-image embeddings
+                    num_images = image_embeds_list.shape[0]
+                    image_embeddings = [image_embeds_list[i] for i in range(num_images)]
+                
+                # Process each sequence separately
+                for seq_idx, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
+                    seq_length = end - start
+                    if seq_length <= 0:
+                        continue
+                    
+                    # Get image index range for this sequence
+                    img_start_idx, img_end_idx = seq_image_indices[seq_idx]
+                    
+                    # Collect all image embeddings for this sequence
+                    seq_image_embeds = image_embeddings[img_start_idx:img_end_idx]
+                    
+                    if not seq_image_embeds:
+                        continue
+                    
+                    # Concatenate all image embeddings for this sequence
+                    seq_vision_tokens = torch.cat([
+                        emb.to(inputs_embeds.device, inputs_embeds.dtype)
+                        for emb in seq_image_embeds
+                    ], dim=0)
+                    
+                    slice_len = seq_vision_tokens.size(0)
+                    
+                    # Use vision_placeholders to get correct target_offset (like normal path)
+                    if seq_vision_placeholders and seq_idx < len(seq_vision_placeholders):
+                        placeholders = seq_vision_placeholders[seq_idx]
+                        if placeholders:
+                            # Use the first placeholder's offset (typically there's only one)
+                            target_offset, expected_length = placeholders[0]
+                            if expected_length != slice_len:
+                                # Warn but use actual length
+                                pass
+                            
+                            target_start = start + target_offset
+                            target_end = target_start + slice_len
+                            
+                            # Debug log before replacement
+                            if not hasattr(self, '_debug_vision_replace_before_logged'):
+                                _debug_log(f"\n[DEBUG Qwen2VLForConditionalGeneration.forward] Before vision replacement:")
+                                _debug_log(f"  Sequence {seq_idx}: start={start}, end={end}, seq_length={seq_length}")
+                                _debug_log(f"  target_offset={target_offset}, slice_len={slice_len}")
+                                _debug_log(f"  target_start={target_start}, target_end={target_end}")
+                                _debug_log(f"  last_token_idx={end-1}")
+                                _debug_log(f"  Will replace inputs_embeds[{target_start}:{target_end}]")
+                                if target_end > end - 1:
+                                    _debug_log(f"  WARNING: target_end ({target_end}) > last_token_idx ({end-1})! This will overwrite last token!")
+                                elif target_end == end - 1:
+                                    _debug_log(f"  WARNING: target_end ({target_end}) == last_token_idx ({end-1})! This will overwrite last token!")
+                                # Check last token before replacement
+                                last_idx = end - 1
+                                if last_idx >= 0 and last_idx < inputs_embeds.shape[0]:
+                                    _debug_log(f"  inputs_embeds[{last_idx}, :5] before replacement: {inputs_embeds[last_idx, :5].tolist()}")
+                                # Check target range before replacement
+                                if target_start < inputs_embeds.shape[0] and target_end <= inputs_embeds.shape[0]:
+                                    _debug_log(f"  inputs_embeds[{target_start}, :5] before replacement: {inputs_embeds[target_start, :5].tolist()}")
+                                    if target_end > target_start + 1:
+                                        _debug_log(f"  inputs_embeds[{target_end-1}, :5] before replacement: {inputs_embeds[target_end-1, :5].tolist()}")
+                            if target_end > end:
+                                raise ValueError(
+                                    f"Visual token target range [{target_start}, {target_end}) "
+                                    f"is out of sequence bounds [{start}, {end})"
+                                )
+                            
+                            inputs_embeds[target_start:target_end] = seq_vision_tokens
+                            vision_token_count += slice_len
+                            
+                            # Debug log after replacement
+                            if not hasattr(self, '_debug_vision_replace_after_logged'):
+                                _debug_log(f"\n[DEBUG Qwen2VLForConditionalGeneration.forward] After vision replacement:")
+                                last_idx = end - 1
+                                if last_idx >= 0 and last_idx < inputs_embeds.shape[0]:
+                                    _debug_log(f"  inputs_embeds[{last_idx}, :5] after replacement: {inputs_embeds[last_idx, :5].tolist()}")
+                                # Check target range after replacement
+                                if target_start < inputs_embeds.shape[0] and target_end <= inputs_embeds.shape[0]:
+                                    _debug_log(f"  inputs_embeds[{target_start}, :5] after replacement: {inputs_embeds[target_start, :5].tolist()}")
+                                    if target_end > target_start + 1:
+                                        _debug_log(f"  inputs_embeds[{target_end-1}, :5] after replacement: {inputs_embeds[target_end-1, :5].tolist()}")
+                                self._debug_vision_replace_after_logged = True
+                        else:
+                            # No placeholders for this sequence - fallback to beginning
+                            if start + slice_len > end:
+                                raise ValueError(
+                                    f"Visual tokens exceed sequence length: position {start} + "
+                                    f"tokens {slice_len} > sequence end {end}"
+                                )
+                            inputs_embeds[start : start + slice_len] = seq_vision_tokens
+                            vision_token_count += slice_len
+                    else:
+                        # No seq_vision_placeholders provided - fallback to beginning
+                        if start + slice_len > end:
+                            raise ValueError(
+                                f"Visual tokens exceed sequence length: position {start} + "
+                                f"tokens {slice_len} > sequence end {end}"
+                            )
+                        inputs_embeds[start : start + slice_len] = seq_vision_tokens
+                        vision_token_count += slice_len
             else:
-                image_embeds = image_embeds.view(-1, image_embeds.shape[-1]).to(
-                    inputs_embeds.device, inputs_embeds.dtype
-                )
+                # Fallback: original logic using masked_scatter (only works correctly for single sequence)
+                # For multi-sequence scenarios, this logic is INCORRECT because it uses masked_scatter
+                # on flattened input_ids without considering sequence boundaries.
+                # In prefill-only mode, we should always have seq_image_indices and seq_vision_placeholders.
+                if sequence_lengths and len(sequence_lengths) > 1:
+                    raise ValueError(
+                        f"Multi-sequence scenario detected ({len(sequence_lengths)} sequences) "
+                        f"but seq_image_indices not provided. The fallback logic using masked_scatter "
+                        f"on flattened input_ids is incorrect for multi-sequence scenarios. "
+                        f"Please ensure seq_image_indices and seq_vision_placeholders are provided."
+                    )
+                
+                image_embeds = self.visual(pixel_values, image_grid_thw)
+                if isinstance(image_embeds, list):
+                    image_embeds = torch.cat(image_embeds, dim=0).to(
+                        inputs_embeds.device, inputs_embeds.dtype
+                    )
+                else:
+                    image_embeds = image_embeds.view(-1, image_embeds.shape[-1]).to(
+                        inputs_embeds.device, inputs_embeds.dtype
+                    )
 
-            if input_ids.dim() == 2:
-                input_ids_flat = input_ids.view(-1)
-            else:
-                input_ids_flat = input_ids
+                if input_ids.dim() == 2:
+                    input_ids_flat = input_ids.view(-1)
+                else:
+                    input_ids_flat = input_ids
 
-            image_token_id = self.config.image_token_id
-            is_image_token = input_ids_flat == image_token_id
-            image_mask = is_image_token.unsqueeze(-1).expand_as(inputs_embeds)
+                image_token_id = self.config.image_token_id
+                is_image_token = input_ids_flat == image_token_id
+                image_mask = is_image_token.unsqueeze(-1).expand_as(inputs_embeds)
 
-            inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+                inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+                vision_token_count = is_image_token.sum().item()
+        
+        # Debug log after vision token replacement
+        if not hasattr(self, '_debug_vision_replacement_logged') and vision_token_count > 0:
+            _debug_log(f"\n[DEBUG Qwen2VLForConditionalGeneration.forward] After vision replacement:")
+            _debug_log(f"  vision_token_count: {vision_token_count}")
+            _debug_log(f"  inputs_embeds shape: {inputs_embeds.shape}")
+            if sequence_lengths:
+                _debug_log(f"  sequence_lengths: {sequence_lengths}")
+                # Calculate actual last token positions after vision replacement
+                offsets = [0]
+                for length in sequence_lengths:
+                    offsets.append(offsets[-1] + length)
+                _debug_log(f"  offsets after vision replacement: {offsets}")
+                # Check last token positions
+                for i, offset in enumerate(offsets[1:], 1):
+                    last_idx = offset - 1
+                    if last_idx >= 0 and last_idx < inputs_embeds.shape[0]:
+                        _debug_log(f"  Sequence {i} last token at index {last_idx}: inputs_embeds[{last_idx}, :5] = {inputs_embeds[last_idx, :5].tolist()}")
+            self._debug_vision_replacement_logged = True
+
+        # Debug log for inputs_embeds before forward pass
+        if not hasattr(self, '_debug_inputs_embeds_logged'):
+            _debug_log(f"\n[DEBUG Qwen2VLForConditionalGeneration.forward] Inputs embeds:")
+            _debug_log(f"  inputs_embeds shape: {inputs_embeds.shape}")
+            _debug_log(f"  inputs_embeds dtype: {inputs_embeds.dtype}")
+            if inputs_embeds.numel() > 0:
+                _debug_log(f"  inputs_embeds min/max: {inputs_embeds.min().item():.4f} / {inputs_embeds.max().item():.4f}")
+                _debug_log(f"  inputs_embeds mean: {inputs_embeds.mean().item():.4f}")
+                _debug_log(f"  inputs_embeds has NaN: {torch.isnan(inputs_embeds).any().item()}")
+                _debug_log(f"  inputs_embeds has Inf: {torch.isinf(inputs_embeds).any().item()}")
+                _debug_log(f"  inputs_embeds all zeros: {(inputs_embeds == 0).all().item()}")
+                # Check values at key positions (last tokens of sequences)
+                if inputs_embeds.shape[0] > 515:
+                    _debug_log(f"  inputs_embeds[515, :5]: {inputs_embeds[515, :5].tolist()}")
+                if inputs_embeds.shape[0] > 941:
+                    _debug_log(f"  inputs_embeds[941, :5]: {inputs_embeds[941, :5].tolist()}")
+                if inputs_embeds.shape[0] > 1208:
+                    _debug_log(f"  inputs_embeds[1208, :5]: {inputs_embeds[1208, :5].tolist()}")
+                if inputs_embeds.shape[0] > 3914:
+                    _debug_log(f"  inputs_embeds[3914, :5]: {inputs_embeds[3914, :5].tolist()}")
+                # Check a few positions before and after last tokens
+                if inputs_embeds.shape[0] > 516:
+                    _debug_log(f"  inputs_embeds[514, :5]: {inputs_embeds[514, :5].tolist()} (before last)")
+                    _debug_log(f"  inputs_embeds[516, :5]: {inputs_embeds[516, :5].tolist()} (after last)")
+            _debug_log(f"  vision_token_count: {vision_token_count}")
+            if sequence_lengths:
+                _debug_log(f"  sequence_lengths: {sequence_lengths}")
+            self._debug_inputs_embeds_logged = True
 
         # --- M-RoPE Position Calculation ---
         # Logic: 
@@ -820,6 +1101,34 @@ class Qwen2VLForConditionalGeneration(nn.Module):
             positions=positions, # Must be 3D [3, batch, seq]
             inputs_embeds=inputs_embeds,
         )
+
+        # Debug log for hidden_states
+        if not hasattr(self, '_debug_hidden_states_logged'):
+            _debug_log(f"\n[DEBUG Qwen2VLForConditionalGeneration.forward] Hidden states:")
+            _debug_log(f"  hidden_states shape: {hidden_states.shape}")
+            _debug_log(f"  hidden_states dtype: {hidden_states.dtype}")
+            if hidden_states.numel() > 0:
+                _debug_log(f"  hidden_states min/max: {hidden_states.min().item():.4f} / {hidden_states.max().item():.4f}")
+                _debug_log(f"  hidden_states mean: {hidden_states.mean().item():.4f}")
+                _debug_log(f"  hidden_states has NaN: {torch.isnan(hidden_states).any().item()}")
+                _debug_log(f"  hidden_states has Inf: {torch.isinf(hidden_states).any().item()}")
+                _debug_log(f"  hidden_states all zeros: {(hidden_states == 0).all().item()}")
+                # Check values at key positions (last tokens of sequences)
+                if hidden_states.shape[0] > 515:
+                    _debug_log(f"  hidden_states[515, :5]: {hidden_states[515, :5].tolist()}")
+                if hidden_states.shape[0] > 941:
+                    _debug_log(f"  hidden_states[941, :5]: {hidden_states[941, :5].tolist()}")
+                if hidden_states.shape[0] > 1208:
+                    _debug_log(f"  hidden_states[1208, :5]: {hidden_states[1208, :5].tolist()}")
+                if hidden_states.shape[0] > 3914:
+                    _debug_log(f"  hidden_states[3914, :5]: {hidden_states[3914, :5].tolist()}")
+                # Check a few positions before and after last tokens
+                if hidden_states.shape[0] > 516:
+                    _debug_log(f"  hidden_states[514, :5]: {hidden_states[514, :5].tolist()} (before last)")
+                    _debug_log(f"  hidden_states[516, :5]: {hidden_states[516, :5].tolist()} (after last)")
+            if sequence_lengths:
+                _debug_log(f"  sequence_lengths: {sequence_lengths}")
+            self._debug_hidden_states_logged = True
 
         return hidden_states
 
@@ -857,9 +1166,9 @@ def load_qwen2_vl_model(model_path, config):
     load_model(model, model_path, name_mapping=name_mapping)
     return model
 
+
 def create_vision_model(config, **kwargs):
     return Qwen2VisionEncoder(config)
 
+
 __all__ = ["Qwen2VLForConditionalGeneration", "load_qwen2_vl_model"]
-
-

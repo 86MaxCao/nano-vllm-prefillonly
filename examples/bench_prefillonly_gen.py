@@ -50,38 +50,7 @@ except ImportError:
     Qwen3VLForConditionalGeneration = None
 
 from nanovllm import LLM, SamplingParams
-
-# ============================================================================
-# Test Configuration: Image URLs and Prompts
-# ============================================================================
-# Test images from COCO (10 images for comprehensive testing)
-DEFAULT_IMAGE_URLS = (
-    "http://images.cocodataset.org/val2017/000000000285.jpg",
-    "http://images.cocodataset.org/val2017/000000000632.jpg",
-    "http://images.cocodataset.org/val2017/000000000724.jpg",
-    "http://images.cocodataset.org/val2017/000000000776.jpg",
-    "http://images.cocodataset.org/val2017/000000001000.jpg",
-    "http://images.cocodataset.org/val2017/000000001268.jpg",
-    "http://images.cocodataset.org/val2017/000000006012.jpg",
-    "http://images.cocodataset.org/val2017/000000190236.jpg",
-    "http://images.cocodataset.org/val2017/000000331352.jpg",
-    "http://images.cocodataset.org/val2017/000000517069.jpg",
-)
-
-# Test prompts for multimodal generation (10 prompts matching the 10 images)
-# Each prompt expects a one-word answer
-MULTIMODAL_GENERATION_PROMPTS = (
-    "What animal is in the picture? Answer with one word.",  # Expected: bear
-    "Was the image taken indoors or outdoors? Answer with indoors or outdoors.",  # Expected: indoors
-    "Was the image taken outdoors? Answer with yes or no.",  # Expected: yes
-    "How many bears in the picture? Answer with one word.",  # Expected: 3
-    "Was the image taken outdoors? Answer with yes or no.",  # Expected: yes
-    "Was the image taken indoors or outdoors? Answer with indoors or outdoors.",  # Expected: outdoors
-    "How many kinds of fruits are in the picture? Answer with one word.",  # Expected: 2
-    "Was the image taken indoors or outdoors? Answer with indoors or outdoors.",  # Expected: indoors
-    "Was the image taken indoors or outdoors? Answer with indoors or outdoors.",  # Expected: indoors
-    "What's the color of the building? Answer with one word.",  # Expected: white
-)
+from examples.prompt import DEFAULT_IMAGE_URLS, MULTIMODAL_GENERATION_PROMPTS, TEXT_GENERATION_PROMPTS
 
 # Global variable to store model filter
 _MODEL_FILTER = None
@@ -309,7 +278,7 @@ def test_memory_comparison(model_path: Optional[str] = None):
     prompts = ["Is the capital of China Beijing? Answer with Yes or No."] * 10
     _ = llm_prefill.generate_single_token(
         prompts,
-        SamplingParams(temperature=1e-6, max_tokens=1),
+        SamplingParams(temperature=1e-3, max_tokens=1),
         use_tqdm=False,
     )
 
@@ -339,7 +308,7 @@ def test_memory_comparison(model_path: Optional[str] = None):
 
     _ = llm_original.generate_single_token(
         prompts,
-        SamplingParams(temperature=1e-6, max_tokens=1),
+        SamplingParams(temperature=1e-3, max_tokens=1),
         use_tqdm=False,
     )
 
@@ -370,7 +339,7 @@ class ComprehensiveTestBase:
         self,
         model_path: str,
         num_warmup: int = 5,
-        num_iterations: int = 10,
+        num_iterations: int = len(TEXT_GENERATION_PROMPTS),
     ):
         self.model_path = os.path.expanduser(model_path)
         if not os.path.exists(self.model_path):
@@ -656,7 +625,7 @@ class ComprehensiveGenerationTest(ComprehensiveTestBase):
         model_path: str,
         prompts: List[str],
         num_warmup: int = 5,
-        num_iterations: int = 10,
+        num_iterations: int = len(TEXT_GENERATION_PROMPTS),
     ):
         super().__init__(model_path, num_warmup, num_iterations)
         self.prompts = prompts
@@ -736,11 +705,28 @@ class ComprehensiveGenerationTest(ComprehensiveTestBase):
                     else:
                         raise AttributeError(f"Cannot find lm_head in model to compute logits from hidden_states: {type(model)}")
                 
-                # Get first token after prompt (single token generation)
-                next_token_logits = logits[:, -1, :]
+                # # Get first token after prompt (single token generation)
+                # next_token_logits = logits[:, -1, :]
+                # # Sample with temperature (use same seed for reproducibility)
+                # next_token_ids = torch.multinomial(
+                #     torch.softmax(next_token_logits / 1e-3, dim=-1), 1
+                # ).squeeze(-1)
+                # return next_token_ids.cpu().tolist()
+                
+                if 'attention_mask' in inputs:
+                    # Get the last non-padding position for each sequence
+                    # attention_mask: [batch_size, seq_len], 1 for real tokens, 0 for padding
+                    seq_lengths = inputs['attention_mask'].sum(dim=1) - 1  # -1 because we want the last token index (0-indexed)
+                    batch_size = logits.shape[0]
+                    # Gather logits at the last real token position for each sequence
+                    next_token_logits = logits[torch.arange(batch_size, device=logits.device), seq_lengths, :]
+                else:
+                    # Fallback: use the last position (assumes no padding or all sequences same length)
+                    next_token_logits = logits[:, -1, :]
+                
                 # Sample with temperature (use same seed for reproducibility)
                 next_token_ids = torch.multinomial(
-                    torch.softmax(next_token_logits / 1e-6, dim=-1), 1
+                    torch.softmax(next_token_logits / 1e-3, dim=-1), 1
                 ).squeeze(-1)
                 return next_token_ids.cpu().tolist()
 
@@ -791,7 +777,7 @@ class ComprehensiveGenerationTest(ComprehensiveTestBase):
         def run_generate():
             return llm.generate_single_token(
                 self.prompts,
-                SamplingParams(temperature=1e-6, max_tokens=1),
+                SamplingParams(temperature=1e-3, max_tokens=1),
                 use_tqdm=False,
             )
 
@@ -842,7 +828,7 @@ class ComprehensiveGenerationTest(ComprehensiveTestBase):
         def run_generate():
             return llm.generate_single_token(
                 self.prompts,
-                SamplingParams(temperature=1e-6, max_tokens=1),
+                SamplingParams(temperature=1e-3, max_tokens=1),
                 use_tqdm=False,
             )
 
@@ -937,7 +923,7 @@ class ComprehensiveMultimodalGenerationTest(ComprehensiveTestBase):
         prompts: List[str],
         images: List[Image.Image],
         num_warmup: int = 5,
-        num_iterations: int = 10,
+        num_iterations: int = len(MULTIMODAL_GENERATION_PROMPTS),
     ):
         super().__init__(model_path, num_warmup, num_iterations)
         self.model_type = model_type
@@ -1098,7 +1084,7 @@ class ComprehensiveMultimodalGenerationTest(ComprehensiveTestBase):
                     
                     next_token_logits = logits[:, -1, :]
                     next_token_ids = torch.multinomial(
-                        torch.softmax(next_token_logits / 1e-6, dim=-1), 1
+                        torch.softmax(next_token_logits / 1e-3, dim=-1), 1
                     ).squeeze(-1)
                     token_ids_list.append(next_token_ids.cpu().item())
                 return token_ids_list
@@ -1177,7 +1163,7 @@ class ComprehensiveMultimodalGenerationTest(ComprehensiveTestBase):
         def run_generate():
             outputs = llm.generate_multimodal(
                 requests,
-                SamplingParams(temperature=1e-6, max_tokens=1),
+                SamplingParams(temperature=1e-3, max_tokens=1),
                 processor,
                 use_tqdm=False,
             )
@@ -1276,7 +1262,7 @@ class ComprehensiveMultimodalGenerationTest(ComprehensiveTestBase):
         def run_generate():
             outputs = llm.generate_multimodal(
                 requests,
-                SamplingParams(temperature=1e-6, max_tokens=1),
+                SamplingParams(temperature=1e-3, max_tokens=1),
                 processor,
                 use_tqdm=False,
             )
@@ -1383,7 +1369,7 @@ class ComprehensiveMultimodalGenerationTest(ComprehensiveTestBase):
 def test_generation_comprehensive(
     modality: str = "text",
     num_warmup: int = 5,
-    num_iterations: int = 10,
+    num_iterations: int = len(TEXT_GENERATION_PROMPTS),
     batch_size: Optional[int] = None,
     model_path: Optional[str] = None,
     model: Optional[str] = None,
@@ -1403,11 +1389,7 @@ def test_generation_comprehensive(
         model_path = os.path.expanduser(model_path)
 
         # Base prompts
-        base_prompts = [
-            "Is the capital of China Beijing? Answer with Yes or No.",
-            "Is the capital of France London? Answer with Yes or No.",
-            "Is 2+2 equal to 4? Answer with Yes or No.",
-        ]
+        base_prompts = list(TEXT_GENERATION_PROMPTS)
 
         # Scale up batch size if specified
         if batch_size and batch_size > len(base_prompts):
@@ -1606,8 +1588,8 @@ Examples:
     parser.add_argument(
         "--num-iterations",
         type=int,
-        default=10,
-        help="Number of benchmark iterations (default: 10)",
+        default=len(TEXT_GENERATION_PROMPTS),
+        help=f"Number of benchmark iterations (default: {len(TEXT_GENERATION_PROMPTS)}, from prompt.py)",
     )
 
     parser.add_argument(
@@ -1651,6 +1633,18 @@ def main():
     if not torch.cuda.is_available():
         print("Warning: CUDA not available, tests may be slow")
 
+    # Adjust default num_iterations based on modality
+    # If user didn't explicitly specify --num-iterations (using default),
+    # use the appropriate default for the modality
+    default_text_iterations = len(TEXT_GENERATION_PROMPTS)
+    default_multimodal_iterations = len(MULTIMODAL_GENERATION_PROMPTS)
+    
+    # If user is using the default value (from parse_args), adjust it based on modality
+    if args.num_iterations == default_text_iterations:
+        if args.modality == "multimodal":
+            args.num_iterations = default_multimodal_iterations
+        # For "text" or "all", keep the text default
+
     print(f"Warmup iterations: {args.num_warmup}")
     print(f"Benchmark iterations: {args.num_iterations}")
 
@@ -1675,10 +1669,16 @@ def main():
 
     if args.modality in ["multimodal", "all"]:
         try:
+            # For multimodal, use appropriate default if user didn't specify
+            # (already adjusted in args.num_iterations above, but handle "all" case)
+            multimodal_iterations = args.num_iterations
+            if args.modality == "all" and args.num_iterations == default_text_iterations:
+                # For "all" mode, use multimodal default for multimodal tests
+                multimodal_iterations = default_multimodal_iterations
             test_generation_comprehensive(
                 modality="multimodal",
                 num_warmup=args.num_warmup,
-                num_iterations=args.num_iterations,
+                num_iterations=multimodal_iterations,
                 batch_size=args.batch_size,
                 model_path=args.model_path,
                 model=args.model,

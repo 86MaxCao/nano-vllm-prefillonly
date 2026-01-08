@@ -33,41 +33,45 @@ from transformers import (
 )
 
 from nanovllm import LLM
-
-# ============================================================================
-# Test Configuration: Image URLs and Prompts
-# ============================================================================
-# Test images from COCO (10 images for comprehensive testing)
-DEFAULT_IMAGE_URLS = (
-    "http://images.cocodataset.org/val2017/000000000285.jpg",
-    "http://images.cocodataset.org/val2017/000000000632.jpg",
-    "http://images.cocodataset.org/val2017/000000000724.jpg",
-    "http://images.cocodataset.org/val2017/000000000776.jpg",
-    "http://images.cocodataset.org/val2017/000000001000.jpg",
-    "http://images.cocodataset.org/val2017/000000001268.jpg",
-    "http://images.cocodataset.org/val2017/000000006012.jpg",
-    "http://images.cocodataset.org/val2017/000000190236.jpg",
-    "http://images.cocodataset.org/val2017/000000331352.jpg",
-    "http://images.cocodataset.org/val2017/000000517069.jpg",
-)
-
-# Test prompts for multimodal embedding (10 prompts matching the 10 images)
-# Comments indicate expected relevance score (高分=high score, 低分=low score)
-MULTIMODAL_EMBEDDING_TEXTS = (
-    "A bear in the image",  # 高分
-    "An outdoor scene",  # 低分
-    "An outdoor setting",  # 高分
-    "Multiple bears",  # 高分
-    "An outdoor environment",  # 高分
-    "An outdoor location",  # 高分
-    "Bananas or fruits",  # 高分
-    "An outdoor view",  # 低分
-    "An outdoor scene",  # 低分
-    "An outdoor setting",  # 高分
+from examples.prompt import (
+    DEFAULT_IMAGE_URLS,
+    MULTIMODAL_EMBEDDING_TEXTS,
+    TEXT_EMBEDDING_TEXTS,
+    TEXT_EMBEDDING_VARIATIONS,
 )
 
 # Global variable to store model filter
 _MODEL_FILTER = None
+
+
+def get_model_dtype(model_path: str) -> torch.dtype:
+    """Get model dtype from config, matching nano-vllm's logic.
+    
+    Args:
+        model_path: Path to the model
+        
+    Returns:
+        torch.dtype: The dtype to use for the model
+    """
+    from transformers import AutoConfig
+    
+    hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    torch_dtype = getattr(hf_config, "torch_dtype", None)
+    if torch_dtype is None and hasattr(hf_config, "text_config"):
+        torch_dtype = getattr(hf_config.text_config, "torch_dtype", None)
+    if isinstance(torch_dtype, str):
+        resolved_dtype = getattr(torch, torch_dtype, None)
+        if resolved_dtype is None:
+            alias_map = {
+                "bf16": torch.bfloat16,
+                "fp16": torch.float16,
+                "float16": torch.float16,
+            }
+            resolved_dtype = alias_map.get(torch_dtype.lower())
+        torch_dtype = resolved_dtype
+    if torch_dtype is None:
+        torch_dtype = torch.float16
+    return torch_dtype
 
 
 def set_model_filter(model_name: Optional[str]):
@@ -343,28 +347,14 @@ def test_batch_embedding_text_comprehensive(
             print("Skipping comprehensive embedding test")
             return
 
-        # Base texts
-        base_texts = [
-            "What is the capital of China?",
-            "Explain gravity",
-            "The capital of China is Beijing.",
-            "Gravity is a force that attracts two bodies.",
-            "Machine learning is a subset of AI.",
-            "Python is a programming language.",
-        ]
+        # Base texts from prompt.py
+        base_texts = list(TEXT_EMBEDDING_TEXTS)
 
         # Scale up batch size if specified
         if batch_size and batch_size > len(base_texts):
             # Repeat and vary the texts to reach desired batch size
             texts = []
-            variations = base_texts + [
-                "What is artificial intelligence?",
-                "Explain quantum physics",
-                "What is deep learning?",
-                "Explain neural networks",
-                "What is natural language processing?",
-                "Explain computer vision",
-            ]
+            variations = list(base_texts) + list(TEXT_EMBEDDING_VARIATIONS)
             for i in range(batch_size):
                 texts.append(variations[i % len(variations)])
         else:
@@ -442,20 +432,18 @@ def test_batch_embedding_text_comprehensive(
         tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
     
     # Load model with appropriate settings
-    # Use torch.float16 for CUDA (Flash Attention 2 requires float16 or bfloat16)
-    try:
-        model = AutoModel.from_pretrained(
-            model_path,
-            dtype=torch.float16,
-            trust_remote_code=True,
-            attn_implementation="flash_attention_2",
-        )
-    except (ValueError, ImportError):
-        model = AutoModel.from_pretrained(
-            model_path,
-            dtype=torch.float16,
-            trust_remote_code=True,
-        )
+    # Get dtype from model config (matching nano-vllm)
+    model_dtype = get_model_dtype(model_path)
+    # Flash Attention 2 only supports fp16 and bf16
+    # If dtype is float32, convert to float16
+    if model_dtype == torch.float32:
+        model_dtype = torch.float16
+    model = AutoModel.from_pretrained(
+        model_path,
+        dtype=model_dtype,
+        trust_remote_code=True,
+        attn_implementation="flash_attention_2",
+    )
     model = model.eval().cuda()
 
     # Set max_length based on embedding type
@@ -1267,19 +1255,18 @@ class ComprehensiveMultimodalEmbeddingTest(ComprehensiveTestBase):
             else self.model_path
         )
         # Load model (no processor needed for jina-embeddings-v4 official API)
-        try:
-            model = AutoModel.from_pretrained(
+        # Get dtype from model config (matching nano-vllm)
+        model_dtype = get_model_dtype(model_path_to_use)
+        # Flash Attention 2 only supports fp16 and bf16
+        # If dtype is float32, convert to float16
+        if model_dtype == torch.float32:
+            model_dtype = torch.float16
+        model = AutoModel.from_pretrained(
             model_path_to_use,
-                dtype=torch.float16,
+            dtype=model_dtype,
             trust_remote_code=True,
-                attn_implementation="flash_attention_2",
-            )
-        except (ValueError, ImportError):
-            model = AutoModel.from_pretrained(
-                model_path_to_use,
-                dtype=torch.float16,
-                trust_remote_code=True,
-            )
+            attn_implementation="flash_attention_2",
+        )
         model = model.eval().cuda()
 
         # Format text+image pairs
