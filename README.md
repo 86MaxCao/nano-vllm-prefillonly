@@ -171,22 +171,54 @@ python3 -m examples.bench_prefillonly_gen --modality multimodal --model qwen3vl 
 
 ## 🎮 Quick Start
 
-### Multimodal Single-Token Generation
+All models use three benchmark scripts depending on task type:
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
-    --modality multimodal \
-    --model qwen3vl \
-    --model-path ~/.cache/huggingface/hub/Qwen3-VL-2B-Instruct
-```
+| Task Type | Script | Key Arguments |
+|-----------|--------|---------------|
+| Generation | `examples.bench_prefillonly_gen` | `--modality`, `--model`, `--model-path` |
+| Embedding | `examples.bench_prefillonly_embed` | `--modality`, `--model`, `--model-path` |
+| Reranking | `examples.bench_prefillonly_rerank` | `--modality`, `--model`, `--model-path` |
 
-### Text-Only Single-Token Generation
+> **Note**: `--model-path` points to the local model directory (e.g., HuggingFace cache). Set `HF_CACHE=~/.cache/huggingface/hub/hf_cache` or adjust paths to match your setup.
+
+### Text Generation
+
+#### Qwen3
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
     --modality text \
     --model qwen3 \
-    --model-path ~/.cache/huggingface/hub/Qwen3-4B
+    --model-path $HF_CACHE/Qwen3-4B
+```
+
+### Multimodal Generation
+
+#### Qwen3-VL
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
+    --modality multimodal \
+    --model qwen3vl \
+    --model-path $HF_CACHE/Qwen3-VL-2B-Instruct
+```
+
+#### Qwen2-VL
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
+    --modality multimodal \
+    --model qwen2vl \
+    --model-path $HF_CACHE/Qwen2-VL-2B-Instruct
+```
+
+#### Qwen2.5-VL
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
+    --modality multimodal \
+    --model qwen2.5vl \
+    --model-path $HF_CACHE/Qwen2.5-VL-3B-Instruct
 ```
 
 ### Text Embedding
@@ -197,40 +229,141 @@ CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
 CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_embed \
     --modality text \
     --model qwen3-embedding \
-    --model-path ~/.cache/huggingface/hub/Qwen3-Embedding-0.6B
+    --model-path $HF_CACHE/Qwen3-Embedding-0.6B
 ```
 
-#### bge-multilingual-gemma2
+#### BGE-multilingual-gemma2
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_embed \
     --modality text \
     --model gemma2 \
-    --model-path ~/.cache/huggingface/hub/bge-multilingual-gemma2
+    --model-path $HF_CACHE/bge-multilingual-gemma2
 ```
 
-> **Note**: Detailed usage examples and demos will be provided in future releases. For now, refer to the benchmark scripts in `examples/` directory.
+### Multimodal Embedding
+
+#### Qwen3-VL-Embedding
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_embed \
+    --modality multimodal \
+    --model qwen3-vl-embedding \
+    --model-path $HF_CACHE/Qwen3-VL-Embedding-2B
+```
+
+### Text Reranking
+
+#### Qwen3-Reranker
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_rerank \
+    --modality text \
+    --model qwen3-reranker \
+    --model-path $HF_CACHE/Qwen3-Reranker-0.6B
+```
+
+#### Jina-Reranker-V3
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_rerank \
+    --modality text \
+    --model jina-reranker-v3 \
+    --model-path $HF_CACHE/jina-reranker-v3
+```
+
+#### BGE-Reranker-Gemma
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_rerank \
+    --modality text \
+    --model bge-reranker-v2-gemma \
+    --model-path $HF_CACHE/bge-reranker-v2-gemma
+```
+
+### Multimodal Reranking
+
+#### Qwen3-VL-Reranker
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_rerank \
+    --modality multimodal \
+    --model qwen3-vl-reranker \
+    --model-path $HF_CACHE/Qwen3-VL-Reranker-2B
+```
+
+#### Jina-Reranker-M0
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_rerank \
+    --modality multimodal \
+    --model jina-reranker-m0 \
+    --model-path $HF_CACHE/jina-reranker-m0
+```
+
+### Batch Benchmarking All Models
+
+Use `bench_all.sh` to benchmark all supported models at once:
+
+```bash
+# Benchmark all models on GPU 0
+bash bench_all.sh 0 all
+
+# Benchmark specific categories
+bash bench_all.sh 0 embed       # Text embedding only
+bash bench_all.sh 0 rerank      # Text reranking only
+bash bench_all.sh 0 gen         # Text generation only
+bash bench_all.sh 0 vl_embed    # VL embedding only
+bash bench_all.sh 0 vl_rerank   # VL reranking only
+bash bench_all.sh 0 vl_gen      # VL generation only
+```
 
 ## 📝 Current Status
 
-⚠️ **Early Development**: This project is currently in active development. The core functionality for prefill-only inference has been implemented and tested, but the codebase is still being optimized and refined.
-
 **What Works:**
-- ✅ Single-token generation for text-only models
-- ✅ Single-token generation for multimodal models (Qwen3-VL, Qwen2-VL, Qwen2.5-VL, LLaVA-NeXT)
+- ✅ Single-token generation for text-only models (Qwen3)
+- ✅ Single-token generation for multimodal models (Qwen3-VL, Qwen2-VL, Qwen2.5-VL)
+- ✅ Text embedding (Qwen3-Embedding, BGE-Gemma2)
+- ✅ Multimodal embedding (Qwen3-VL-Embedding)
+- ✅ Text reranking (Qwen3-Reranker, Jina-Reranker-V3, BGE-Reranker-Gemma)
+- ✅ Multimodal reranking (Qwen3-VL-Reranker, Jina-Reranker-M0)
 - ✅ Memory-efficient inference without KV cache
 - ✅ Accuracy matching with Transformers baseline
 
-**Currently Supported Models:**
-- ✅ **Qwen3**: Text generation models (e.g., Qwen3-4B, Qwen3-0.6B)
-- ✅ **Qwen3-VL**: Multimodal generation models (e.g., Qwen3-VL-2B-Instruct)
-- ✅ **Qwen3-Embedding**: Embedding models for semantic search (e.g., Qwen3-Embedding-0.6B)
-- ✅ **bge-multilingual-gemma2**: Multilingual embedding models (e.g., bge-multilingual-gemma2)
+**Not Yet Supported:**
+- ❌ LLaVA-NeXT prefill-only (tensor shape mismatch in multimodal projector)
+- ❌ Jina-Embedding-V4 (custom modeling code incompatible with current transformers)
+- ❌ GME-Qwen2-VL (requires older transformers version)
+
+### Supported Models & VRAM Savings
+
+Our prefill-only optimization skips KV cache allocation entirely for embedding and reranker models, while vLLM allocates KV cache for ALL models (even when completely unused). On a 96GB H20 GPU, the KV cache alone can consume 82-85GB — meaning vLLM can only serve one embedding/reranker model per GPU, while our framework uses just the model weights.
+
+| Model | Category | Prefill-Only VRAM | vLLM-Style VRAM | KV Cache | VRAM Saved |
+|-------|----------|-------------------|-----------------|----------|------------|
+| Qwen3-0.6B | text_gen | 1,703 MB | 86,507 MB | 85,288 MB | **98.0%** |
+| Qwen3-VL-2B | vl_gen | 4,812 MB | 52,196 MB | - | **90.8%** |
+| Qwen2.5-VL-3B | vl_gen | 11,005 MB | 62,234 MB | - | **82.3%** |
+| Qwen3-Embedding-0.6B | text_embed | 1,177 MB | 86,472 MB | 85,288 MB | **98.6%** |
+| BGE-Gemma2 | text_embed | 17,665 MB | 87,469 MB | 69,804 MB | **79.8%** |
+| Qwen3-Reranker-0.6B | text_rerank | 1,453 MB | 86,168 MB | 84,980 MB | **98.3%** |
+| Jina-Reranker-V3 | text_rerank | 1,234 MB | 86,157 MB | 84,924 MB | **98.6%** |
+| BGE-Reranker-Gemma | text_rerank | 4,818 MB | 87,542 MB | 82,724 MB | **94.5%** |
+| Qwen3-VL-Embedding-2B | vl_embed | 4,780 MB | 85,706 MB | 82,264 MB | **94.4%** |
+| Qwen3-VL-Reranker-2B | vl_rerank | 4,844 MB | 85,706 MB | 82,264 MB | **94.3%** |
+| Jina-Reranker-M0 | vl_rerank | 4,661 MB | 87,541 MB | 82,880 MB | **94.7%** |
+
+#### How VRAM is Measured
+
+- **Prefill-Only VRAM**: Peak GPU memory allocated when loading and running inference with our framework (no KV cache). Measured via `torch.cuda.max_memory_allocated()` in an isolated subprocess to avoid CUDA memory pool contamination between models.
+- **vLLM-Style VRAM**: Simulates vLLM's behavior, which allocates KV cache even for embedding/reranker models. For models that can be loaded as generation models, we load them as such to force KV cache allocation and measure the peak. For models that cannot (e.g., VL rerankers), we compute the KV cache size using the same formula as vLLM: `available_memory = total_gpu_memory × gpu_memory_utilization - model_weights`, then add it to the model weight VRAM.
+- **KV Cache**: The size of the KV cache tensor alone, computed as `2 × num_layers × block_size × num_kv_heads × head_dim × dtype_bytes × num_blocks`. This memory is completely wasted for embedding/reranker models since they only need a single forward pass.
+- All measurements taken on NVIDIA H20 (96GB) GPUs with subprocess isolation (each model measured in a fresh process to avoid cross-model memory contamination).
 
 **In Progress:**
-- 🔄 **Model Support**: Adapting all 12 models from `bench_all.sh` (currently in development)
-  - Text-only: Qwen3-Reranker, Jina-Reranker-V3, BGE-Reranker-V2-Gemma
-  - Multimodal: Jina-Embedding-V4, Jina-Reranker-M0, LLaVA-NeXT, Qwen2-VL, Qwen2.5-VL
+- 🔄 LLaVA-NeXT prefill-only (tensor shape mismatch in multimodal projector)
+- 🔄 Jina-Embedding-V4 (custom modeling code incompatible with current transformers)
+- 🔄 GME-Qwen2-VL (requires older transformers version)
 - 🔄 Production-ready features and detailed demos
 
 ## 🏗️ Architecture

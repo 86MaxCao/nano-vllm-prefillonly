@@ -283,7 +283,11 @@ class Qwen2VLTextDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         rope_scaling = getattr(config, "rope_scaling", None)
-        # Handle dict config for rope_scaling
+        rope_theta = getattr(config, "rope_theta", 1000000)
+        # Handle dict config: rope_theta may be nested inside rope_scaling
+        if isinstance(rope_scaling, dict):
+            rope_theta = rope_scaling.get("rope_theta", rope_theta)
+            rope_scaling = None
         
         self.self_attn = Qwen2VLTextAttention(
             config=config,
@@ -294,7 +298,7 @@ class Qwen2VLTextDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, "attention_bias", True),
             head_dim=getattr(config, "head_dim", None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
+            rope_theta=rope_theta,
             rope_scaling=rope_scaling,
         )
         self.mlp = Qwen2VLTextMLP(

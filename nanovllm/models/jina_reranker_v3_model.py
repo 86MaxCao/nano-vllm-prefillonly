@@ -120,6 +120,12 @@ class JinaRerankerV3DecoderLayer(nn.Module):
         use_flex_attention: bool = False,  # Default to False, use Flash Attention
     ) -> None:
         super().__init__()
+        # Handle rope_scaling: HF configs may store it as a dict with rope_theta inside
+        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = getattr(config, "rope_theta", 1000000)
+        if isinstance(rope_scaling, dict):
+            rope_theta = rope_scaling.get("rope_theta", rope_theta)
+            rope_scaling = None
         self.self_attn = JinaRerankerV3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -128,8 +134,8 @@ class JinaRerankerV3DecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, 'attention_bias', True),
             head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
             use_flex_attention=use_flex_attention,
         )
         # Reuse MLP from Qwen3

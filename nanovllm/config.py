@@ -15,13 +15,13 @@ class Config:
     is_multimodal: bool = False  # Enable multimodal support
     multimodal_model_type: str = "qwen3_vl"  # "qwen3_vl", "qwen2_vl", "qwen2_5_vl", "llavanext"
     is_reranker: bool = False  # Enable reranker support
-    reranker_type: str | None = None  # "qwen3", "gemma", "jina_v3", etc.
-    is_original_qwen3_reranker: bool = False  # For original Qwen3-Reranker or Gemma-Reranker
+    reranker_type: str | None = None  # "qwen3", "qwen3_vl", "gemma", "jina_v3", "jina_m0"
+    is_original_qwen3_reranker: bool | None = None  # Auto-detected per reranker type; set True/False to override
     classifier_from_token: list[str] | None = None  # e.g., ["no", "yes"] for Qwen3-Reranker, ["Yes"] for Gemma-Reranker
     projector_dim: int = 512  # For jina-reranker-v3
     use_flex_attention: bool = True  # Use FlexAttention for listwise rerankers (jina_v3)
     is_embedding: bool = False  # Enable embedding model support
-    embedding_type: str | None = None  # "gemma2", "qwen3", "jina_v3", etc.
+    embedding_type: str | None = None  # "gemma2", "qwen3", "qwen3_vl", "jina_v4", "llavanext", "qwen2_vl_gme"
     pooling_type: str = "LAST"  # Pooling type: "LAST", "MEAN", "CLS"
     normalize_embeddings: bool = True  # Whether to normalize embeddings
     # Prefill-only optimizations
