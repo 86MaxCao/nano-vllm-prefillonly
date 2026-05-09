@@ -70,6 +70,7 @@ class Config:
         if not self.is_multimodal and _model_type in ("qwen3_5", "qwen3_5_moe"):
             if hasattr(self.hf_config, "vision_config"):
                 self.is_multimodal = True
+                self.multimodal_model_type = "qwen3_5"
         
         # Auto-enable prefill_only_mode for embedding/reranker models
         if self.is_embedding or self.is_reranker:

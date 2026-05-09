@@ -360,6 +360,8 @@ Our prefill-only optimization skips KV cache allocation entirely for embedding a
 | Model | Category | Prefill-Only VRAM | vLLM-Style VRAM | KV Cache | VRAM Saved |
 |-------|----------|-------------------|-----------------|----------|------------|
 | Qwen3-0.6B | text_gen | 1,703 MB | 86,507 MB | 85,288 MB | **98.0%** |
+| Qwen3.5-0.8B | text_gen | 7,075 MB | 47,119 MB | 40,044 MB | **85.0%** |
+| Qwen3.5-0.8B | vl_gen | 7,075 MB | 45,998 MB | 38,923 MB | **84.6%** |
 | Qwen3-VL-2B | vl_gen | 4,812 MB | 52,196 MB | - | **90.8%** |
 | Qwen2.5-VL-3B | vl_gen | 11,005 MB | 62,234 MB | - | **82.3%** |
 | Qwen3-Embedding-0.6B | text_embed | 1,177 MB | 86,472 MB | 85,288 MB | **98.6%** |
