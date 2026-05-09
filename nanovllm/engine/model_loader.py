@@ -104,11 +104,36 @@ try:
 except ImportError as e:
     QWEN3_VL_RERANKER_AVAILABLE = False
 
+try:
+    from nanovllm.models.qwen3_5 import load_qwen3_5_model, Qwen3_5TextForCausalLM
+    QWEN3_5_AVAILABLE = True
+except ImportError as e:
+    QWEN3_5_AVAILABLE = False
+
+try:
+    from nanovllm.models.qwen3_next import Qwen3NextForCausalLM
+    QWEN3_NEXT_AVAILABLE = True
+except ImportError as e:
+    QWEN3_NEXT_AVAILABLE = False
+
+try:
+    from nanovllm.models.qwen3_5_embedding import Qwen3_5Embedding
+    QWEN3_5_EMBEDDING_AVAILABLE = True
+except ImportError as e:
+    QWEN3_5_EMBEDDING_AVAILABLE = False
+
+try:
+    from nanovllm.models.qwen3_5_reranker import Qwen3_5Reranker
+    QWEN3_5_RERANKER_AVAILABLE = True
+except ImportError as e:
+    QWEN3_5_RERANKER_AVAILABLE = False
+
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 
 MULTIMODAL_AVAILABLE = (
     QWEN3_VL_AVAILABLE or QWEN2_VL_AVAILABLE or
-    QWEN2_5_VL_AVAILABLE or LLAVANEXT_AVAILABLE
+    QWEN2_5_VL_AVAILABLE or LLAVANEXT_AVAILABLE or
+    QWEN3_5_AVAILABLE
 )
 
 
@@ -153,7 +178,11 @@ def get_target_dtype_for_embedding_reranker(hf_config) -> torch.dtype:
 def infer_embedding_type(config: Config, hf_config) -> str | None:
     """Auto-detect embedding_type from model path or config."""
     model_path_lower = config.model.lower()
-    if "qwen3" in model_path_lower and ("vl" in model_path_lower or "vision" in model_path_lower):
+    if "qwen3_5" in model_path_lower or "qwen3.5" in model_path_lower:
+        if "vl" in model_path_lower or "vision" in model_path_lower:
+            return "qwen3_5"
+        return "qwen3_5"
+    elif "qwen3" in model_path_lower and ("vl" in model_path_lower or "vision" in model_path_lower):
         return "qwen3_vl"
     elif "qwen3" in model_path_lower:
         return "qwen3"
@@ -169,7 +198,9 @@ def infer_embedding_type(config: Config, hf_config) -> str | None:
         return "qwen2_vl_gme"
     else:
         model_type = getattr(hf_config, "model_type", "").lower()
-        if "qwen3" in model_type and ("vl" in model_type or hasattr(hf_config, "vision_config")):
+        if "qwen3_5" in model_type:
+            return "qwen3_5"
+        elif "qwen3" in model_type and ("vl" in model_type or hasattr(hf_config, "vision_config")):
             return "qwen3_vl"
         elif "qwen3" in model_type:
             return "qwen3"
@@ -181,7 +212,9 @@ def infer_embedding_type(config: Config, hf_config) -> str | None:
 def infer_reranker_type(config: Config, hf_config) -> str | None:
     """Auto-detect reranker_type from model path or config."""
     model_path_lower = config.model.lower()
-    if "qwen3" in model_path_lower and ("vl" in model_path_lower or "vision" in model_path_lower):
+    if "qwen3_5" in model_path_lower or "qwen3.5" in model_path_lower:
+        return "qwen3_5"
+    elif "qwen3" in model_path_lower and ("vl" in model_path_lower or "vision" in model_path_lower):
         return "qwen3_vl"
     elif "qwen3" in model_path_lower:
         return "qwen3"
@@ -193,7 +226,9 @@ def infer_reranker_type(config: Config, hf_config) -> str | None:
         return "jina_v3"
     else:
         model_type = getattr(hf_config, "model_type", "").lower()
-        if "qwen3" in model_type and ("vl" in model_type or hasattr(hf_config, "vision_config")):
+        if "qwen3_5" in model_type:
+            return "qwen3_5"
+        elif "qwen3" in model_type and ("vl" in model_type or hasattr(hf_config, "vision_config")):
             return "qwen3_vl"
         elif "qwen3" in model_type:
             return "qwen3"
@@ -205,7 +240,9 @@ def infer_multimodal_model_type(config: Config, hf_config) -> str | None:
     model_path_lower = config.model.lower()
     model_type = getattr(hf_config, "model_type", "").lower()
 
-    if "qwen3" in model_path_lower and "vl" in model_path_lower:
+    if "qwen3_5" in model_path_lower or "qwen3.5" in model_path_lower:
+        return "qwen3_5"
+    elif "qwen3" in model_path_lower and "vl" in model_path_lower:
         return "qwen3_vl"
     elif "qwen2_5" in model_path_lower and "vl" in model_path_lower:
         return "qwen2_5_vl"
@@ -213,6 +250,8 @@ def infer_multimodal_model_type(config: Config, hf_config) -> str | None:
         return "qwen2_vl"
     elif "llava" in model_path_lower:
         return "llavanext"
+    elif "qwen3_5" in model_type:
+        return "qwen3_5"
     elif "qwen3_vl" in model_type:
         return "qwen3_vl"
     elif "qwen2_5_vl" in model_type:
@@ -388,6 +427,18 @@ class ModelLoader:
             load_model(embedding_model, config.model, name_mapping=name_mapping)
             return embedding_model
 
+        elif embedding_type == "qwen3_5" and QWEN3_5_EMBEDDING_AVAILABLE:
+            text_config = getattr(hf_config, "text_config", hf_config)
+            embedding_model = Qwen3_5Embedding(
+                text_config,
+                pooling_type=pooling_type,
+                normalize=normalize_embeddings,
+            )
+            if target_dtype is not None:
+                embedding_model = embedding_model.to(target_dtype)
+            load_model(embedding_model, config.model)
+            return embedding_model
+
         else:
             raise ValueError(f"Unsupported embedding type: {embedding_type}")
 
@@ -485,13 +536,36 @@ class ModelLoader:
                 model.convert_from_original_reranker(tokenizer)
             return model
 
+        elif reranker_type == "qwen3_5" and QWEN3_5_RERANKER_AVAILABLE:
+            text_config = getattr(hf_config, "text_config", hf_config)
+            if is_original is None:
+                is_original = True
+            if classifier_tokens is None:
+                classifier_tokens = ["no", "yes"]
+            model = Qwen3_5Reranker(
+                text_config,
+                is_original_reranker=is_original,
+                classifier_from_token=classifier_tokens,
+            )
+            if target_dtype is not None:
+                model = model.to(target_dtype)
+            load_model(model, config.model)
+
+            if is_original:
+                from transformers import AutoTokenizer
+                tokenizer = AutoTokenizer.from_pretrained(config.model)
+                model.convert_from_original_reranker(tokenizer)
+            return model
+
         else:
             raise ValueError(f"Unsupported reranker type: {reranker_type}")
 
     @staticmethod
     def load_multimodal_model(config: Config, multimodal_model_type: str) -> torch.nn.Module:
         """Load a multimodal model."""
-        if multimodal_model_type == "qwen3_vl" and QWEN3_VL_AVAILABLE:
+        if multimodal_model_type == "qwen3_5" and QWEN3_5_AVAILABLE:
+            return load_qwen3_5_model(config.model, config)
+        elif multimodal_model_type == "qwen3_vl" and QWEN3_VL_AVAILABLE:
             return load_qwen3_vl_model(config.model, config)
         elif multimodal_model_type == "qwen2_vl" and QWEN2_VL_AVAILABLE:
             return load_qwen2_vl_model(config.model, config)
@@ -514,6 +588,18 @@ class ModelLoader:
             return model
         else:
             text_config = getattr(hf_config, "text_config", hf_config)
+            text_model_type = getattr(text_config, "model_type", None)
+            # Qwen3.5 text models use Qwen3Next or Qwen3_5TextForCausalLM
+            if text_model_type in ("qwen3_next", "qwen3_5", "qwen3_5_moe"):
+                if QWEN3_NEXT_AVAILABLE:
+                    model = Qwen3NextForCausalLM(text_config)
+                    load_model(model, config.model)
+                    return model
+                elif QWEN3_5_AVAILABLE:
+                    model = Qwen3_5TextForCausalLM(text_config)
+                    load_model(model, config.model)
+                    return model
+            # Default: Qwen3
             model = Qwen3ForCausalLM(text_config)
             load_model(model, config.model)
             return model

@@ -192,6 +192,15 @@ CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
     --model-path $HF_CACHE/Qwen3-4B
 ```
 
+#### Qwen3.5
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
+    --modality text \
+    --model qwen3.5 \
+    --model-path $HF_CACHE/Qwen3.5-4B
+```
+
 ### Multimodal Generation
 
 #### Qwen3-VL
@@ -201,6 +210,15 @@ CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
     --modality multimodal \
     --model qwen3vl \
     --model-path $HF_CACHE/Qwen3-VL-2B-Instruct
+```
+
+#### Qwen3.5-VL
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
+    --modality multimodal \
+    --model qwen3.5vl \
+    --model-path $HF_CACHE/Qwen3.5-VL-2B-Instruct
 ```
 
 #### Qwen2-VL
@@ -232,6 +250,15 @@ CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_embed \
     --model-path $HF_CACHE/Qwen3-Embedding-0.6B
 ```
 
+#### Qwen3.5-Embedding
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_embed \
+    --modality text \
+    --model qwen3.5-embedding \
+    --model-path $HF_CACHE/Qwen3.5-Embedding-0.6B
+```
+
 #### BGE-multilingual-gemma2
 
 ```bash
@@ -252,6 +279,15 @@ CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_embed \
     --model-path $HF_CACHE/Qwen3-VL-Embedding-2B
 ```
 
+#### Qwen3.5-VL-Embedding
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_embed \
+    --modality multimodal \
+    --model qwen3.5-vl-embedding \
+    --model-path $HF_CACHE/Qwen3.5-VL-Embedding-2B
+```
+
 ### Text Reranking
 
 #### Qwen3-Reranker
@@ -261,6 +297,15 @@ CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_rerank \
     --modality text \
     --model qwen3-reranker \
     --model-path $HF_CACHE/Qwen3-Reranker-0.6B
+```
+
+#### Qwen3.5-Reranker
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_rerank \
+    --modality text \
+    --model qwen3.5-reranker \
+    --model-path $HF_CACHE/Qwen3.5-Reranker-0.6B
 ```
 
 #### Jina-Reranker-V3
@@ -292,6 +337,15 @@ CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_rerank \
     --model-path $HF_CACHE/Qwen3-VL-Reranker-2B
 ```
 
+#### Qwen3.5-VL-Reranker
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_rerank \
+    --modality multimodal \
+    --model qwen3.5-vl-reranker \
+    --model-path $HF_CACHE/Qwen3.5-VL-Reranker-2B
+```
+
 #### Jina-Reranker-M0
 
 ```bash
@@ -321,12 +375,12 @@ bash bench_all.sh 0 vl_gen      # VL generation only
 ## 📝 Current Status
 
 **What Works:**
-- ✅ Single-token generation for text-only models (Qwen3)
-- ✅ Single-token generation for multimodal models (Qwen3-VL, Qwen2-VL, Qwen2.5-VL)
-- ✅ Text embedding (Qwen3-Embedding, BGE-Gemma2)
-- ✅ Multimodal embedding (Qwen3-VL-Embedding)
-- ✅ Text reranking (Qwen3-Reranker, Jina-Reranker-V3, BGE-Reranker-Gemma)
-- ✅ Multimodal reranking (Qwen3-VL-Reranker, Jina-Reranker-M0)
+- ✅ Single-token generation for text-only models (Qwen3, Qwen3.5)
+- ✅ Single-token generation for multimodal models (Qwen3-VL, Qwen3.5-VL, Qwen2-VL, Qwen2.5-VL)
+- ✅ Text embedding (Qwen3-Embedding, Qwen3.5-Embedding, BGE-Gemma2)
+- ✅ Multimodal embedding (Qwen3-VL-Embedding, Qwen3.5-VL-Embedding)
+- ✅ Text reranking (Qwen3-Reranker, Qwen3.5-Reranker, Jina-Reranker-V3, BGE-Reranker-Gemma)
+- ✅ Multimodal reranking (Qwen3-VL-Reranker, Qwen3.5-VL-Reranker, Jina-Reranker-M0)
 - ✅ Memory-efficient inference without KV cache
 - ✅ Accuracy matching with Transformers baseline
 
