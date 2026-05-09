@@ -116,18 +116,6 @@ try:
 except ImportError as e:
     QWEN3_NEXT_AVAILABLE = False
 
-try:
-    from nanovllm.models.qwen3_5_embedding import Qwen3_5Embedding
-    QWEN3_5_EMBEDDING_AVAILABLE = True
-except ImportError as e:
-    QWEN3_5_EMBEDDING_AVAILABLE = False
-
-try:
-    from nanovllm.models.qwen3_5_reranker import Qwen3_5Reranker
-    QWEN3_5_RERANKER_AVAILABLE = True
-except ImportError as e:
-    QWEN3_5_RERANKER_AVAILABLE = False
-
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 
 MULTIMODAL_AVAILABLE = (
@@ -178,11 +166,7 @@ def get_target_dtype_for_embedding_reranker(hf_config) -> torch.dtype:
 def infer_embedding_type(config: Config, hf_config) -> str | None:
     """Auto-detect embedding_type from model path or config."""
     model_path_lower = config.model.lower()
-    if "qwen3_5" in model_path_lower or "qwen3.5" in model_path_lower:
-        if "vl" in model_path_lower or "vision" in model_path_lower:
-            return "qwen3_5"
-        return "qwen3_5"
-    elif "qwen3" in model_path_lower and ("vl" in model_path_lower or "vision" in model_path_lower):
+    if "qwen3" in model_path_lower and ("vl" in model_path_lower or "vision" in model_path_lower):
         return "qwen3_vl"
     elif "qwen3" in model_path_lower:
         return "qwen3"
@@ -198,9 +182,7 @@ def infer_embedding_type(config: Config, hf_config) -> str | None:
         return "qwen2_vl_gme"
     else:
         model_type = getattr(hf_config, "model_type", "").lower()
-        if "qwen3_5" in model_type:
-            return "qwen3_5"
-        elif "qwen3" in model_type and ("vl" in model_type or hasattr(hf_config, "vision_config")):
+        if "qwen3" in model_type and ("vl" in model_type or hasattr(hf_config, "vision_config")):
             return "qwen3_vl"
         elif "qwen3" in model_type:
             return "qwen3"
@@ -212,9 +194,7 @@ def infer_embedding_type(config: Config, hf_config) -> str | None:
 def infer_reranker_type(config: Config, hf_config) -> str | None:
     """Auto-detect reranker_type from model path or config."""
     model_path_lower = config.model.lower()
-    if "qwen3_5" in model_path_lower or "qwen3.5" in model_path_lower:
-        return "qwen3_5"
-    elif "qwen3" in model_path_lower and ("vl" in model_path_lower or "vision" in model_path_lower):
+    if "qwen3" in model_path_lower and ("vl" in model_path_lower or "vision" in model_path_lower):
         return "qwen3_vl"
     elif "qwen3" in model_path_lower:
         return "qwen3"
@@ -226,9 +206,7 @@ def infer_reranker_type(config: Config, hf_config) -> str | None:
         return "jina_v3"
     else:
         model_type = getattr(hf_config, "model_type", "").lower()
-        if "qwen3_5" in model_type:
-            return "qwen3_5"
-        elif "qwen3" in model_type and ("vl" in model_type or hasattr(hf_config, "vision_config")):
+        if "qwen3" in model_type and ("vl" in model_type or hasattr(hf_config, "vision_config")):
             return "qwen3_vl"
         elif "qwen3" in model_type:
             return "qwen3"
@@ -427,18 +405,6 @@ class ModelLoader:
             load_model(embedding_model, config.model, name_mapping=name_mapping)
             return embedding_model
 
-        elif embedding_type == "qwen3_5" and QWEN3_5_EMBEDDING_AVAILABLE:
-            text_config = getattr(hf_config, "text_config", hf_config)
-            embedding_model = Qwen3_5Embedding(
-                text_config,
-                pooling_type=pooling_type,
-                normalize=normalize_embeddings,
-            )
-            if target_dtype is not None:
-                embedding_model = embedding_model.to(target_dtype)
-            load_model(embedding_model, config.model)
-            return embedding_model
-
         else:
             raise ValueError(f"Unsupported embedding type: {embedding_type}")
 
@@ -533,27 +499,6 @@ class ModelLoader:
             if is_original:
                 from transformers import AutoTokenizer
                 tokenizer = AutoTokenizer.from_pretrained(config.model, trust_remote_code=True)
-                model.convert_from_original_reranker(tokenizer)
-            return model
-
-        elif reranker_type == "qwen3_5" and QWEN3_5_RERANKER_AVAILABLE:
-            text_config = getattr(hf_config, "text_config", hf_config)
-            if is_original is None:
-                is_original = True
-            if classifier_tokens is None:
-                classifier_tokens = ["no", "yes"]
-            model = Qwen3_5Reranker(
-                text_config,
-                is_original_reranker=is_original,
-                classifier_from_token=classifier_tokens,
-            )
-            if target_dtype is not None:
-                model = model.to(target_dtype)
-            load_model(model, config.model)
-
-            if is_original:
-                from transformers import AutoTokenizer
-                tokenizer = AutoTokenizer.from_pretrained(config.model)
                 model.convert_from_original_reranker(tokenizer)
             return model
 

@@ -92,9 +92,7 @@ def get_embedding_type_from_model(model_name: str) -> str:
     model_lower = model_name.lower()
     
     # Model name to embedding type mapping
-    if "qwen3.5" in model_lower or "qwen3_5" in model_lower:
-        return "qwen3_5"
-    elif "qwen3" in model_lower or "qwen3-embedding" in model_lower:
+    if "qwen3" in model_lower or "qwen3-embedding" in model_lower:
         return "qwen3"
     elif "gemma2" in model_lower or "bge-multilingual-gemma2" in model_lower:
         return "gemma2"
@@ -105,7 +103,7 @@ def get_embedding_type_from_model(model_name: str) -> str:
     else:
         raise ValueError(
             f"Unknown model: {model_name}. "
-            f"Supported models: qwen3-embedding, qwen3.5-embedding, gemma2, jina-embedding-v4, jina-embedding-v3"
+            f"Supported models: qwen3-embedding, gemma2, jina-embedding-v4, jina-embedding-v3"
         )
 
 
@@ -127,7 +125,6 @@ def should_test_model(model_name: str) -> bool:
         "qwen2vl": ["qwen2vl", "qwen2_vl", "qwen2-vl"],
         "qwen2.5vl": ["qwen2.5vl", "qwen2_5_vl", "qwen2.5-vl"],
         "qwen3vl": ["qwen3vl", "qwen3_vl", "qwen3-vl"],
-        "qwen3.5vl": ["qwen3.5vl", "qwen3_5_vl", "qwen3.5-vl", "qwen3-5vl"],
         "llavanext": ["llavanext", "llava-v1.6", "llava_v1.6"],
     }
 
