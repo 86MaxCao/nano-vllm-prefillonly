@@ -258,6 +258,79 @@ class ModelRunner:
         seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
         self.run(seqs, True)
         torch.cuda.empty_cache()
+        # Reset GatedDeltaNet states after warmup to avoid polluting real sequences
+        self._reset_gdn_states()
+
+    def _reset_gdn_states(self):
+        """Reset Qwen3.5/Qwen3Next linear-attn recurrent states if present."""
+        if hasattr(self.model, "language_model") and hasattr(
+            self.model.language_model, "model"
+        ):
+            for layer in self.model.language_model.model.layers:
+                if hasattr(layer, "linear_attn") and layer.linear_attn is not None:
+                    if hasattr(layer.linear_attn, "reset_state"):
+                        layer.linear_attn.reset_state()
+
+    def cleanup_seq_states(self, seq_ids: list[int]):
+        """Remove GDN state_cache entries for finished sequences."""
+        if hasattr(self.model, "language_model") and hasattr(
+            self.model.language_model, "model"
+        ):
+            for layer in self.model.language_model.model.layers:
+                if hasattr(layer, "linear_attn") and layer.linear_attn is not None:
+                    state_cache = getattr(layer.linear_attn, "state_cache", None)
+                    if state_cache is not None:
+                        for sid in seq_ids:
+                            state_cache.pop(sid, None)
+                    counter = getattr(layer.linear_attn, "_decode_step_counter", None)
+                    if counter is not None:
+                        for sid in seq_ids:
+                            counter.pop(sid, None)
+
+    def _gather_gdn_states(self, sequence_ids: list[int], bs: int):
+        """Copy per-sequence states from state_cache into graph buffers before replay."""
+        if not hasattr(self.model, "language_model") or not hasattr(
+            self.model.language_model, "model"
+        ):
+            return
+        for layer in self.model.language_model.model.layers:
+            if hasattr(layer, "linear_attn") and layer.linear_attn is not None:
+                gdn = layer.linear_attn
+                for i, seq_id in enumerate(sequence_ids):
+                    conv_state, recurrent_state = gdn.state_cache.get(seq_id, (None, None))
+                    if conv_state is not None:
+                        gdn._graph_conv_state[i].copy_(conv_state.squeeze(0))
+                    else:
+                        gdn._graph_conv_state[i].zero_()
+                    if recurrent_state is not None:
+                        gdn._graph_recurrent_state[i].copy_(recurrent_state.squeeze(0))
+                    else:
+                        gdn._graph_recurrent_state[i].zero_()
+
+    def _scatter_gdn_states(self, sequence_ids: list[int], bs: int):
+        """Copy updated graph buffers back into state_cache after replay."""
+        if not hasattr(self.model, "language_model") or not hasattr(
+            self.model.language_model, "model"
+        ):
+            return
+        for layer in self.model.language_model.model.layers:
+            if hasattr(layer, "linear_attn") and layer.linear_attn is not None:
+                gdn = layer.linear_attn
+                for i, seq_id in enumerate(sequence_ids):
+                    gdn.state_cache[seq_id] = (
+                        gdn._graph_conv_state[i : i + 1].clone(),
+                        gdn._graph_recurrent_state[i : i + 1].clone(),
+                    )
+
+    def _has_gdn_layers(self) -> bool:
+        """Check if the model has GatedDeltaNet layers."""
+        if hasattr(self.model, "language_model") and hasattr(
+            self.model.language_model, "model"
+        ):
+            for layer in self.model.language_model.model.layers:
+                if hasattr(layer, "linear_attn") and layer.linear_attn is not None:
+                    return True
+        return False
 
     def allocate_kv_cache(self):
         # Reranker and embedding models don't need KV cache (prefill-only)
@@ -366,9 +439,17 @@ class ModelRunner:
         if num_hidden_layers is None:
             raise ValueError("Model config missing num_hidden_layers")
         
+        # For mixed-architecture models (e.g., Qwen3.5 with GatedDeltaNet),
+        # only full_attention layers need KV cache
+        layer_types = getattr(text_config, "layer_types", None)
+        if layer_types is not None:
+            num_attention_layers = sum(1 for lt in layer_types if lt == "full_attention")
+        else:
+            num_attention_layers = num_hidden_layers
+        
         block_bytes = (
             2
-            * num_hidden_layers
+            * num_attention_layers
             * self.block_size
             * num_kv_heads
             * head_dim
@@ -388,7 +469,7 @@ class ModelRunner:
             )
         self.kv_cache = torch.empty(
             2,
-            num_hidden_layers,
+            num_attention_layers,
             config.num_kvcache_blocks,
             self.block_size,
             num_kv_heads,
@@ -402,6 +483,10 @@ class ModelRunner:
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+        assert layer_id == num_attention_layers, (
+            f"KV cache allocation mismatch: expected {num_attention_layers} attention layers, "
+            f"but found {layer_id} layers with k_cache/v_cache attributes."
+        )
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs) if seqs else 0
@@ -636,7 +721,14 @@ class ModelRunner:
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = (
                 context.block_tables
             )
+            # Gather per-sequence GDN states into graph buffers before replay
+            if seqs is not None:
+                seq_ids = [seq.seq_id for seq in seqs]
+                self._gather_gdn_states(seq_ids, bs)
             graph.replay()
+            # Scatter updated GDN states back to per-sequence state_cache after replay
+            if seqs is not None:
+                self._scatter_gdn_states(seq_ids, bs)
             # For embedding models, forward() returns embeddings directly
             # For reranker models, forward() returns hidden_states (no logits)
             # For language models, forward() returns hidden_states and needs
@@ -1594,6 +1686,8 @@ class ModelRunner:
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
+        
+        has_gdn = self._has_gdn_layers()
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
@@ -1603,16 +1697,38 @@ class ModelRunner:
                 context_lens=context_lens[:bs],
                 block_tables=block_tables[:bs],
             )
-            warmup_out = self.model(input_ids[:bs], positions[:bs])
-            outputs[:bs] = warmup_out  # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                capture_out = self.model(input_ids[:bs], positions[:bs])
-                outputs[:bs] = capture_out  # capture
+            # Reset GDN states before each capture
+            if has_gdn:
+                self._reset_gdn_states()
+            # For models with GDN layers, pass use_graph=True and sequence_lengths
+            if has_gdn:
+                sequence_lengths = [1] * bs
+                warmup_out = self.model(
+                    input_ids[:bs], positions[:bs],
+                    sequence_lengths=sequence_lengths, use_graph=True,
+                )
+                outputs[:bs] = warmup_out
+                with torch.cuda.graph(graph, self.graph_pool):
+                    capture_out = self.model(
+                        input_ids[:bs], positions[:bs],
+                        sequence_lengths=sequence_lengths, use_graph=True,
+                    )
+                    outputs[:bs] = capture_out
+            else:
+                warmup_out = self.model(input_ids[:bs], positions[:bs])
+                outputs[:bs] = warmup_out  # warmup
+                with torch.cuda.graph(graph, self.graph_pool):
+                    capture_out = self.model(input_ids[:bs], positions[:bs])
+                    outputs[:bs] = capture_out  # capture
             if self.graph_pool is None:
                 self.graph_pool = graph.pool()
             self.graphs[bs] = graph
             torch.cuda.synchronize()
             reset_context()
+
+        # Reset GDN states after all captures
+        if has_gdn:
+            self._reset_gdn_states()
 
         self.graph_vars = dict(
             input_ids=input_ids,

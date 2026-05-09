@@ -35,6 +35,12 @@ bench_embed() {
         --model qwen3-embedding \
         --model-path $HF_CACHE/Qwen3-Embedding-0.6B || warn "Qwen3-Embedding failed"
 
+    log "Qwen3.5-Embedding-0.6B"
+    python3 -m examples.bench_prefillonly_embed \
+        --modality text --batch-size 512 \
+        --model qwen3.5-embedding \
+        --model-path $HF_CACHE/Qwen3.5-Embedding-0.6B || warn "Qwen3.5-Embedding failed"
+
     log "BGE-multilingual-gemma2"
     python3 -m examples.bench_prefillonly_embed \
         --modality text --batch-size 512 \
@@ -54,6 +60,12 @@ bench_rerank() {
         --model qwen3-reranker \
         --model-path $HF_CACHE/Qwen3-Reranker-0.6B || warn "Qwen3-Reranker failed"
 
+    log "Qwen3.5-Reranker-0.6B"
+    python3 -m examples.bench_prefillonly_rerank \
+        --modality text --batch-size 512 \
+        --model qwen3.5-reranker \
+        --model-path $HF_CACHE/Qwen3.5-Reranker-0.6B || warn "Qwen3.5-Reranker failed"
+
     log "Jina-Reranker-V3"
     python3 -m examples.bench_prefillonly_rerank \
         --modality text --batch-size 512 \
@@ -72,6 +84,12 @@ bench_gen() {
         --modality text \
         --model qwen3 \
         --model-path $HF_CACHE/Qwen3-4B || warn "Qwen3-4B failed"
+
+    log "Qwen3.5-4B"
+    python3 -m examples.bench_prefillonly_gen \
+        --modality text \
+        --model qwen3.5 \
+        --model-path $HF_CACHE/Qwen3.5-4B || warn "Qwen3.5-4B failed"
 }
 
 # ============================================================================
@@ -85,6 +103,12 @@ bench_vl_embed() {
         --modality multimodal \
         --model qwen3-vl-embedding \
         --model-path $HF_CACHE/Qwen3-VL-Embedding-2B || warn "Qwen3-VL-Embedding failed"
+
+    log "Qwen3.5-VL-Embedding-2B"
+    python3 -m examples.bench_prefillonly_embed \
+        --modality multimodal \
+        --model qwen3.5-vl-embedding \
+        --model-path $HF_CACHE/Qwen3.5-VL-Embedding-2B || warn "Qwen3.5-VL-Embedding failed"
 
     log "Jina-Embeddings-V4"
     python3 -m examples.bench_prefillonly_embed \
@@ -105,6 +129,12 @@ bench_vl_rerank() {
         --model qwen3-vl-reranker \
         --model-path $HF_CACHE/Qwen3-VL-Reranker-2B || warn "Qwen3-VL-Reranker failed"
 
+    log "Qwen3.5-VL-Reranker-2B"
+    python3 -m examples.bench_prefillonly_rerank \
+        --modality multimodal \
+        --model qwen3.5-vl-reranker \
+        --model-path $HF_CACHE/Qwen3.5-VL-Reranker-2B || warn "Qwen3.5-VL-Reranker failed"
+
     log "Jina-Reranker-M0"
     python3 -m examples.bench_prefillonly_rerank \
         --modality multimodal \
@@ -122,6 +152,11 @@ bench_vl_gen() {
     python3 -m examples.bench_prefillonly_gen \
         --modality multimodal --model qwen3vl \
         --model-path $HF_CACHE/Qwen3-VL-2B-Instruct || warn "Qwen3-VL failed"
+
+    log "Qwen3.5-VL-2B"
+    python3 -m examples.bench_prefillonly_gen \
+        --modality multimodal --model qwen3.5vl \
+        --model-path $HF_CACHE/Qwen3.5-VL-2B-Instruct || warn "Qwen3.5-VL failed"
 
     log "Qwen2-VL-2B"
     python3 -m examples.bench_prefillonly_gen \

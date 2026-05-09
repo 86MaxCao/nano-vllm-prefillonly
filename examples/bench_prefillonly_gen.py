@@ -80,6 +80,7 @@ def should_test_model(model_name: str) -> bool:
         "qwen2vl": ["qwen2vl", "qwen2_vl", "qwen2-vl"],
         "qwen2.5vl": ["qwen2.5vl", "qwen2_5_vl", "qwen2.5-vl", "qwen2-5vl"],
         "qwen3vl": ["qwen3vl", "qwen3_vl", "qwen3-vl"],
+        "qwen3.5vl": ["qwen3.5vl", "qwen3_5_vl", "qwen3.5-vl", "qwen3-5vl"],
         "llavanext": ["llavanext", "llava-v1.6", "llava_v1.6"],
     }
     
@@ -1447,19 +1448,20 @@ def test_generation_comprehensive(
             "qwen2vl": "qwen2_vl",
             "qwen2.5vl": "qwen2_5_vl",
             "qwen3vl": "qwen3_vl",
+            "qwen3.5vl": "qwen3_5",
         }
-        
+
         # Find matching model type
         model_type = None
         for name, mtype in model_type_mapping.items():
             if name in model_lower:
                 model_type = mtype
                 break
-        
+
         if model_type is None:
             raise ValueError(
                 f"Unknown model: {model}. "
-                f"Supported models: llavanext, qwen2vl, qwen2.5vl, qwen3vl"
+                f"Supported models: llavanext, qwen2vl, qwen2.5vl, qwen3vl, qwen3.5vl"
             )
         
         vlm_models = [(model, model_type, model_path)]

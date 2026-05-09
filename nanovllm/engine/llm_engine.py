@@ -155,6 +155,10 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
+        # Clean up GDN states for finished sequences
+        finished_seq_ids = [seq.seq_id for seq in seqs if seq.is_finished]
+        if finished_seq_ids:
+            self.model_runner.call("cleanup_seq_states", finished_seq_ids)
         outputs = [
             (seq.seq_id, seq.completion_token_ids)
             for seq in seqs
