@@ -101,7 +101,6 @@ def should_test_model(model_name: str) -> bool:
         "qwen2vl": ["qwen2vl", "qwen2_vl", "qwen2-vl"],
         "qwen2.5vl": ["qwen2.5vl", "qwen2_5_vl", "qwen2.5-vl"],
         "qwen3vl": ["qwen3vl", "qwen3_vl", "qwen3-vl"],
-        "qwen3.5vl": ["qwen3.5vl", "qwen3_5_vl", "qwen3.5-vl", "qwen3-5vl"],
         "llavanext": ["llavanext", "llava-v1.6", "llava_v1.6"],
     }
     
@@ -128,14 +127,12 @@ def get_reranker_type_from_model(model_name: str) -> tuple[str, bool]:
         return ("jina_v3", True)  # jina_v3 is listwise
     elif "bge-reranker-v2-gemma" in model_lower or "bge_reranker_v2_gemma" in model_lower:
         return ("gemma", False)  # gemma is pointwise
-    elif "qwen3.5-reranker" in model_lower or "qwen3.5_reranker" in model_lower:
-        return ("qwen3_5", False)  # qwen3.5 is pointwise
     elif "qwen3-reranker" in model_lower or "qwen3_reranker" in model_lower or "jina-reranker-m0" in model_lower:
         return ("qwen3", False)  # qwen3 and jina-m0 are pointwise
     else:
         raise ValueError(
             f"Unknown model: {model_name}. "
-            f"Supported models: qwen3-reranker, qwen3.5-reranker, jina-reranker-v3, bge-reranker-v2-gemma, jina-reranker-m0"
+            f"Supported models: qwen3-reranker, jina-reranker-v3, bge-reranker-v2-gemma, jina-reranker-m0"
         )
 
 
