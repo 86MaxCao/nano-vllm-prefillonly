@@ -80,50 +80,23 @@ class Qwen3Reranker(Qwen3ForCausalLM):
         """
         batch_size, seq_len, hidden_size = hidden_states.shape
         
-        print(f"[DEBUG compute_score] token_indices: {token_indices}")
-        print(f"[DEBUG compute_score] attention_mask: {attention_mask}")
-        if attention_mask is not None:
-            print(f"[DEBUG compute_score] attention_mask shape: {attention_mask.shape}")
-        
         if token_indices is None:
-            # Use the actual last token position for each sequence (not padding position)
-            # Transformers uses logits[:, -1, :], but for padded sequences, we need to use
-            # the actual last token position (seq_len_actual - 1) instead of seq_len - 1
-            # to avoid getting padding positions (which are zeros in our implementation)
             if attention_mask is not None:
-                # Calculate actual sequence lengths from attention_mask
-                seq_lens_actual = attention_mask.sum(dim=1)  # [batch_size]
-                # Use actual last token position for each sequence
+                seq_lens_actual = attention_mask.sum(dim=1)
                 token_indices = (seq_lens_actual - 1).to(torch.int64)
-                print(f"[DEBUG] Using actual last token positions: {token_indices.tolist()} (from seq_lens: {seq_lens_actual.tolist()})")
             else:
-                # If no attention_mask, assume all sequences have the same length
                 token_indices = torch.full(
                     (batch_size,), seq_len - 1,
                 dtype=torch.int64,
                 device=hidden_states.device,
             )
-                print(f"[DEBUG] Using seq_len - 1 = {seq_len - 1} as token_indices (no attention_mask)")
         
-        # Extract hidden states at specified positions
-        # token_indices is [batch_size] with seq positions
         batch_indices = torch.arange(batch_size, device=hidden_states.device)
-        selected_states = hidden_states[batch_indices, token_indices]  # [batch_size, hidden_size]
-        print(f"[DEBUG] selected_states shape: {selected_states.shape}")
-        print(f"[DEBUG] selected_states mean: {selected_states.mean().item():.6f}, std: {selected_states.std().item():.6f}")
-        print(f"[DEBUG] selected_states first seq: {selected_states[0, :10].tolist()}... (first 10)")
-        print(f"[DEBUG] selected_states second seq: {selected_states[1, :10].tolist()}... (first 10)")
+        selected_states = hidden_states[batch_indices, token_indices]
         
-        # Compute raw score (logit(yes) - logit(no))
         raw_scores = self.score_head(selected_states).squeeze(-1)
-        print(f"[DEBUG] raw_scores: {raw_scores.tolist()}")
-        print(f"[DEBUG] score_head weight mean: {self.score_head.weight.data.mean().item():.6f}, std: {self.score_head.weight.data.std().item():.6f}")
         
-        # Apply sigmoid to convert to probability (matching transformers
-        # baseline). This is equivalent to:
-        # exp(log_softmax([logit(no), logit(yes)])[1])
         scores = torch.sigmoid(raw_scores)
-        print(f"[DEBUG] scores after sigmoid: {scores.tolist()}")
         return scores
 
     def convert_from_original_reranker(self, tokenizer):
@@ -197,13 +170,6 @@ class Qwen3Reranker(Qwen3ForCausalLM):
                 weight_true = full_weight[[true_id]].to(torch.float32)
                 weight_false = full_weight[[false_id]].to(torch.float32)
                 score_weight = (weight_true - weight_false).to(model_dtype)
-            
-            print(f"[DEBUG] Weight conversion:")
-            print(f"[DEBUG]   true_id: {true_id}, false_id: {false_id}")
-            print(f"[DEBUG]   vocab_start_idx: {vocab_start_idx}, vocab_end_idx: {vocab_end_idx}")
-            print(f"[DEBUG]   weight_true shape: {weight_true.shape}, mean: {weight_true.mean().item():.6f}, std: {weight_true.std().item():.6f}")
-            print(f"[DEBUG]   weight_false shape: {weight_false.shape}, mean: {weight_false.mean().item():.6f}, std: {weight_false.std().item():.6f}")
-            print(f"[DEBUG]   score_weight shape: {score_weight.shape}, mean: {score_weight.mean().item():.6f}, std: {score_weight.std().item():.6f}")
         
         # Create score_head and load the converted weight
         # vLLM uses weight_loader, but we can directly copy since score_weight is already [1, hidden_size]

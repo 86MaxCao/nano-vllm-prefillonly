@@ -144,7 +144,9 @@ class Qwen2_5VLTextDecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = getattr(config, "rope_theta", 1000000)
         if isinstance(rope_scaling, dict):
+            rope_theta = rope_scaling.get("rope_theta", rope_theta)
             rope_scaling = None
 
         self.self_attn = Qwen2_5VLTextAttention(
@@ -155,7 +157,7 @@ class Qwen2_5VLTextDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, "attention_bias", True),
             head_dim=getattr(config, "head_dim", None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
+            rope_theta=rope_theta,
             rope_scaling=rope_scaling,
         )
         self.mlp = Qwen2_5VLTextMLP(
@@ -228,7 +230,7 @@ class Qwen2_5VLTextForCausalLM(nn.Module):
         super().__init__()
         self.model = Qwen2_5VLTextModel(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
-        if config.tie_word_embeddings:
+        if getattr(config, "tie_word_embeddings", False):
             self.lm_head.weight.data = self.model.embed_tokens.weight.data
 
     def forward(

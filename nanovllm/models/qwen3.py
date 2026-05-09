@@ -123,6 +123,12 @@ class Qwen3DecoderLayer(nn.Module):
         config: Qwen3Config,
     ) -> None:
         super().__init__()
+        # Handle rope_scaling: HF configs may store it as a dict with rope_theta inside
+        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta = getattr(config, "rope_theta", 1000000)
+        if isinstance(rope_scaling, dict):
+            rope_theta = rope_scaling.get("rope_theta", rope_theta)
+            rope_scaling = None
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -131,8 +137,8 @@ class Qwen3DecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, 'attention_bias', True),
             head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,

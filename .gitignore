@@ -203,6 +203,9 @@ deprecated/
 docs/
 **/docs/
 
+# Qoder CLI
+.qoder/
+
 # log directories
 log/
 **/log/
