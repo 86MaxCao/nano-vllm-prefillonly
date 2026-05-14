@@ -533,6 +533,9 @@ class ModelLoader:
             return model
         else:
             text_config = getattr(hf_config, "text_config", hf_config)
+            # Propagate tie_word_embeddings from parent config if missing on text_config
+            if not hasattr(text_config, "tie_word_embeddings") and hasattr(hf_config, "tie_word_embeddings"):
+                text_config.tie_word_embeddings = hf_config.tie_word_embeddings
             text_model_type = getattr(text_config, "model_type", None)
             # Qwen3.5 text models use Qwen3Next or Qwen3_5TextForCausalLM
             if text_model_type in ("qwen3_next", "qwen3_5", "qwen3_5_moe"):

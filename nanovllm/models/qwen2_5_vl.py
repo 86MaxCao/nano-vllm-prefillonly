@@ -372,7 +372,8 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         **kwargs,
     ) -> torch.Tensor:
-        # Qwen2_5-VL vision attention implementation (similar to transformers)
+        from flash_attn import flash_attn_varlen_func
+
         seq_length = hidden_states.shape[0]
         query_states, key_states, value_states = (
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
@@ -380,18 +381,23 @@ class Qwen2_5_VLVisionAttention(nn.Module):
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
 
-        query_states = query_states.transpose(0, 1).unsqueeze(0)
-        key_states = key_states.transpose(0, 1).unsqueeze(0)
-        value_states = value_states.transpose(0, 1).unsqueeze(0)
+        # flash_attn_varlen_func expects (total_tokens, num_heads, head_dim)
+        # query_states is already (seq_length, num_heads, head_dim)
+        cu_lens = cu_seqlens.to(torch.int32)
+        if cu_lens[0] != 0:
+            cu_lens = torch.cat([torch.zeros(1, dtype=torch.int32, device=cu_lens.device), cu_lens])
+        max_seqlen = int((cu_lens[1:] - cu_lens[:-1]).max().item())
 
-        # Simple eager attention for now (can be optimized with flash attention later)
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max() if cu_seqlens.numel() > 1 else seq_length
-        
-        attn_weights = torch.matmul(query_states, key_states.transpose(-1, -2)) * self.scaling
-        attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
-        
-        attn_output = attn_output.squeeze(0).transpose(0, 1).reshape(seq_length, -1)
+        attn_output = flash_attn_varlen_func(
+            query_states, key_states, value_states,
+            cu_seqlens_q=cu_lens,
+            cu_seqlens_k=cu_lens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=False,
+        )
+
+        attn_output = attn_output.reshape(seq_length, -1)
         attn_output = self.proj(attn_output)
         return attn_output
 
@@ -601,36 +607,36 @@ class Qwen2_5_VisionEncoder(nn.Module):
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
         
         # Debug: log cu_seqlens calculation
-        if not hasattr(self, '_debug_cu_seqlens_logged'):
-            print(
-                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
-                f"=== CU Sequence Lengths Calculation ==="
-            )
-            print(
-                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
-                f"grids shape: {grids.shape}, values:\n{grids.cpu().tolist()}"
-            )
-            print(
-                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
-                f"spatial_tokens_per_frame: {spatial_tokens_per_frame.cpu().tolist()}"
-            )
-            print(
-                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
-                f"grids[:, 0] (temporal): {grids[:, 0].cpu().tolist()}"
-            )
-            print(
-                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
-                f"cu_seqlens (before pad): {cu_seqlens[1:].cpu().tolist()}"
-            )
-            print(
-                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
-                f"cu_seqlens (after pad): {cu_seqlens.cpu().tolist()}"
-            )
-            print(
-                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
-                f"hidden_states shape before blocks: {hidden_states.shape}"
-            )
-            self._debug_cu_seqlens_logged = True
+        # if not hasattr(self, '_debug_cu_seqlens_logged'):
+            # print(
+                # f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                # f"=== CU Sequence Lengths Calculation ==="
+            # )
+            # print(
+                # f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                # f"grids shape: {grids.shape}, values:\n{grids.cpu().tolist()}"
+            # )
+            # print(
+                # f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                # f"spatial_tokens_per_frame: {spatial_tokens_per_frame.cpu().tolist()}"
+            # )
+            # print(
+                # f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                # f"grids[:, 0] (temporal): {grids[:, 0].cpu().tolist()}"
+            # )
+            # print(
+                # f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                # f"cu_seqlens (before pad): {cu_seqlens[1:].cpu().tolist()}"
+            # )
+            # print(
+                # f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                # f"cu_seqlens (after pad): {cu_seqlens.cpu().tolist()}"
+            # )
+            # print(
+                # f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                # f"hidden_states shape before blocks: {hidden_states.shape}"
+            # )
+            # self._debug_cu_seqlens_logged = True
 
         for block in self.vision.blocks:
             hidden_states = block(hidden_states, cu_seqlens, position_embeddings=position_embeddings)
@@ -638,36 +644,36 @@ class Qwen2_5_VisionEncoder(nn.Module):
         hidden_states = self.vision.merger(hidden_states)
         
         # Debug: log after merger
-        if not hasattr(self, '_debug_after_merger_logged'):
-            print(
-                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
-                f"hidden_states shape after merger: {hidden_states.shape}"
-            )
-            spatial_merge_size = self.config.spatial_merge_size
-            print(
-                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
-                f"spatial_merge_size: {spatial_merge_size}"
-            )
-            self._debug_after_merger_logged = True
+        # if not hasattr(self, '_debug_after_merger_logged'):
+            # print(
+                # f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                # f"hidden_states shape after merger: {hidden_states.shape}"
+            # )
+            # spatial_merge_size = self.config.spatial_merge_size
+            # print(
+                # f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                # f"spatial_merge_size: {spatial_merge_size}"
+            # )
+            # self._debug_after_merger_logged = True
 
         split_sizes = (grids.prod(-1) // (self.config.spatial_merge_size**2)).tolist()
         image_chunks = list(torch.split(hidden_states, split_sizes))
         
         # Debug: log split results
-        if not hasattr(self, '_debug_split_sizes_logged'):
-            print(
-                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
-                f"split_sizes: {split_sizes}"
-            )
-            print(
-                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
-                f"image_chunks lengths: {[chunk.shape[0] for chunk in image_chunks]}"
-            )
-            print(
-                f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
-                f"Total hidden_states: {hidden_states.shape[0]}, sum of split_sizes: {sum(split_sizes)}"
-            )
-            self._debug_split_sizes_logged = True
+        # if not hasattr(self, '_debug_split_sizes_logged'):
+            # print(
+                # f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                # f"split_sizes: {split_sizes}"
+            # )
+            # print(
+                # f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                # f"image_chunks lengths: {[chunk.shape[0] for chunk in image_chunks]}"
+            # )
+            # print(
+                # f"[DEBUG qwen2.5vl._run_vision_from_tokens] "
+                # f"Total hidden_states: {hidden_states.shape[0]}, sum of split_sizes: {sum(split_sizes)}"
+            # )
+            # self._debug_split_sizes_logged = True
 
         return image_chunks
 
@@ -728,28 +734,28 @@ class Qwen2_5_VisionEncoder(nn.Module):
                 flat = pixel_values
 
             # Debug: log splitting details
-            if not hasattr(self, '_debug_vision_encoder_split_logged'):
-                print(
-                    f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
-                    f"=== Vision Encoder Flattened Input Processing ==="
-                )
-                print(
-                    f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
-                    f"pixel_values shape: {pixel_values.shape}, dim: {pixel_values.dim()}"
-                )
-                print(
-                    f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
-                    f"image_grid_thw shape: {image_grid_thw.shape}, values:\n{image_grid_thw.cpu().tolist()}"
-                )
-                print(
-                    f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
-                    f"tokens_per_image: {tokens_per_image} (total: {sum(tokens_per_image)})"
-                )
-                print(
-                    f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
-                    f"flat shape: {flat.shape} (expected: [{sum(tokens_per_image)}, {feature if pixel_values.dim() == 3 else pixel_values.shape[1]}])"
-                )
-                self._debug_vision_encoder_split_logged = True
+            # if not hasattr(self, '_debug_vision_encoder_split_logged'):
+                # print(
+                    # f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
+                    # f"=== Vision Encoder Flattened Input Processing ==="
+                # )
+                # print(
+                    # f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
+                    # f"pixel_values shape: {pixel_values.shape}, dim: {pixel_values.dim()}"
+                # )
+                # print(
+                    # f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
+                    # f"image_grid_thw shape: {image_grid_thw.shape}, values:\n{image_grid_thw.cpu().tolist()}"
+                # )
+                # print(
+                    # f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
+                    # f"tokens_per_image: {tokens_per_image} (total: {sum(tokens_per_image)})"
+                # )
+                # print(
+                    # f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
+                    # f"flat shape: {flat.shape} (expected: [{sum(tokens_per_image)}, {feature if pixel_values.dim() == 3 else pixel_values.shape[1]}])"
+                # )
+                # self._debug_vision_encoder_split_logged = True
 
             # Ensure pixel_values have the correct dtype
             proj_dtype = self.vision.patch_embed.proj.weight.dtype
@@ -759,12 +765,12 @@ class Qwen2_5_VisionEncoder(nn.Module):
             token_list = [self._linear_patch_embed(chunk) for chunk in splits]
             
             # Debug: log split results
-            if not hasattr(self, '_debug_vision_encoder_splits_logged'):
-                print(
-                    f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
-                    f"Split into {len(splits)} chunks, token_list lengths: {[t.shape[0] for t in token_list]}"
-                )
-                self._debug_vision_encoder_splits_logged = True
+            # if not hasattr(self, '_debug_vision_encoder_splits_logged'):
+                # print(
+                    # f"[DEBUG qwen2.5vl.vision.forward (flattened)] "
+                    # f"Split into {len(splits)} chunks, token_list lengths: {[t.shape[0] for t in token_list]}"
+                # )
+                # self._debug_vision_encoder_splits_logged = True
 
             return self._run_vision_from_tokens(token_list, grids)
 
@@ -957,59 +963,59 @@ class Qwen2_5VLForConditionalGeneration(nn.Module):
                 offsets.append(offsets[-1] + length)
 
             # Debug: log inputs before vision encoder
-            if not hasattr(self, '_debug_qwen2_5vl_fallback_start_logged'):
-                print(
-                    f"[DEBUG qwen2.5vl.forward (fallback)] "
-                    f"=== Fallback Path Inputs ==="
-                )
-                print(
-                    f"[DEBUG qwen2.5vl.forward (fallback)] "
-                    f"pixel_values shape: {pixel_values.shape}, dtype: {pixel_values.dtype}, "
-                    f"device: {pixel_values.device}"
-                )
-                print(
-                    f"[DEBUG qwen2.5vl.forward (fallback)] "
-                    f"image_grid_thw shape: {image_grid_thw.shape if image_grid_thw is not None else None}, "
-                    f"dtype: {image_grid_thw.dtype if image_grid_thw is not None else None}"
-                )
-                if image_grid_thw is not None:
-                    if image_grid_thw.dim() == 2:
-                        print(
-                            f"[DEBUG qwen2.5vl.forward (fallback)] "
-                            f"image_grid_thw values:\n{image_grid_thw.cpu().tolist()}"
-                        )
-                    else:
-                        print(
-                            f"[DEBUG qwen2.5vl.forward (fallback)] "
-                            f"image_grid_thw values: {image_grid_thw.cpu().tolist()}"
-                        )
-                print(
-                    f"[DEBUG qwen2.5vl.forward (fallback)] "
-                    f"sequence_lengths: {sequence_lengths}, total_tokens: {total_tokens}, offsets: {offsets}"
-                )
-                if seq_image_indices:
-                    print(
-                        f"[DEBUG qwen2.5vl.forward (fallback)] "
-                        f"seq_image_indices: {seq_image_indices}"
-                    )
-                if seq_vision_placeholders:
-                    print(
-                        f"[DEBUG qwen2.5vl.forward (fallback)] "
-                        f"seq_vision_placeholders: {seq_vision_placeholders}"
-                    )
-                print(
-                    f"[DEBUG qwen2.5vl.forward (fallback)] "
-                    f"inputs_embeds shape: {inputs_embeds.shape}, dtype: {inputs_embeds.dtype}, "
-                    f"device: {inputs_embeds.device}"
-                )
-                # Log first few values of inputs_embeds before vision replacement
-                if inputs_embeds.numel() > 0:
-                    print(
-                        f"[DEBUG qwen2.5vl.forward (fallback)] "
-                        f"inputs_embeds[0:5, 0:3] (first 5 tokens, first 3 dims):\n"
-                        f"{inputs_embeds[0:5, 0:3].cpu().tolist()}"
-                    )
-                self._debug_qwen2_5vl_fallback_start_logged = True
+            # if not hasattr(self, '_debug_qwen2_5vl_fallback_start_logged'):
+                # print(
+                    # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                    # f"=== Fallback Path Inputs ==="
+                # )
+                # print(
+                    # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                    # f"pixel_values shape: {pixel_values.shape}, dtype: {pixel_values.dtype}, "
+                    # f"device: {pixel_values.device}"
+                # )
+                # print(
+                    # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                    # f"image_grid_thw shape: {image_grid_thw.shape if image_grid_thw is not None else None}, "
+                    # f"dtype: {image_grid_thw.dtype if image_grid_thw is not None else None}"
+                # )
+                # if image_grid_thw is not None:
+                    # if image_grid_thw.dim() == 2:
+                        # print(
+                            # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                            # f"image_grid_thw values:\n{image_grid_thw.cpu().tolist()}"
+                        # )
+                    # else:
+                        # print(
+                            # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                            # f"image_grid_thw values: {image_grid_thw.cpu().tolist()}"
+                        # )
+                # print(
+                    # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                    # f"sequence_lengths: {sequence_lengths}, total_tokens: {total_tokens}, offsets: {offsets}"
+                # )
+                # if seq_image_indices:
+                    # print(
+                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        # f"seq_image_indices: {seq_image_indices}"
+                    # )
+                # if seq_vision_placeholders:
+                    # print(
+                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        # f"seq_vision_placeholders: {seq_vision_placeholders}"
+                    # )
+                # print(
+                    # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                    # f"inputs_embeds shape: {inputs_embeds.shape}, dtype: {inputs_embeds.dtype}, "
+                    # f"device: {inputs_embeds.device}"
+                # )
+                # # Log first few values of inputs_embeds before vision replacement
+                # if inputs_embeds.numel() > 0:
+                    # print(
+                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        # f"inputs_embeds[0:5, 0:3] (first 5 tokens, first 3 dims):\n"
+                        # f"{inputs_embeds[0:5, 0:3].cpu().tolist()}"
+                    # )
+                # self._debug_qwen2_5vl_fallback_start_logged = True
 
             # Get image embeddings from vision encoder
             image_tokens = self.visual(pixel_values, image_grid_thw)
@@ -1020,71 +1026,71 @@ class Qwen2_5VLForConditionalGeneration(nn.Module):
             # Convert to list format for easier processing
             if isinstance(image_tokens, list):
                 image_embeddings = image_tokens
-                if not hasattr(self, '_debug_qwen2_5vl_image_tokens_logged'):
-                    print(
-                        f"[DEBUG qwen2.5vl.forward (fallback)] "
-                        f"=== Vision Encoder Output ==="
-                    )
-                    print(
-                        f"[DEBUG qwen2.5vl.forward (fallback)] "
-                        f"vision encoder returned list of {len(image_embeddings)} tensors"
-                    )
-                    for i, emb in enumerate(image_embeddings):
-                        print(
-                            f"[DEBUG qwen2.5vl.forward (fallback)] "
-                            f"Image {i}: shape={emb.shape}, dtype={emb.dtype}, "
-                            f"device={emb.device}, "
-                            f"mean={emb.mean().item():.6f}, std={emb.std().item():.6f}, "
-                            f"min={emb.min().item():.6f}, max={emb.max().item():.6f}"
-                        )
-                        if i < 3:  # Print first few values for first 3 images
-                            print(
-                                f"[DEBUG qwen2.5vl.forward (fallback)] "
-                                f"Image {i} embedding[0, 0:5] (first token, first 5 dims):\n"
-                                f"{emb[0, 0:5].cpu().tolist()}"
-                            )
-                    self._debug_qwen2_5vl_image_tokens_logged = True
+                # if not hasattr(self, '_debug_qwen2_5vl_image_tokens_logged'):
+                    # print(
+                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        # f"=== Vision Encoder Output ==="
+                    # )
+                    # print(
+                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        # f"vision encoder returned list of {len(image_embeddings)} tensors"
+                    # )
+                    # for i, emb in enumerate(image_embeddings):
+                        # print(
+                            # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                            # f"Image {i}: shape={emb.shape}, dtype={emb.dtype}, "
+                            # f"device={emb.device}, "
+                            # f"mean={emb.mean().item():.6f}, std={emb.std().item():.6f}, "
+                            # f"min={emb.min().item():.6f}, max={emb.max().item():.6f}"
+                        # )
+                        # if i < 3:  # Print first few values for first 3 images
+                            # print(
+                                # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                # f"Image {i} embedding[0, 0:5] (first token, first 5 dims):\n"
+                                # f"{emb[0, 0:5].cpu().tolist()}"
+                            # )
+                    # self._debug_qwen2_5vl_image_tokens_logged = True
             else:
                 # Split tensor into list of per-image embeddings
                 num_images = image_tokens.shape[0]
                 image_embeddings = [image_tokens[i] for i in range(num_images)]
-                if not hasattr(self, '_debug_qwen2_5vl_image_tokens_logged'):
-                    print(
-                        f"[DEBUG qwen2.5vl.forward (fallback)] "
-                        f"=== Vision Encoder Output ==="
-                    )
-                    print(
-                        f"[DEBUG qwen2.5vl.forward (fallback)] "
-                        f"vision encoder returned tensor shape {image_tokens.shape}, "
-                        f"split into {len(image_embeddings)} embeddings"
-                    )
-                    for i, emb in enumerate(image_embeddings):
-                        print(
-                            f"[DEBUG qwen2.5vl.forward (fallback)] "
-                            f"Image {i}: shape={emb.shape}, dtype={emb.dtype}, "
-                            f"device={emb.device}, "
-                            f"mean={emb.mean().item():.6f}, std={emb.std().item():.6f}"
-                        )
-                        if i < 3:  # Print first few values for first 3 images
-                            print(
-                                f"[DEBUG qwen2.5vl.forward (fallback)] "
-                                f"Image {i} embedding[0, 0:5] (first token, first 5 dims):\n"
-                                f"{emb[0, 0:5].cpu().tolist()}"
-                            )
-                    self._debug_qwen2_5vl_image_tokens_logged = True
-            
+                # if not hasattr(self, '_debug_qwen2_5vl_image_tokens_logged'):
+                    # print(
+                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        # f"=== Vision Encoder Output ==="
+                    # )
+                    # print(
+                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        # f"vision encoder returned tensor shape {image_tokens.shape}, "
+                        # f"split into {len(image_embeddings)} embeddings"
+                    # )
+                    # for i, emb in enumerate(image_embeddings):
+                        # print(
+                            # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                            # f"Image {i}: shape={emb.shape}, dtype={emb.dtype}, "
+                            # f"device={emb.device}, "
+                            # f"mean={emb.mean().item():.6f}, std={emb.std().item():.6f}"
+                        # )
+                        # if i < 3:  # Print first few values for first 3 images
+                            # print(
+                                # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                # f"Image {i} embedding[0, 0:5] (first token, first 5 dims):\n"
+                                # f"{emb[0, 0:5].cpu().tolist()}"
+                            # )
+                    # self._debug_qwen2_5vl_image_tokens_logged = True
+
             total_replaced = 0
             
             # For multi-sequence scenarios, we MUST use seq_image_indices and seq_vision_placeholders
             # The original fallback logic (scanning flattened input_ids) is incorrect for multi-sequence
             # because it doesn't account for sequence boundaries in the flattened input_ids.
             if seq_image_indices and len(seq_image_indices) == len(sequence_lengths):
-                if not hasattr(self, '_debug_qwen2_5vl_mapping_logged'):
-                    print(
-                        f"[DEBUG qwen2.5vl.forward (fallback)] "
-                        f"Using seq_image_indices mapping for {len(sequence_lengths)} sequences"
-                    )
-                    self._debug_qwen2_5vl_mapping_logged = True
+                # if not hasattr(self, '_debug_qwen2_5vl_mapping_logged'):
+                    # print(
+                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        # f"Using seq_image_indices mapping for {len(sequence_lengths)} sequences"
+                    # )
+                    # self._debug_qwen2_5vl_mapping_logged = True
                 # Use seq_image_indices to correctly map images to sequences
                 for seq_idx, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
                     seq_length = end - start
@@ -1121,15 +1127,8 @@ class Qwen2_5VLForConditionalGeneration(nn.Module):
                             if len(placeholders) == 1:
                                 target_offset, expected_length = placeholders[0]
                                 if expected_length != slice_len:
-                                    # Warn about mismatch
-                                    if not hasattr(self, f'_debug_length_mismatch_{seq_idx}_logged'):
-                                        print(
-                                            f"[DEBUG qwen2.5vl.forward (fallback)] "
-                                            f"WARNING: Sequence {seq_idx} expected_length ({expected_length}) "
-                                            f"!= actual slice_len ({slice_len}), using actual length"
-                                        )
-                                        setattr(self, f'_debug_length_mismatch_{seq_idx}_logged', True)
-                                
+                                    pass  # length mismatch is non-fatal
+
                                 target_start = start + target_offset
                                 target_end = target_start + slice_len
                                 if target_end > end:
@@ -1138,36 +1137,36 @@ class Qwen2_5VLForConditionalGeneration(nn.Module):
                                         f"is out of sequence bounds [{start}, {end})"
                                     )
                                 
-                                if not hasattr(self, f'_debug_placement_{seq_idx}_logged'):
-                                    print(
-                                        f"[DEBUG qwen2.5vl.forward (fallback)] "
-                                        f"=== Sequence {seq_idx} Vision Token Placement ==="
-                                    )
-                                    print(
-                                        f"[DEBUG qwen2.5vl.forward (fallback)] "
-                                        f"Sequence {seq_idx}: placing {slice_len} vision tokens "
-                                        f"at offset {target_offset} (absolute position {target_start}:{target_end}), "
-                                        f"images [{img_start_idx}:{img_end_idx}]"
-                                    )
-                                    print(
-                                        f"[DEBUG qwen2.5vl.forward (fallback)] "
-                                        f"Sequence {seq_idx}: seq_vision_tokens shape={seq_vision_tokens.shape}, "
-                                        f"dtype={seq_vision_tokens.dtype}, device={seq_vision_tokens.device}"
-                                    )
-                                    print(
-                                        f"[DEBUG qwen2.5vl.forward (fallback)] "
-                                        f"Sequence {seq_idx}: seq_vision_tokens[0, 0:5] (first token, first 5 dims):\n"
-                                        f"{seq_vision_tokens[0, 0:5].cpu().tolist()}"
-                                    )
-                                    # Log inputs_embeds before replacement
-                                    print(
-                                        f"[DEBUG qwen2.5vl.forward (fallback)] "
-                                        f"Sequence {seq_idx}: inputs_embeds[{target_start}:{target_start+3}, 0:3] "
-                                        f"BEFORE replacement:\n"
-                                        f"{inputs_embeds[target_start:target_start+3, 0:3].cpu().tolist()}"
-                                    )
-                                    setattr(self, f'_debug_placement_{seq_idx}_logged', True)
-                                
+                                # if not hasattr(self, f'_debug_placement_{seq_idx}_logged'):
+                                    # print(
+                                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                        # f"=== Sequence {seq_idx} Vision Token Placement ==="
+                                    # )
+                                    # print(
+                                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                        # f"Sequence {seq_idx}: placing {slice_len} vision tokens "
+                                        # f"at offset {target_offset} (absolute position {target_start}:{target_end}), "
+                                        # f"images [{img_start_idx}:{img_end_idx}]"
+                                    # )
+                                    # print(
+                                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                        # f"Sequence {seq_idx}: seq_vision_tokens shape={seq_vision_tokens.shape}, "
+                                        # f"dtype={seq_vision_tokens.dtype}, device={seq_vision_tokens.device}"
+                                    # )
+                                    # print(
+                                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                        # f"Sequence {seq_idx}: seq_vision_tokens[0, 0:5] (first token, first 5 dims):\n"
+                                        # f"{seq_vision_tokens[0, 0:5].cpu().tolist()}"
+                                    # )
+                                    # # Log inputs_embeds before replacement
+                                    # print(
+                                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                                        # f"Sequence {seq_idx}: inputs_embeds[{target_start}:{target_start+3}, 0:3] "
+                                        # f"BEFORE replacement:\n"
+                                        # f"{inputs_embeds[target_start:target_start+3, 0:3].cpu().tolist()}"
+                                    # )
+                                    # setattr(self, f'_debug_placement_{seq_idx}_logged', True)
+
                                 inputs_embeds[target_start:target_end] = seq_vision_tokens
                                 visual_pos_mask[target_start:target_end] = True
                                 total_replaced += slice_len
@@ -1317,34 +1316,34 @@ class Qwen2_5VLForConditionalGeneration(nn.Module):
             visual_pos_mask = None
 
         # Debug: log final state before language model
-        if not hasattr(self, '_debug_qwen2_5vl_before_lm_logged'):
-            print(
-                f"[DEBUG qwen2.5vl.forward (fallback)] "
-                f"=== Before Language Model ==="
-            )
-            print(
-                f"[DEBUG qwen2.5vl.forward (fallback)] "
-                f"vision_token_count: {vision_token_count}, "
-                f"visual_pos_mask is not None: {visual_pos_mask is not None}"
-            )
-            if visual_pos_mask is not None:
-                visual_token_indices = torch.nonzero(visual_pos_mask, as_tuple=False).squeeze(1)
-                print(
-                    f"[DEBUG qwen2.5vl.forward (fallback)] "
-                    f"visual_pos_mask: {visual_pos_mask.sum().item()} True values out of {len(visual_pos_mask)}"
-                )
-                if len(visual_token_indices) > 0:
-                    print(
-                        f"[DEBUG qwen2.5vl.forward (fallback)] "
-                        f"First 10 visual token positions: {visual_token_indices[:10].cpu().tolist()}"
-                    )
-            print(
-                f"[DEBUG qwen2.5vl.forward (fallback)] "
-                f"inputs_embeds shape: {inputs_embeds.shape}, "
-                f"inputs_embeds[0:5, 0:3] (first 5 tokens, first 3 dims):\n"
-                f"{inputs_embeds[0:5, 0:3].cpu().tolist()}"
-            )
-            self._debug_qwen2_5vl_before_lm_logged = True
+        # if not hasattr(self, '_debug_qwen2_5vl_before_lm_logged'):
+            # print(
+                # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                # f"=== Before Language Model ==="
+            # )
+            # print(
+                # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                # f"vision_token_count: {vision_token_count}, "
+                # f"visual_pos_mask is not None: {visual_pos_mask is not None}"
+            # )
+            # if visual_pos_mask is not None:
+                # visual_token_indices = torch.nonzero(visual_pos_mask, as_tuple=False).squeeze(1)
+                # print(
+                    # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                    # f"visual_pos_mask: {visual_pos_mask.sum().item()} True values out of {len(visual_pos_mask)}"
+                # )
+                # if len(visual_token_indices) > 0:
+                    # print(
+                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                        # f"First 10 visual token positions: {visual_token_indices[:10].cpu().tolist()}"
+                    # )
+            # print(
+                # f"[DEBUG qwen2.5vl.forward (fallback)] "
+                # f"inputs_embeds shape: {inputs_embeds.shape}, "
+                # f"inputs_embeds[0:5, 0:3] (first 5 tokens, first 3 dims):\n"
+                # f"{inputs_embeds[0:5, 0:3].cpu().tolist()}"
+            # )
+            # self._debug_qwen2_5vl_before_lm_logged = True
 
         if positions is None:
             positions = torch.arange(

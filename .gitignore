@@ -209,3 +209,7 @@ docs/
 # log directories
 log/
 **/log/
+
+# Internal scripts and data (not for open source)
+scripts/
+data/
