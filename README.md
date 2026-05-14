@@ -40,371 +40,223 @@ When processing **hundreds of millions of images** at scale, the traditional vLL
 
 ## 📊 Performance Benchmarks
 
-### 1. Qwen3-VL-2B-Instruct (Multimodal Generation)
+All benchmarks measured on a single NVIDIA H20 GPU (96GB). Speed measured as mean latency over 5 iterations after warmup. VRAM measured via `torch.cuda.max_memory_allocated()` in isolated subprocesses.
 
-**Test Configuration:**
-- **Model**: Qwen3-VL-2B-Instruct
-- **Task**: Multimodal single-token generation
-- **Hardware**: Single H20 GPU
+### Speed Comparison: Text Models (batch=100)
 
-**Speed Comparison:**
+| Model | Category | Transformers (s) | Prefill-Only (s) | Speedup |
+|-------|----------|:-----------------:|:-----------------:|:-------:|
+| Qwen3-0.6B | Generation | 0.0524 | 0.0309 | **1.70x** |
+| Qwen3-Embedding-0.6B | Embedding | 0.0330 | 0.0242 | **1.36x** |
+| bge-multilingual-gemma2 | Embedding | 0.2613 | 0.1595 | **1.64x** |
+| Qwen3-Reranker-0.6B | Reranking | 0.1574 | 0.0610 | **2.58x** |
+| bge-reranker-v2-gemma | Reranking | 0.1736 | 0.1162 | **1.49x** |
 
-| Inference Engine | Mean (s) | Median (s) | P90 (s) | P99 (s) | Speedup vs Transformers |
-|-----------------|----------|------------|---------|---------|------------------------|
-| Transformers     | 1.2112   | 1.2121     | 1.2716  | 1.2738  | 1.00x (baseline)       |
-| Prefill-Only     | 0.5766   | 0.5349     | 0.7640  | 0.8717  | **2.10x faster** ⚡     |
-| Original nano-vllm | 0.5712 | 0.5667     | 0.6211  | 0.6246  | 2.12x faster            |
 
-**Memory Comparison (Peak):**
+### Speed Comparison: Multimodal Models (batch=10, 224x224 images)
 
-| Metric               | Transformers | Prefill-Only | Original nano-vllm | Prefill vs Original |
-|---------------------|--------------|--------------|---------------------|---------------------|
-| Peak Allocated      | 4459.80 MB   | 4892.34 MB   | 49680.06 MB         | **10.15x less** 💾  |
-| Peak Reserved       | 4744.00 MB   | 5226.00 MB   | 49998.00 MB         | 9.57x less          |
-| Current Allocated   | 4090.96 MB   | 4218.46 MB   | 42467.46 MB         | 10.07x less         |
-| Current Reserved    | 4744.00 MB   | 4308.00 MB   | 49998.00 MB         | 11.61x less         |
-| Fragmentation %     | 0.15%        | 2.08%        | 0.55%               | -                   |
+| Model | Category | Transformers (s) | Prefill-Only (s) | Speedup |
+|-------|----------|:-----------------:|:-----------------:|:-------:|
+| Qwen3-VL-2B-Instruct | Generation | 0.0864 | 0.0499 | **1.73x** |
+| Qwen2.5-VL-3B-Instruct | Generation | 0.1212 | 0.0594 | **2.04x** |
+| Qwen3-VL-Embedding-2B | Embedding | 0.0704 | 0.0651 | **1.08x** |
+| Qwen3-VL-Reranker-2B | Reranking | 0.0829 | 0.0738 | **1.12x** |
 
-**Key Insight**: While prefill-only mode is slightly slower (0.99x) than original nano-vllm, it uses **only 10% of the memory**, making it ideal for high-throughput scenarios where memory efficiency is critical.
+> Both Transformers and Prefill-Only use FlashAttention. End-to-end measurement includes preprocessing (tokenization/apply_chat_template + image processing).
 
----
+### Why Varlen Attention is Faster (Forward-Only Comparison)
 
-### 2. Qwen3-4B (Text Generation)
+Our framework uses **varlen FlashAttention** (`flash_attn_varlen_func`), which concatenates all sequences into a single 1D tensor and uses `cu_seqlens` to delineate boundaries. This eliminates padding waste that Transformers' standard batch attention suffers from.
 
-**Test Configuration:**
-- **Model**: Qwen3-4B
-- **Task**: Text-only single-token generation
+**Benchmark**: Qwen3-VL-2B-Instruct, model forward only (excluding preprocessing), NVIDIA H20.
 
-**Speed Comparison:**
+| Scenario | Transformers | Prefill-Only | Speedup | Why |
+|----------|:------------:|:------------:|:-------:|-----|
+| 10 images, same size (224px) | 67 ms | 66 ms | 1.02x | No padding difference, nearly identical |
+| 100 images, same size (224px) | 565 ms | 534 ms | 1.06x | Slight advantage from avoiding attention_mask overhead |
+| 10 images, variable size (224-672px) | 264 ms | 175 ms | **1.50x** | HF pads to max (454 tokens), 48% tokens wasted |
 
-| Inference Engine | Mean (s) | Median (s) | P90 (s) | P99 (s) | Speedup vs Transformers |
-|-----------------|----------|------------|---------|---------|------------------------|
-| Transformers     | 0.2367   | 0.2366     | 0.2377  | 0.2416  | 1.00x (baseline)       |
-| Prefill-Only     | 0.1352   | 0.1271     | 0.1568  | 0.2653  | **1.75x faster** ⚡     |
-| Original         | 0.1264   | 0.1248     | 0.1254  | 0.1311  | 1.87x faster            |
+**Key insight**: The speedup scales with **sequence length variance**. When images have different resolutions, Transformers pads all sequences to the longest one, wasting compute on padding tokens. Our varlen approach computes only real tokens — the more diverse the input lengths, the bigger the advantage.
 
-**Memory Comparison (Peak):**
+In production scenarios with mixed-resolution images (common in real-world applications), this translates to 1.3-1.5x faster model forward passes with zero accuracy loss.
 
-| Metric               | Transformers | Prefill-Only | Original | Prefill vs Original |
-|---------------------|--------------|--------------|----------|---------------------|
-| Peak Memory         | 9040.87 MB   | 8007.38 MB   | 85825.38 MB | **10.72x less** 💾  |
+### torch.compile Status
 
----
+Currently, our framework applies `@torch.compile` to **individual operators** (RMSNorm, SiLU, RoPE, Sampler) but does NOT perform **full-graph compilation** or **cross-operator kernel fusion**. In contrast, vLLM v1 compiles the entire model forward pass as a single graph, enabling TorchInductor to fuse adjacent operators (e.g., RMSNorm output directly into linear input) and reduce memory bandwidth by ~20%.
 
-### 3. Qwen3-Embedding-0.6B (Embedding Model)
+This is a known optimization gap. Full-graph `torch.compile` support for prefill-only workloads is planned for a future release.
 
-**Test Configuration:**
-- **Model**: Qwen3-Embedding-0.6B
-- **Task**: Text embedding for semantic search
+### VRAM Savings (Prefill-Only vs vLLM-Style KV Cache)
 
-**Accuracy Comparison:**
-- Prefill-Only vs Transformers: Cosine Similarity: **0.999761** (min: 0.999707), Max Diff: 0.003435, Mean Diff: 0.000533
-- Original vs Transformers: Cosine Similarity: **0.999761** (min: 0.999707), Max Diff: 0.003435, Mean Diff: 0.000533
+Our framework **completely eliminates KV cache allocation** for prefill-only workloads, while vLLM allocates KV cache for ALL models (even when entirely unused for embedding/reranking). On a 96GB H20 GPU, the KV cache alone can consume 40-85GB.
 
-**Speed Comparison:**
+| Model | Category | Prefill-Only VRAM | vLLM-Style VRAM | VRAM Saved |
+|-------|----------|:-----------------:|:---------------:|:----------:|
+| Qwen3-0.6B | Text Generation | 1,703 MB | 86,507 MB | **98.0%** |
+| Qwen3-Embedding-0.6B | Text Embedding | 1,177 MB | 86,472 MB | **98.6%** |
+| bge-multilingual-gemma2 | Text Embedding | 17,665 MB | 87,469 MB | **79.8%** |
+| Qwen3-Reranker-0.6B | Text Reranking | 1,453 MB | 86,168 MB | **98.3%** |
+| bge-reranker-v2-gemma | Text Reranking | 4,818 MB | 87,542 MB | **94.5%** |
+| Qwen3-VL-2B-Instruct | Multimodal Generation | 4,812 MB | 52,196 MB | **90.8%** |
+| Qwen2.5-VL-3B-Instruct | Multimodal Generation | 11,005 MB | 62,234 MB | **82.3%** |
+| Qwen3-VL-Embedding-2B | Multimodal Embedding | 4,780 MB | 85,706 MB | **94.4%** |
+| Qwen3-VL-Reranker-2B | Multimodal Reranking | 4,844 MB | 85,706 MB | **94.3%** |
 
-| Inference Engine | Mean (s) | Median (s) | P90 (s) | P99 (s) | Speedup vs Transformers |
-|-----------------|----------|------------|---------|---------|------------------------|
-| Transformers     | 0.0366   | 0.0363     | 0.0373  | 0.0374  | 1.00x (baseline)       |
-| Prefill-Only     | 0.0246   | 0.0245     | 0.0257  | 0.0261  | **1.49x faster** ⚡     |
-| Original         | 0.0247   | 0.0248     | 0.0252  | 0.0257  | 1.48x faster            |
+#### How VRAM is Measured
 
-**Memory Comparison (Peak):**
-
-| Metric               | Transformers | Prefill-Only | Original | Prefill vs Original |
-|---------------------|--------------|--------------|----------|---------------------|
-| Peak Memory         | 1190.87 MB   | 1192.38 MB   | 2316.02 MB | 1.94x less 💾       |
-
----
-
-### 4. bge-multilingual-gemma2 (Multilingual Embedding Model)
-
-**Test Configuration:**
-- **Model**: bge-multilingual-gemma2
-- **Task**: Multilingual text embedding
-
-**Accuracy Comparison:**
-- Prefill-Only vs Transformers: Cosine Similarity: **0.999973** (min: 0.999939), Max Diff: 0.000886, Mean Diff: 0.000091
-- Original vs Transformers: Cosine Similarity: **0.999973** (min: 0.999939), Max Diff: 0.000886, Mean Diff: 0.000091
-
-**Speed Comparison:**
-
-| Inference Engine | Mean (s) | Median (s) | P90 (s) | P99 (s) | Speedup vs Transformers |
-|-----------------|----------|------------|---------|---------|------------------------|
-| Transformers     | 0.0715   | 0.0713     | 0.0717  | 0.0730  | 1.00x (baseline)       |
-| Prefill-Only     | 0.0449   | 0.0446     | 0.0463  | 0.0466  | **1.59x faster** ⚡     |
-| Original         | 0.0452   | 0.0430     | 0.0455  | 0.0631  | 1.58x faster            |
-
-**Memory Comparison (Peak):**
-
-| Metric               | Transformers | Prefill-Only | Original | Prefill vs Original |
-|---------------------|--------------|--------------|----------|---------------------|
-| Peak Memory         | 17677.26 MB  | 17677.25 MB  | 35303.30 MB | **2.00x less** 💾  |
-
-> **Note**: Further performance optimizations are under active development. The current implementation focuses on correctness and memory efficiency, with speed optimizations planned for future releases.
+- **Prefill-Only VRAM**: Peak GPU memory allocated when loading and running inference with our framework (no KV cache). Measured via `torch.cuda.max_memory_allocated()` in isolated subprocesses.
+- **vLLM-Style VRAM**: Simulates vLLM's behavior of allocating KV cache even for embedding/reranker models. For models loadable as generation models, we force KV cache allocation and measure. For others, KV cache size is computed using vLLM's formula and added to model weight VRAM.
+- All measurements taken on NVIDIA H20 (96GB) with subprocess isolation.
 
 ## 📦 Installation
 
-### Prerequisites
-
-Install the required dependencies (same as nano-vllm):
-
 ```bash
-# Clone the repository
 git clone https://github.com/86MaxCao/nano-vllm-prefillonly.git
 cd nano-vllm-prefillonly
-
-# Install dependencies (same as nano-vllm)
-pip install -r requirements.txt
+pip install -e .
 ```
 
-> **Note**: If you already have nano-vllm installed, you may not need to install additional packages. The dependencies are identical.
-
-### Running Without Package Installation
-
-You can run the benchmarks directly without installing the package itself (no `pip install .` needed):
-
-```bash
-# Run directly using Python module syntax
-python3 -m examples.bench_prefillonly_gen --modality multimodal --model qwen3vl --model-path ~/.cache/huggingface/hub/Qwen3-VL-2B-Instruct
-```
-
-> **Note**: For developers who need to install the package itself, you can modify `pyproject.toml` and use `pip install .` as needed.
+**Dependencies**: Python 3.10+, PyTorch 2.4+, Transformers 4.51+, Flash-Attention, Triton.
 
 ## 🎮 Quick Start
 
-All models use three benchmark scripts depending on task type:
-
-| Task Type | Script | Key Arguments |
-|-----------|--------|---------------|
-| Generation | `examples.bench_prefillonly_gen` | `--modality`, `--model`, `--model-path` |
-| Embedding | `examples.bench_prefillonly_embed` | `--modality`, `--model`, `--model-path` |
-| Reranking | `examples.bench_prefillonly_rerank` | `--modality`, `--model`, `--model-path` |
-
-> **Note**: `--model-path` points to the local model directory (e.g., HuggingFace cache). Set `HF_CACHE=~/.cache/huggingface/hub/hf_cache` or adjust paths to match your setup.
-
 ### Text Generation
 
-#### Qwen3
+```python
+from nanovllm import LLM, SamplingParams
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
-    --modality text \
-    --model qwen3 \
-    --model-path $HF_CACHE/Qwen3-4B
-```
+llm = LLM("Qwen/Qwen3-0.6B")
+sp = SamplingParams(max_tokens=1)
 
-#### Qwen3.5
+prompts = ["Is the Earth round? Answer Yes or No."] * 100
+for p in prompts:
+    llm.add_request(p, sp)
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
-    --modality text \
-    --model qwen3.5 \
-    --model-path $HF_CACHE/Qwen3.5-4B
+outputs = {}
+while not llm.is_finished():
+    output, _ = llm.step()
+    for seq_id, token_ids in output:
+        outputs[seq_id] = token_ids
 ```
 
 ### Multimodal Generation
 
-#### Qwen3-VL
+```python
+from nanovllm import LLM, SamplingParams
+from transformers import AutoProcessor
+from PIL import Image
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
-    --modality multimodal \
-    --model qwen3vl \
-    --model-path $HF_CACHE/Qwen3-VL-2B-Instruct
-```
+llm = LLM("Qwen/Qwen3-VL-2B-Instruct", multimodal_model_type="qwen3_vl")
+processor = AutoProcessor.from_pretrained("Qwen/Qwen3-VL-2B-Instruct")
+sp = SamplingParams(max_tokens=1)
 
-#### Qwen3.5
+images = [Image.open(f"image_{i}.jpg") for i in range(10)]
+requests = [
+    {
+        "messages": [{"role": "user", "content": [
+            {"type": "image", "image": img},
+            {"type": "text", "text": "What is in this image? Answer in one word."},
+        ]}],
+        "images": [img],
+    }
+    for img in images
+]
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
-    --modality multimodal \
-    --model qwen3.5vl \
-    --model-path $HF_CACHE/Qwen3.5-4B
-```
-
-#### Qwen2-VL
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
-    --modality multimodal \
-    --model qwen2vl \
-    --model-path $HF_CACHE/Qwen2-VL-2B-Instruct
-```
-
-#### Qwen2.5-VL
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_gen \
-    --modality multimodal \
-    --model qwen2.5vl \
-    --model-path $HF_CACHE/Qwen2.5-VL-3B-Instruct
+results = llm.generate_multimodal(requests, sp, processor)
 ```
 
 ### Text Embedding
 
-#### Qwen3-Embedding
+```python
+from nanovllm import LLM
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_embed \
-    --modality text \
-    --model qwen3-embedding \
-    --model-path $HF_CACHE/Qwen3-Embedding-0.6B
-```
+llm = LLM("Qwen/Qwen3-Embedding-0.6B", is_embedding=True)
 
-#### BGE-multilingual-gemma2
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_embed \
-    --modality text \
-    --model gemma2 \
-    --model-path $HF_CACHE/bge-multilingual-gemma2
+texts = ["What is deep learning?", "Explain transformers", "What is NLP?"]
+embeddings = llm.embed_batch(texts)  # [batch_size, hidden_size]
 ```
 
 ### Multimodal Embedding
 
-#### Qwen3-VL-Embedding
+```python
+from nanovllm import LLM
+from PIL import Image
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_embed \
-    --modality multimodal \
-    --model qwen3-vl-embedding \
-    --model-path $HF_CACHE/Qwen3-VL-Embedding-2B
+llm = LLM("Qwen/Qwen3-VL-Embedding-2B", multimodal_model_type="qwen3_vl", is_embedding=True)
+
+images = [Image.open("photo.jpg")]
+texts = ["A photo of a building"]
+embeddings = llm.embed_batch(texts, images=images)  # [batch_size, hidden_size]
 ```
 
 ### Text Reranking
 
-#### Qwen3-Reranker
+```python
+from nanovllm import LLM
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_rerank \
-    --modality text \
-    --model qwen3-reranker \
-    --model-path $HF_CACHE/Qwen3-Reranker-0.6B
-```
+llm = LLM("Qwen/Qwen3-Reranker-0.6B", is_reranker=True)
 
-#### Jina-Reranker-V3
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_rerank \
-    --modality text \
-    --model jina-reranker-v3 \
-    --model-path $HF_CACHE/jina-reranker-v3
-```
-
-#### BGE-Reranker-Gemma
-
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_rerank \
-    --modality text \
-    --model bge-reranker-v2-gemma \
-    --model-path $HF_CACHE/bge-reranker-v2-gemma
+pairs = [
+    ("What is AI?", "Artificial intelligence is the simulation of human intelligence."),
+    ("What is Python?", "Python is a programming language."),
+]
+scores = llm.rerank_batch(pairs)  # [batch_size]
 ```
 
 ### Multimodal Reranking
 
-#### Qwen3-VL-Reranker
+```python
+from nanovllm import LLM
+from PIL import Image
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_rerank \
-    --modality multimodal \
-    --model qwen3-vl-reranker \
-    --model-path $HF_CACHE/Qwen3-VL-Reranker-2B
+llm = LLM("Qwen/Qwen3-VL-Reranker-2B", multimodal_model_type="qwen3_vl", is_reranker=True)
+
+images = [Image.open("photo.jpg")]
+pairs = [("Find a building", "A document about architecture")]
+scores = llm.rerank_batch(pairs, images=images)  # [batch_size]
 ```
 
-#### Jina-Reranker-M0
+## 🏗️ Supported Models
 
-```bash
-CUDA_VISIBLE_DEVICES=0 python3 -m examples.bench_prefillonly_rerank \
-    --modality multimodal \
-    --model jina-reranker-m0 \
-    --model-path $HF_CACHE/jina-reranker-m0
-```
+| Model | Type | `multimodal_model_type` | Extra Args |
+|-------|------|------------------------|------------|
+| Qwen3-0.6B | Text Generation | - | - |
+| Qwen3-Embedding-0.6B | Text Embedding | - | `is_embedding=True` |
+| bge-multilingual-gemma2 | Text Embedding | - | `is_embedding=True` |
+| Qwen3-Reranker-0.6B | Text Reranking | - | `is_reranker=True` |
+| bge-reranker-v2-gemma | Text Reranking | - | `is_reranker=True` |
+| Qwen3-VL-2B-Instruct | Multimodal Generation | `qwen3_vl` | - |
+| Qwen2.5-VL-3B-Instruct | Multimodal Generation | `qwen2_5_vl` | - |
+| Qwen3-VL-Embedding-2B | Multimodal Embedding | `qwen3_vl` | `is_embedding=True` |
+| Qwen3-VL-Reranker-2B | Multimodal Reranking | `qwen3_vl` | `is_reranker=True` |
 
-### Batch Benchmarking All Models
-
-Use `bench_all.sh` to benchmark all supported models at once:
-
-```bash
-# Benchmark all models on GPU 0
-bash bench_all.sh 0 all
-
-# Benchmark specific categories
-bash bench_all.sh 0 embed       # Text embedding only
-bash bench_all.sh 0 rerank      # Text reranking only
-bash bench_all.sh 0 gen         # Text generation only
-bash bench_all.sh 0 vl_embed    # VL embedding only
-bash bench_all.sh 0 vl_rerank   # VL reranking only
-bash bench_all.sh 0 vl_gen      # VL generation only
-```
+> `multimodal_model_type` can be auto-detected from model path (e.g., paths containing "qwen3" + "vl" auto-resolve to `qwen3_vl`). Explicit specification is only needed when auto-detection fails.
 
 ## 📝 Current Status
 
 **What Works:**
-- ✅ Single-token generation for text-only models (Qwen3, Qwen3.5)
-- ✅ Single-token generation for multimodal models (Qwen3-VL, Qwen3.5, Qwen2-VL, Qwen2.5-VL)
-- ✅ Text embedding (Qwen3-Embedding, BGE-Gemma2)
-- ✅ Multimodal embedding (Qwen3-VL-Embedding)
-- ✅ Text reranking (Qwen3-Reranker, Jina-Reranker-V3, BGE-Reranker-Gemma)
-- ✅ Multimodal reranking (Qwen3-VL-Reranker, Jina-Reranker-M0)
-- ✅ Memory-efficient inference without KV cache
-- ✅ Accuracy matching with Transformers baseline
+- Single-token generation for text and multimodal models
+- Text and multimodal embedding with batch processing
+- Text and multimodal reranking with batch processing
+- Memory-efficient inference without KV cache
+- Accuracy matching with Transformers baseline
 
-**Not Yet Supported:**
-- ❌ LLaVA-NeXT prefill-only (tensor shape mismatch in multimodal projector)
-- ❌ Jina-Embedding-V4 (custom modeling code incompatible with current transformers)
-- ❌ GME-Qwen2-VL (requires older transformers version)
-
-### Supported Models & VRAM Savings
-
-Our prefill-only optimization skips KV cache allocation entirely for embedding and reranker models, while vLLM allocates KV cache for ALL models (even when completely unused). On a 96GB H20 GPU, the KV cache alone can consume 82-85GB — meaning vLLM can only serve one embedding/reranker model per GPU, while our framework uses just the model weights.
-
-| Model | Category | Prefill-Only VRAM | vLLM-Style VRAM | KV Cache | VRAM Saved |
-|-------|----------|-------------------|-----------------|----------|------------|
-| Qwen3-0.6B | text_gen | 1,703 MB | 86,507 MB | 85,288 MB | **98.0%** |
-| Qwen3.5-0.8B | text_gen | 7,075 MB | 47,119 MB | 40,044 MB | **85.0%** |
-| Qwen3.5-0.8B | vl_gen | 7,075 MB | 45,998 MB | 38,923 MB | **84.6%** |
-| Qwen3-VL-2B | vl_gen | 4,812 MB | 52,196 MB | - | **90.8%** |
-| Qwen2.5-VL-3B | vl_gen | 11,005 MB | 62,234 MB | - | **82.3%** |
-| Qwen3-Embedding-0.6B | text_embed | 1,177 MB | 86,472 MB | 85,288 MB | **98.6%** |
-| BGE-Gemma2 | text_embed | 17,665 MB | 87,469 MB | 69,804 MB | **79.8%** |
-| Qwen3-Reranker-0.6B | text_rerank | 1,453 MB | 86,168 MB | 84,980 MB | **98.3%** |
-| Jina-Reranker-V3 | text_rerank | 1,234 MB | 86,157 MB | 84,924 MB | **98.6%** |
-| BGE-Reranker-Gemma | text_rerank | 4,818 MB | 87,542 MB | 82,724 MB | **94.5%** |
-| Qwen3-VL-Embedding-2B | vl_embed | 4,780 MB | 85,706 MB | 82,264 MB | **94.4%** |
-| Qwen3-VL-Reranker-2B | vl_rerank | 4,844 MB | 85,706 MB | 82,264 MB | **94.3%** |
-| Jina-Reranker-M0 | vl_rerank | 4,661 MB | 87,541 MB | 82,880 MB | **94.7%** |
-
-#### How VRAM is Measured
-
-- **Prefill-Only VRAM**: Peak GPU memory allocated when loading and running inference with our framework (no KV cache). Measured via `torch.cuda.max_memory_allocated()` in an isolated subprocess to avoid CUDA memory pool contamination between models.
-- **vLLM-Style VRAM**: Simulates vLLM's behavior, which allocates KV cache even for embedding/reranker models. For models that can be loaded as generation models, we load them as such to force KV cache allocation and measure the peak. For models that cannot (e.g., VL rerankers), we compute the KV cache size using the same formula as vLLM: `available_memory = total_gpu_memory × gpu_memory_utilization - model_weights`, then add it to the model weight VRAM.
-- **KV Cache**: The size of the KV cache tensor alone, computed as `2 × num_layers × block_size × num_kv_heads × head_dim × dtype_bytes × num_blocks`. This memory is completely wasted for embedding/reranker models since they only need a single forward pass.
-- All measurements taken on NVIDIA H20 (96GB) GPUs with subprocess isolation (each model measured in a fresh process to avoid cross-model memory contamination).
-
-**In Progress:**
-- 🔄 LLaVA-NeXT prefill-only (tensor shape mismatch in multimodal projector)
-- 🔄 Jina-Embedding-V4 (custom modeling code incompatible with current transformers)
-- 🔄 GME-Qwen2-VL (requires older transformers version)
-- 🔄 Production-ready features and detailed demos
+**Known Limitations:**
+- jina-reranker-v3: Custom bidirectional architecture, causal varlen path adds overhead
+- Full-graph `torch.compile` not yet supported (only per-operator compile)
 
 ## 🏗️ Architecture
 
-This project is built on top of [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm), a lightweight vLLM implementation. The prefill-only optimization:
+Built on [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm). Key optimizations:
 
-1. **Skips KV Cache Allocation**: For single-token generation, KV cache is unnecessary
-2. **Uses Fallback Path for Vision**: Directly processes `pixel_values` without vision cache
-3. **Optimizes Memory Usage**: Eliminates cache management overhead
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+1. **No KV Cache** - Eliminates cache allocation entirely for prefill-only tasks
+2. **Varlen FlashAttention** - Concatenates sequences into 1D tensor, eliminates padding waste
+3. **Batch Preprocessing** - Batch `apply_chat_template` + batch processor calls
 
 ## 📄 License
 
-This project inherits the license from [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm).
+MIT License (inherited from [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)).
 
 ## 🙏 Acknowledgments
 
-- Built on [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) by [GeeeekExplorer](https://github.com/GeeeekExplorer)
-- Inspired by the need for efficient discriminative inference at scale
+- [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) by [GeeeekExplorer](https://github.com/GeeeekExplorer)

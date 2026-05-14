@@ -380,9 +380,7 @@ class ModelRunner:
         config_single_token = getattr(self.config, "single_token_mode", False)
         if config_prefill_only and config_single_token:
             self.kv_cache = None
-            # Explicitly set num_kvcache_blocks to 0 for prefill-only single-token generation
             self.config.num_kvcache_blocks = 0
-            print("[KV Cache] Skipping KV cache allocation for prefill-only single-token generation")
             return
         
         config = self.config
@@ -989,8 +987,8 @@ class ModelRunner:
                 reset_context()
                 return embeddings
             else:
-                # Native nano-vllm model - can use varlen optimization
-                # Convert batch to varlen
+                # Native nano-vllm model (e.g. Qwen3VLEmbedding)
+                # Use varlen FlashAttention just like generation path
                 batch_size, seq_len = input_ids.shape
                 input_ids_flat, positions_flat, cu_seqlens, max_seqlen, seq_lens = (
                     self._batch_to_varlen(input_ids, positions, attention_mask)
@@ -1009,20 +1007,63 @@ class ModelRunner:
                 )
                 
                 try:
-                    # Forward pass with varlen format
-                    # Note: For multimodal, we need to handle pixel_values and image_grid_thw
-                    # This requires model support for varlen multimodal inputs
-                    # For now, fall back to batch format for native models too
-                    kwargs = {
-                        "input_ids": input_ids,
-                        "positions": positions,
-                        "attention_mask": attention_mask,
-                    }
-                    if pixel_values is not None:
-                        kwargs["pixel_values"] = pixel_values
+                    # Build seq_image_indices and seq_vision_placeholders
+                    # like MultimodalHandler.prepare_prefill_only_inputs does
+                    seq_image_indices = []
+                    seq_vision_placeholders = []
+                    current_image_idx = 0
+                    
                     if image_grid_thw is not None:
-                        kwargs["image_grid_thw"] = image_grid_thw
-                    embeddings = self.model(**kwargs)
+                        num_images = image_grid_thw.shape[0]
+                        # For embedding, typically one image per sequence
+                        images_per_seq = num_images // batch_size if batch_size > 0 else 0
+                        for i in range(batch_size):
+                            start_idx = i * images_per_seq
+                            end_idx = start_idx + images_per_seq
+                            seq_image_indices.append((start_idx, end_idx))
+                            # Find vision placeholder positions in this sequence's tokens
+                            # Vision placeholders are typically at the beginning after varlen flatten
+                            # We compute the expected number of vision tokens from grid_thw
+                            merge_size = getattr(self.model, 'visual', None)
+                            if merge_size and hasattr(merge_size, 'config'):
+                                spatial_merge = merge_size.config.spatial_merge_size
+                            else:
+                                spatial_merge = 2  # default
+                            img_grids = image_grid_thw[start_idx:end_idx]
+                            n_vis_tokens = int((img_grids.prod(-1) // (spatial_merge ** 2)).sum().item())
+                            # Vision placeholder is at the start of each sequence's tokens
+                            # (after the system prompt tokens - find <|image_pad|> tokens)
+                            # Use input_ids to find placeholder positions
+                            seq_input_ids = input_ids[i]
+                            if attention_mask is not None:
+                                seq_mask = attention_mask[i].bool()
+                                seq_tokens_actual = seq_input_ids[seq_mask]
+                            else:
+                                seq_tokens_actual = seq_input_ids
+                            
+                            # Find image placeholder token (151655 for Qwen3-VL)
+                            placeholder_token_id = 151655
+                            placeholder_positions = (seq_tokens_actual == placeholder_token_id).nonzero(as_tuple=True)[0]
+                            if len(placeholder_positions) > 0:
+                                offset_in_seq = int(placeholder_positions[0].item())
+                                seq_vision_placeholders.append([(offset_in_seq, n_vis_tokens)])
+                            else:
+                                seq_vision_placeholders.append([(0, n_vis_tokens)])
+                    else:
+                        for i in range(batch_size):
+                            seq_image_indices.append((0, 0))
+                            seq_vision_placeholders.append([])
+                    
+                    # Forward with varlen input_ids and proper multimodal params
+                    embeddings = self.model(
+                        input_ids=input_ids_flat,
+                        positions=positions_flat,
+                        pixel_values=pixel_values,
+                        image_grid_thw=image_grid_thw,
+                        sequence_lengths=seq_lens,
+                        seq_image_indices=seq_image_indices,
+                        seq_vision_placeholders=seq_vision_placeholders,
+                    )
                 finally:
                     reset_context()
                 
@@ -1265,8 +1306,8 @@ class ModelRunner:
                 reset_context()
                 return scores
             else:
-                # Native nano-vllm model - can use varlen optimization
-                # Convert batch to varlen
+                # Native nano-vllm model (e.g. Qwen3VLReranker)
+                # Use varlen FlashAttention just like generation path
                 batch_size, seq_len = input_ids.shape
                 input_ids_flat, positions_flat, cu_seqlens, max_seqlen, seq_lens = (
                     self._batch_to_varlen(input_ids, positions, attention_mask)
@@ -1284,20 +1325,54 @@ class ModelRunner:
                 )
                 
                 try:
-                    # Forward pass with varlen format
-                    # Note: For multimodal, we need to handle pixel_values and image_grid_thw
-                    # This requires model support for varlen multimodal inputs
-                    # For now, fall back to batch format for native models too
-                    kwargs = {
-                        "input_ids": input_ids,
-                        "positions": positions,
-                        "attention_mask": attention_mask,
-                    }
-                    if pixel_values is not None:
-                        kwargs["pixel_values"] = pixel_values
+                    # Build seq_image_indices and seq_vision_placeholders
+                    seq_image_indices = []
+                    seq_vision_placeholders = []
+                    
                     if image_grid_thw is not None:
-                        kwargs["image_grid_thw"] = image_grid_thw
-                    scores = self.model(**kwargs)
+                        num_images = image_grid_thw.shape[0]
+                        images_per_seq = num_images // batch_size if batch_size > 0 else 0
+                        for i in range(batch_size):
+                            start_idx = i * images_per_seq
+                            end_idx = start_idx + images_per_seq
+                            seq_image_indices.append((start_idx, end_idx))
+                            # Compute expected vision tokens
+                            merge_size = getattr(self.model, 'visual', None)
+                            if merge_size and hasattr(merge_size, 'config'):
+                                spatial_merge = merge_size.config.spatial_merge_size
+                            else:
+                                spatial_merge = 2
+                            img_grids = image_grid_thw[start_idx:end_idx]
+                            n_vis_tokens = int((img_grids.prod(-1) // (spatial_merge ** 2)).sum().item())
+                            # Find placeholder positions
+                            seq_input_ids = input_ids[i]
+                            if attention_mask is not None:
+                                seq_mask = attention_mask[i].bool()
+                                seq_tokens_actual = seq_input_ids[seq_mask]
+                            else:
+                                seq_tokens_actual = seq_input_ids
+                            placeholder_token_id = 151655
+                            placeholder_positions = (seq_tokens_actual == placeholder_token_id).nonzero(as_tuple=True)[0]
+                            if len(placeholder_positions) > 0:
+                                offset_in_seq = int(placeholder_positions[0].item())
+                                seq_vision_placeholders.append([(offset_in_seq, n_vis_tokens)])
+                            else:
+                                seq_vision_placeholders.append([(0, n_vis_tokens)])
+                    else:
+                        for i in range(batch_size):
+                            seq_image_indices.append((0, 0))
+                            seq_vision_placeholders.append([])
+                    
+                    # Forward with varlen input_ids and proper multimodal params
+                    scores = self.model(
+                        input_ids=input_ids_flat,
+                        positions=positions_flat,
+                        pixel_values=pixel_values,
+                        image_grid_thw=image_grid_thw,
+                        sequence_lengths=seq_lens,
+                        seq_image_indices=seq_image_indices,
+                        seq_vision_placeholders=seq_vision_placeholders,
+                    )
                 finally:
                     reset_context()
                 
@@ -1368,6 +1443,61 @@ class ModelRunner:
         
         # Forward pass (only prefill, no decode)
         # Use standard Flash Attention with causal mask (no FlexAttention block_mask needed)
+        if pixel_values is not None and hasattr(self.model, 'forward'):
+            # Multimodal reranker with compute_score (e.g., Qwen3VLReranker)
+            # Need to pass pixel_values and related params for vision processing
+            # Build seq_image_indices and seq_vision_placeholders
+            seq_image_indices = []
+            seq_vision_placeholders = []
+            
+            if image_grid_thw is not None:
+                num_images = image_grid_thw.shape[0]
+                images_per_seq = num_images // batch_size if batch_size > 0 else 0
+                for i in range(batch_size):
+                    start_idx = i * images_per_seq
+                    end_idx = start_idx + images_per_seq
+                    seq_image_indices.append((start_idx, end_idx))
+                    # Compute expected vision tokens
+                    merge_size = getattr(self.model, 'visual', None)
+                    if merge_size and hasattr(merge_size, 'config'):
+                        spatial_merge = merge_size.config.spatial_merge_size
+                    else:
+                        spatial_merge = 2
+                    img_grids = image_grid_thw[start_idx:end_idx]
+                    n_vis_tokens = int((img_grids.prod(-1) // (spatial_merge ** 2)).sum().item())
+                    # Find placeholder positions in the original (pre-flatten) input_ids
+                    seq_input_ids = input_ids[i]
+                    if attention_mask is not None:
+                        seq_mask = attention_mask[i].bool()
+                        seq_tokens_actual = seq_input_ids[seq_mask]
+                    else:
+                        seq_tokens_actual = seq_input_ids
+                    placeholder_token_id = 151655
+                    placeholder_positions = (seq_tokens_actual == placeholder_token_id).nonzero(as_tuple=True)[0]
+                    if len(placeholder_positions) > 0:
+                        offset_in_seq = int(placeholder_positions[0].item())
+                        seq_vision_placeholders.append([(offset_in_seq, n_vis_tokens)])
+                    else:
+                        seq_vision_placeholders.append([(0, n_vis_tokens)])
+            else:
+                for i in range(batch_size):
+                    seq_image_indices.append((0, 0))
+                    seq_vision_placeholders.append([])
+            
+            # Call model with multimodal params - it returns scores directly
+            # when sequence_lengths is provided
+            scores = self.model(
+                input_ids=input_ids_flat,
+                positions=positions_flat,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                sequence_lengths=seq_lens,
+                seq_image_indices=seq_image_indices,
+                seq_vision_placeholders=seq_vision_placeholders,
+            )
+            reset_context()
+            return scores
+        
         hidden_states_varlen = self.model(input_ids_flat, positions_flat)
         
         # Process hidden_states (text-only rerankers only, multimodal already handled above)
@@ -1581,19 +1711,13 @@ class ModelRunner:
         )
         _advance_vision_offsets()
         
-        # For prefill-only single-token generation, explicitly clear GPU and CPU
-        # memory used by vision cache to reduce peak memory usage
+        # For prefill-only single-token generation, clear references to vision
+        # cache tensors so they can be garbage collected. Do NOT call
+        # torch.cuda.empty_cache() here - it thrashes the CUDA memory pool and
+        # causes expensive re-allocations on every iteration.
         config_prefill_only = getattr(self.config, "prefill_only_mode", False)
         config_single_token = getattr(self.config, "single_token_mode", False)
         if config_prefill_only and config_single_token:
-            # Record memory before cleanup for logging
-            if torch.cuda.is_available():
-                mem_before = torch.cuda.memory_allocated() / 1024**2
-                stats_before = torch.cuda.memory_stats()
-                reserved_before = stats_before.get(
-                    "reserved_bytes.all.current", 0
-                ) / 1024**2
-            
             # Clear GPU memory used by vision slices immediately after use
             if vision_slices_per_seq:
                 for slices in vision_slices_per_seq:
@@ -1607,53 +1731,12 @@ class ModelRunner:
                             slice_info["deepstack"] = None
                 vision_slices_per_seq = None
             
-            # Clear CPU vision cache immediately after use to save memory
-            # This is important because vision tokens can be very large
-            vision_mem_mb = 0
+            # Clear CPU vision cache references
             for seq in seqs:
                 if seq.cached_vision_tokens is not None:
-                    # Calculate memory saved (for logging)
-                    if isinstance(seq.cached_vision_tokens, list):
-                        for emb in seq.cached_vision_tokens:
-                            if isinstance(emb, torch.Tensor):
-                                vision_mem_mb += (
-                                    emb.numel() * emb.element_size() / 1024**2
-                                )
                     seq.cached_vision_tokens = None
-                    
                 if seq.cached_deepstack_tokens is not None:
-                    if isinstance(seq.cached_deepstack_tokens, list):
-                        for layer_tokens in seq.cached_deepstack_tokens:
-                            if isinstance(layer_tokens, list):
-                                for feat in layer_tokens:
-                                    if isinstance(feat, torch.Tensor):
-                                        vision_mem_mb += (
-                                            feat.numel() * feat.element_size() / 1024**2
-                                        )
                     seq.cached_deepstack_tokens = None
-            
-            # Clear GPU cache
-            torch.cuda.empty_cache()
-            
-            # Log memory cleanup if significant memory was freed
-            if torch.cuda.is_available():
-                mem_after = torch.cuda.memory_allocated() / 1024**2
-                stats_after = torch.cuda.memory_stats()
-                reserved_after = stats_after.get(
-                    "reserved_bytes.all.current", 0
-                ) / 1024**2
-                
-                gpu_freed = mem_before - mem_after
-                reserved_freed = reserved_before - reserved_after
-                
-                # Log if significant memory was freed or vision cache was large
-                if vision_mem_mb > 10 or gpu_freed > 10 or reserved_freed > 10:
-                    print(
-                        f"[Memory] Cleaned vision cache: "
-                        f"GPU allocated freed {gpu_freed:.2f} MB, "
-                        f"GPU reserved freed {reserved_freed:.2f} MB, "
-                        f"CPU vision cache ~{vision_mem_mb:.2f} MB"
-                    )
         
         if self.rank == 0:
             # Expand temperatures from batch format to varlen format if needed
@@ -1796,14 +1879,6 @@ class ModelRunner:
             # The model's forward method has a fallback path that accepts pixel_values
             seq.cached_vision_tokens = []
             seq.cached_deepstack_tokens = []
-            # IMPORTANT: Do NOT set seq.pixel_values = None here!
-            # We need to keep pixel_values so it can be passed to model.forward()
-            if not hasattr(self, '_debug_skip_vision_cache_logged'):
-                print(
-                    "[Memory] Skipping vision cache for prefill-only "
-                    "single-token generation (will use pixel_values fallback path)"
-                )
-                self._debug_skip_vision_cache_logged = True
             return
 
         # Check if model has visual method (qwen2vl, qwen2.5vl, qwen3vl)

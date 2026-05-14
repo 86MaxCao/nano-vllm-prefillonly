@@ -223,6 +223,7 @@ class Qwen3VLTextModel(nn.Module):
                 ds = deepstack_visual_embeds[layer_idx].to(
                     hidden_states.device, hidden_states.dtype
                 )
+                # Clone needed: torch.compile on RMSNorm may reuse the buffer
                 hidden_states = hidden_states.clone()
                 if visual_pos_mask is not None:
                     if mask_tensor is None:
@@ -379,39 +380,45 @@ class Qwen3VLVisionAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        seq_lengths: Sequence[int],
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
-        outputs = []
-        offset = 0
+        from flash_attn import flash_attn_varlen_func
+
+        seq_length = hidden_states.shape[0]
         cos, sin = position_embeddings
-        for length in seq_lengths:
-            chunk = hidden_states[offset : offset + length]
-            cos_chunk = cos[offset : offset + length]
-            sin_chunk = sin[offset : offset + length]
 
-            qkv = self.qkv(chunk)
-            q, k, v = qkv.chunk(3, dim=-1)
+        qkv = self.qkv(hidden_states)
+        q, k, v = qkv.chunk(3, dim=-1)
 
-            q = q.view(length, self.num_heads, self.head_dim).transpose(0, 1)
-            k = k.view(length, self.num_heads, self.head_dim).transpose(0, 1)
-            v = v.view(length, self.num_heads, self.head_dim).transpose(0, 1)
+        q = q.view(seq_length, self.num_heads, self.head_dim)
+        k = k.view(seq_length, self.num_heads, self.head_dim)
+        v = v.view(seq_length, self.num_heads, self.head_dim)
 
-            q, k = apply_rotary_pos_emb_vision(q, k, cos_chunk, sin_chunk)
-            if q.dtype != v.dtype:
-                q = q.to(v.dtype)
-                k = k.to(v.dtype)
+        # Apply rotary embeddings (expects num_heads first)
+        q_t = q.transpose(0, 1)
+        k_t = k.transpose(0, 1)
+        q_t, k_t = apply_rotary_pos_emb_vision(q_t, k_t, cos, sin)
+        q = q_t.transpose(0, 1)
+        k = k_t.transpose(0, 1)
 
-            attn_scores = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-            attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(v.dtype)
-            attn_output = torch.matmul(attn_weights, v)
+        if q.dtype != v.dtype:
+            q = q.to(v.dtype)
+            k = k.to(v.dtype)
 
-            attn_output = attn_output.transpose(0, 1).reshape(length, self.hidden_size)
-            attn_output = self.proj(attn_output)
-            outputs.append(attn_output)
-            offset += length
+        attn_output = flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            causal=False,
+        )
 
-        return torch.cat(outputs, dim=0)
+        attn_output = attn_output.reshape(seq_length, self.hidden_size)
+        attn_output = self.proj(attn_output)
+        return attn_output
 
 
 class Qwen3VLVisionPatchMerger(nn.Module):
@@ -448,12 +455,13 @@ class Qwen3VLVisionBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        seq_lengths: Sequence[int],
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.norm1(hidden_states)
-        hidden_states = residual + self.attn(hidden_states, seq_lengths, position_embeddings)
+        hidden_states = residual + self.attn(hidden_states, cu_seqlens, max_seqlen, position_embeddings)
         residual = hidden_states
         hidden_states = self.norm2(hidden_states)
         hidden_states = residual + self.mlp(hidden_states)
@@ -603,11 +611,16 @@ class Qwen3VLVisionModel(nn.Module):
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
-        seq_lengths = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).tolist()
+        # Compute cu_seqlens once (same as HF: each temporal frame is a separate sequence)
+        cu_seqlens = torch.repeat_interleave(
+            grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+        ).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens = torch.nn.functional.pad(cu_seqlens, (1, 0), value=0)
+        max_seqlen = int((grid_thw[:, 1] * grid_thw[:, 2]).max().item())
 
         deepstack_feature_lists: List[torch.Tensor] = []
         for layer_idx, block in enumerate(self.blocks):
-            hidden_states = block(hidden_states, seq_lengths, position_embeddings)
+            hidden_states = block(hidden_states, cu_seqlens, max_seqlen, position_embeddings)
             if layer_idx in self.deepstack_visual_indexes:
                 merger = self.deepstack_merger_list[self.deepstack_visual_indexes.index(layer_idx)]
                 deepstack_feature = merger(hidden_states)
@@ -653,11 +666,16 @@ class Qwen3VisionEncoder(nn.Module):
         emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
         position_embeddings = (emb.cos(), emb.sin())
 
-        seq_lengths = (grids[:, 0] * grids[:, 1] * grids[:, 2]).tolist()
+        # Compute cu_seqlens once (same as HF: each temporal frame is a separate sequence)
+        cu_seqlens = torch.repeat_interleave(
+            grids[:, 1] * grids[:, 2], grids[:, 0]
+        ).cumsum(dim=0, dtype=torch.int32)
+        cu_seqlens = torch.nn.functional.pad(cu_seqlens, (1, 0), value=0)
+        max_seqlen = int((grids[:, 1] * grids[:, 2]).max().item())
 
         deepstack_feature_lists: List[torch.Tensor] = []
         for layer_idx, block in enumerate(self.vision.blocks):
-            hidden_states = block(hidden_states, seq_lengths, position_embeddings)
+            hidden_states = block(hidden_states, cu_seqlens, max_seqlen, position_embeddings)
             if layer_idx in self.vision.deepstack_visual_indexes:
                 merger = self.vision.deepstack_merger_list[
                     self.vision.deepstack_visual_indexes.index(layer_idx)
@@ -726,20 +744,20 @@ class Qwen3VisionEncoder(nn.Module):
         image_grid_thw: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         # Debug: log pixel_values format in visual.forward
-        if not hasattr(self, '_debug_qwen3vl_visual_logged'):
-            print(
-                f"[DEBUG qwen3vl.visual.forward] "
-                f"pixel_values shape: {pixel_values.shape}, "
-                f"dim: {pixel_values.dim()}, dtype: {pixel_values.dtype}"
-            )
-            if image_grid_thw is not None:
-                print(
-                    f"[DEBUG qwen3vl.visual.forward] "
-                    f"image_grid_thw shape: {image_grid_thw.shape}, "
-                    f"dim: {image_grid_thw.dim()}"
-                )
-            self._debug_qwen3vl_visual_logged = True
-        
+        # if not hasattr(self, '_debug_qwen3vl_visual_logged'):
+            # print(
+                # f"[DEBUG qwen3vl.visual.forward] "
+                # f"pixel_values shape: {pixel_values.shape}, "
+                # f"dim: {pixel_values.dim()}, dtype: {pixel_values.dtype}"
+            # )
+            # if image_grid_thw is not None:
+                # print(
+                    # f"[DEBUG qwen3vl.visual.forward] "
+                    # f"image_grid_thw shape: {image_grid_thw.shape}, "
+                    # f"dim: {image_grid_thw.dim()}"
+                # )
+            # self._debug_qwen3vl_visual_logged = True
+
         if pixel_values.dim() <= 3:
             if image_grid_thw is None:
                 raise ValueError("image_grid_thw is required for flattened inputs")
@@ -829,9 +847,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         self.visual = create_vision_model(self.vision_config)
         self.language_model = Qwen3VLTextForCausalLM(self.text_config)
 
-        print("[Qwen3VLForConditionalGeneration] Initialization complete")
-        print(f"  - Vision encoder: {type(self.visual).__name__}")
-        print(f"  - Language model: {type(self.language_model).__name__}")
+        # print("[Qwen3VLForConditionalGeneration] Initialization complete")
+        # print(f"  - Vision encoder: {type(self.visual).__name__}")
+        # print(f"  - Language model: {type(self.language_model).__name__}")
     
         self.packed_modules_mapping = {
             "mlp.gate_proj": ("mlp.gate_up_proj", 0),
@@ -889,29 +907,29 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             deepstack_collect: list[list[torch.Tensor]] | None = None
 
             # Debug: log normal path processing
-            if not hasattr(self, '_debug_normal_path_logged'):
-                print(
-                    f"[DEBUG qwen3vl.forward (normal)] "
-                    f"Using vision_slices_per_seq path for {len(sequence_lengths)} sequences"
-                )
-                print(
-                    f"[DEBUG qwen3vl.forward (normal)] "
-                    f"Total slices: {sum(len(slices) for slices in vision_slices_per_seq)}"
-                )
-                self._debug_normal_path_logged = True
-            
+            # if not hasattr(self, '_debug_normal_path_logged'):
+                # print(
+                    # f"[DEBUG qwen3vl.forward (normal)] "
+                    # f"Using vision_slices_per_seq path for {len(sequence_lengths)} sequences"
+                # )
+                # print(
+                    # f"[DEBUG qwen3vl.forward (normal)] "
+                    # f"Total slices: {sum(len(slices) for slices in vision_slices_per_seq)}"
+                # )
+                # self._debug_normal_path_logged = True
+
             for seq_idx, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
                 seq_slices = vision_slices_per_seq[seq_idx]
                 if not seq_slices:
                     continue
 
-                if not hasattr(self, f'_debug_normal_seq_{seq_idx}_logged'):
-                    print(
-                        f"[DEBUG qwen3vl.forward (normal)] "
-                        f"Sequence {seq_idx}: range [{start}, {end}), "
-                        f"length={end-start}, num_slices={len(seq_slices)}"
-                    )
-                    setattr(self, f'_debug_normal_seq_{seq_idx}_logged', True)
+                # if not hasattr(self, f'_debug_normal_seq_{seq_idx}_logged'):
+                    # print(
+                        # f"[DEBUG qwen3vl.forward (normal)] "
+                        # f"Sequence {seq_idx}: range [{start}, {end}), "
+                        # f"length={end-start}, num_slices={len(seq_slices)}"
+                    # )
+                    # setattr(self, f'_debug_normal_seq_{seq_idx}_logged', True)
 
                 for slice_info in seq_slices:
                     token_slice = slice_info["tokens"].to(
@@ -965,43 +983,43 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 raise ValueError("sum of sequence_lengths does not match total input tokens")
 
             # Debug: log pixel_values format before calling visual
-            if not hasattr(self, '_debug_qwen3vl_fallback_logged'):
-                print(
-                    f"[DEBUG qwen3vl.forward (fallback)] "
-                    f"pixel_values shape: {pixel_values.shape}, "
-                    f"dim: {pixel_values.dim()}, dtype: {pixel_values.dtype}"
-                )
-                # Check expected dtype for vision model
-                # Qwen3VisionEncoder structure: self.visual.vision.patch_embed.proj
-                try:
-                    vision_dtype = self.visual.vision.patch_embed.proj.weight.dtype
-                    print(
-                        f"[DEBUG qwen3vl.forward (fallback)] "
-                        f"Vision model expected dtype: {vision_dtype}, "
-                        f"pixel_values dtype: {pixel_values.dtype}, "
-                        f"match: {pixel_values.dtype == vision_dtype}"
-                    )
-                except AttributeError:
-                    # Fallback: use pos_embed weight dtype
-                    vision_dtype = self.visual.vision.pos_embed.weight.dtype
-                    print(
-                        f"[DEBUG qwen3vl.forward (fallback)] "
-                        f"Vision model dtype (from pos_embed): {vision_dtype}, "
-                        f"pixel_values dtype: {pixel_values.dtype}"
-                    )
-                if image_grid_thw is not None:
-                    print(
-                        f"[DEBUG qwen3vl.forward (fallback)] "
-                        f"image_grid_thw shape: {image_grid_thw.shape}, "
-                        f"dim: {image_grid_thw.dim()}, dtype: {image_grid_thw.dtype}"
-                    )
-                # Log inputs_embeds dtype for comparison
-                print(
-                    f"[DEBUG qwen3vl.forward (fallback)] "
-                    f"inputs_embeds dtype: {inputs_embeds.dtype}, "
-                    f"device: {inputs_embeds.device}"
-                )
-                self._debug_qwen3vl_fallback_logged = True
+            # if not hasattr(self, '_debug_qwen3vl_fallback_logged'):
+                # print(
+                    # f"[DEBUG qwen3vl.forward (fallback)] "
+                    # f"pixel_values shape: {pixel_values.shape}, "
+                    # f"dim: {pixel_values.dim()}, dtype: {pixel_values.dtype}"
+                # )
+                # # Check expected dtype for vision model
+                # # Qwen3VisionEncoder structure: self.visual.vision.patch_embed.proj
+                # try:
+                    # vision_dtype = self.visual.vision.patch_embed.proj.weight.dtype
+                    # print(
+                        # f"[DEBUG qwen3vl.forward (fallback)] "
+                        # f"Vision model expected dtype: {vision_dtype}, "
+                        # f"pixel_values dtype: {pixel_values.dtype}, "
+                        # f"match: {pixel_values.dtype == vision_dtype}"
+                    # )
+                # except AttributeError:
+                    # # Fallback: use pos_embed weight dtype
+                    # vision_dtype = self.visual.vision.pos_embed.weight.dtype
+                    # print(
+                        # f"[DEBUG qwen3vl.forward (fallback)] "
+                        # f"Vision model dtype (from pos_embed): {vision_dtype}, "
+                        # f"pixel_values dtype: {pixel_values.dtype}"
+                    # )
+                # if image_grid_thw is not None:
+                    # print(
+                        # f"[DEBUG qwen3vl.forward (fallback)] "
+                        # f"image_grid_thw shape: {image_grid_thw.shape}, "
+                        # f"dim: {image_grid_thw.dim()}, dtype: {image_grid_thw.dtype}"
+                    # )
+                # # Log inputs_embeds dtype for comparison
+                # print(
+                    # f"[DEBUG qwen3vl.forward (fallback)] "
+                    # f"inputs_embeds dtype: {inputs_embeds.dtype}, "
+                    # f"device: {inputs_embeds.device}"
+                # )
+                # self._debug_qwen3vl_fallback_logged = True
 
             # Ensure pixel_values dtype matches vision model (safety check)
             # Qwen3VisionEncoder structure: self.visual.vision.patch_embed.proj
@@ -1012,13 +1030,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 vision_dtype = self.visual.vision.pos_embed.weight.dtype
             
             if pixel_values.dtype != vision_dtype:
-                if not hasattr(self, '_debug_qwen3vl_dtype_warning_logged'):
-                    print(
-                        f"[WARNING qwen3vl.forward (fallback)] "
-                        f"pixel_values dtype {pixel_values.dtype} does not match "
-                        f"vision model dtype {vision_dtype}, converting..."
-                    )
-                    self._debug_qwen3vl_dtype_warning_logged = True
+                # if not hasattr(self, '_debug_qwen3vl_dtype_warning_logged'):
+                    # print(
+                        # f"[WARNING qwen3vl.forward (fallback)] "
+                        # f"pixel_values dtype {pixel_values.dtype} does not match "
+                        # f"vision model dtype {vision_dtype}, converting..."
+                    # )
+                    # self._debug_qwen3vl_dtype_warning_logged = True
                 pixel_values = pixel_values.to(vision_dtype)
 
             image_chunks, deepstack_layers_raw = self.visual(pixel_values, image_grid_thw)
@@ -1026,24 +1044,24 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                 raise ValueError("The vision encoder did not return valid image features")
 
             # Debug: log image_chunks info
-            if not hasattr(self, '_debug_fallback_image_chunks_logged'):
-                print(
-                    f"[DEBUG qwen3vl.forward (fallback)] "
-                    f"vision encoder returned {len(image_chunks)} image_chunks"
-                )
-                if len(image_chunks) > 0:
-                    print(
-                        f"[DEBUG qwen3vl.forward (fallback)] "
-                        f"First image_chunk shape: {image_chunks[0].shape}, "
-                        f"dtype: {image_chunks[0].dtype}"
-                    )
-                if seq_image_indices:
-                    print(
-                        f"[DEBUG qwen3vl.forward (fallback)] "
-                        f"seq_image_indices: {seq_image_indices} "
-                        f"(sequence -> image index range mapping)"
-                    )
-                self._debug_fallback_image_chunks_logged = True
+            # if not hasattr(self, '_debug_fallback_image_chunks_logged'):
+                # print(
+                    # f"[DEBUG qwen3vl.forward (fallback)] "
+                    # f"vision encoder returned {len(image_chunks)} image_chunks"
+                # )
+                # if len(image_chunks) > 0:
+                    # print(
+                        # f"[DEBUG qwen3vl.forward (fallback)] "
+                        # f"First image_chunk shape: {image_chunks[0].shape}, "
+                        # f"dtype: {image_chunks[0].dtype}"
+                    # )
+                # if seq_image_indices:
+                    # print(
+                        # f"[DEBUG qwen3vl.forward (fallback)] "
+                        # f"seq_image_indices: {seq_image_indices} "
+                        # f"(sequence -> image index range mapping)"
+                    # )
+                # self._debug_fallback_image_chunks_logged = True
 
             offsets = [0]
             for length in sequence_lengths:
@@ -1056,13 +1074,13 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             # Fallback path needs to correctly map image_chunks to sequences
             if seq_image_indices and len(seq_image_indices) == len(sequence_lengths):
                 # Use seq_image_indices to correctly map images to sequences
-                if not hasattr(self, '_debug_fallback_mapping_logged'):
-                    print(
-                        f"[DEBUG qwen3vl.forward (fallback)] "
-                        f"Using seq_image_indices mapping for {len(sequence_lengths)} sequences"
-                    )
-                    self._debug_fallback_mapping_logged = True
-                
+                # if not hasattr(self, '_debug_fallback_mapping_logged'):
+                    # print(
+                        # f"[DEBUG qwen3vl.forward (fallback)] "
+                        # f"Using seq_image_indices mapping for {len(sequence_lengths)} sequences"
+                    # )
+                    # self._debug_fallback_mapping_logged = True
+
                 for seq_idx, (start, end) in enumerate(zip(offsets[:-1], offsets[1:])):
                     seq_length = end - start
                     if seq_length <= 0:
@@ -1074,16 +1092,16 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     # Collect all image chunks for this sequence
                     seq_image_chunks = image_chunks[img_start_idx:img_end_idx]
                     
-                    if not hasattr(self, f'_debug_seq_{seq_idx}_logged'):
-                        print(
-                            f"[DEBUG qwen3vl.forward (fallback)] "
-                            f"Sequence {seq_idx}: range [{start}, {end}), "
-                            f"length={seq_length}, "
-                            f"images [{img_start_idx}:{img_end_idx}], "
-                            f"num_chunks={len(seq_image_chunks)}"
-                        )
-                        setattr(self, f'_debug_seq_{seq_idx}_logged', True)
-                    
+                    # if not hasattr(self, f'_debug_seq_{seq_idx}_logged'):
+                        # print(
+                            # f"[DEBUG qwen3vl.forward (fallback)] "
+                            # f"Sequence {seq_idx}: range [{start}, {end}), "
+                            # f"length={seq_length}, "
+                            # f"images [{img_start_idx}:{img_end_idx}], "
+                            # f"num_chunks={len(seq_image_chunks)}"
+                        # )
+                        # setattr(self, f'_debug_seq_{seq_idx}_logged', True)
+
                     # Concatenate all image chunks for this sequence
                     if seq_image_chunks:
                         # All chunks should be on same device/dtype, concatenate them
@@ -1107,14 +1125,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                                 if len(placeholders) == 1:
                                     target_offset, expected_length = placeholders[0]
                                     if expected_length != slice_len:
-                                        if not hasattr(self, f'_debug_placeholder_length_mismatch_{seq_idx}_logged'):
-                                            print(
-                                                f"[DEBUG qwen3vl.forward (fallback)] "
-                                                f"WARNING: Sequence {seq_idx} placeholder length ({expected_length}) "
-                                                f"!= actual vision tokens ({slice_len}), using actual length"
-                                            )
-                                            setattr(self, f'_debug_placeholder_length_mismatch_{seq_idx}_logged', True)
-                                    
+                                        pass  # length mismatch is non-fatal, use actual length
+
                                     target_start = start + target_offset
                                     target_end = target_start + slice_len
                                     if target_end > end:
@@ -1123,29 +1135,29 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                                             f"is out of sequence bounds [{start}, {end})"
                                         )
                                     
-                                    if not hasattr(self, f'_debug_placeholder_placement_{seq_idx}_logged'):
-                                        print(
-                                            f"[DEBUG qwen3vl.forward (fallback)] "
-                                            f"Sequence {seq_idx}: placing {slice_len} vision tokens "
-                                            f"at offset {target_offset} (absolute position {target_start})"
-                                        )
-                                        setattr(self, f'_debug_placeholder_placement_{seq_idx}_logged', True)
-                                    
+                                    # if not hasattr(self, f'_debug_placeholder_placement_{seq_idx}_logged'):
+                                        # print(
+                                            # f"[DEBUG qwen3vl.forward (fallback)] "
+                                            # f"Sequence {seq_idx}: placing {slice_len} vision tokens "
+                                            # f"at offset {target_offset} (absolute position {target_start})"
+                                        # )
+                                        # setattr(self, f'_debug_placeholder_placement_{seq_idx}_logged', True)
+
                                     inputs_embeds[target_start:target_end] = seq_vision_tokens
                                     visual_pos_mask[target_start:target_end] = True
                                     total_replaced += slice_len
                                 else:
                                     # Multiple placeholders - need to split seq_vision_tokens
                                     # This is rare, but handle it by distributing tokens proportionally
-                                    if not hasattr(self, f'_debug_multiple_placeholders_{seq_idx}_logged'):
-                                        print(
-                                            f"[DEBUG qwen3vl.forward (fallback)] "
-                                            f"WARNING: Sequence {seq_idx} has {len(placeholders)} placeholders, "
-                                            f"but we have {len(seq_image_chunks)} image chunks. "
-                                            f"Using first placeholder only."
-                                        )
-                                        setattr(self, f'_debug_multiple_placeholders_{seq_idx}_logged', True)
-                                    
+                                    # if not hasattr(self, f'_debug_multiple_placeholders_{seq_idx}_logged'):
+                                        # print(
+                                            # f"[DEBUG qwen3vl.forward (fallback)] "
+                                            # f"WARNING: Sequence {seq_idx} has {len(placeholders)} placeholders, "
+                                            # f"but we have {len(seq_image_chunks)} image chunks. "
+                                            # f"Using first placeholder only."
+                                        # )
+                                        # setattr(self, f'_debug_multiple_placeholders_{seq_idx}_logged', True)
+
                                     target_offset, expected_length = placeholders[0]
                                     target_start = start + target_offset
                                     target_end = target_start + slice_len
@@ -1159,25 +1171,25 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                                     total_replaced += slice_len
                             else:
                                 # No placeholders for this sequence - fallback to beginning
-                                if not hasattr(self, f'_debug_no_placeholder_{seq_idx}_logged'):
-                                    print(
-                                        f"[DEBUG qwen3vl.forward (fallback)] "
-                                        f"WARNING: Sequence {seq_idx} has no vision_placeholders, "
-                                        f"placing vision tokens at sequence start"
-                                    )
-                                    setattr(self, f'_debug_no_placeholder_{seq_idx}_logged', True)
+                                # if not hasattr(self, f'_debug_no_placeholder_{seq_idx}_logged'):
+                                    # print(
+                                        # f"[DEBUG qwen3vl.forward (fallback)] "
+                                        # f"WARNING: Sequence {seq_idx} has no vision_placeholders, "
+                                        # f"placing vision tokens at sequence start"
+                                    # )
+                                    # setattr(self, f'_debug_no_placeholder_{seq_idx}_logged', True)
                                 inputs_embeds[start : start + slice_len] = seq_vision_tokens
                                 visual_pos_mask[start : start + slice_len] = True
                                 total_replaced += slice_len
                         else:
                             # No seq_vision_placeholders provided - fallback to beginning
-                            if not hasattr(self, f'_debug_no_placeholders_info_{seq_idx}_logged'):
-                                print(
-                                    f"[DEBUG qwen3vl.forward (fallback)] "
-                                    f"WARNING: No seq_vision_placeholders for sequence {seq_idx}, "
-                                    f"placing vision tokens at sequence start"
-                                )
-                                setattr(self, f'_debug_no_placeholders_info_{seq_idx}_logged', True)
+                            # if not hasattr(self, f'_debug_no_placeholders_info_{seq_idx}_logged'):
+                                # print(
+                                    # f"[DEBUG qwen3vl.forward (fallback)] "
+                                    # f"WARNING: No seq_vision_placeholders for sequence {seq_idx}, "
+                                    # f"placing vision tokens at sequence start"
+                                # )
+                                # setattr(self, f'_debug_no_placeholders_info_{seq_idx}_logged', True)
                             inputs_embeds[start : start + slice_len] = seq_vision_tokens
                             visual_pos_mask[start : start + slice_len] = True
                             total_replaced += slice_len
@@ -1196,14 +1208,14 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                                         deepstack_collect[layer_idx].append(layer_concat)
             else:
                 # Fallback: original logic (assumes one image per sequence)
-                if not hasattr(self, '_debug_fallback_original_logged'):
-                    print(
-                        f"[DEBUG qwen3vl.forward (fallback)] "
-                        f"WARNING: No seq_image_indices, using original 1:1 mapping "
-                        f"(assumes one image per sequence)"
-                    )
-                    self._debug_fallback_original_logged = True
-                
+                # if not hasattr(self, '_debug_fallback_original_logged'):
+                    # print(
+                        # f"[DEBUG qwen3vl.forward (fallback)] "
+                        # f"WARNING: No seq_image_indices, using original 1:1 mapping "
+                        # f"(assumes one image per sequence)"
+                    # )
+                    # self._debug_fallback_original_logged = True
+
                 image_iter = iter(image_chunks)
                 deepstack_iter = [iter(layer) for layer in deepstack_layers_raw] if deepstack_layers_raw else None
 

@@ -36,7 +36,17 @@ class LLMEngine:
         )
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self._processor = None  # Lazily loaded for multimodal
         atexit.register(self.exit)
+
+    def _get_processor(self):
+        """Lazily load and cache the AutoProcessor for multimodal inputs."""
+        if self._processor is None:
+            from transformers import AutoProcessor
+            self._processor = AutoProcessor.from_pretrained(
+                self.model_runner.config.model, trust_remote_code=True
+            )
+        return self._processor
 
     def _expand_vision_placeholders(
         self,
@@ -246,7 +256,10 @@ class LLMEngine:
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(requests)
 
-        for request, sp in zip(requests, sampling_params):
+        # Phase 1: Extract text and images from all requests
+        all_texts = []
+        all_images = []  # per-request image list (None if no images)
+        for request in requests:
             messages = request.get("messages")
             text = request.get("text")
             images = request.get("images")
@@ -256,13 +269,11 @@ class LLMEngine:
                     raise ValueError(
                         "multimodal request requires 'text' or 'messages'"
                     )
-
                 text = processor.apply_chat_template(
                     messages,
                     tokenize=False,
                     add_generation_prompt=True,
                 )
-
                 if images is None:
                     extracted_images = []
                     for message in messages:
@@ -276,87 +287,154 @@ class LLMEngine:
             if images is not None and not isinstance(images, (list, tuple)):
                 images = [images]
 
-            # Use return_tensors="pt" as per official LlavaNextProcessor usage
-            processor_kwargs = {
-                "text": [text],
-                "return_tensors": "pt",
-                "padding": True,
-            }
-            if images:
-                # Let the processor handle image normalization + batching.
-                processor_kwargs["images"] = images
+            all_texts.append(text)
+            all_images.append(images)
 
-            processor_outputs = processor(**processor_kwargs)
+        # Phase 2: Batch processor call
+        # Separate multimodal vs text-only requests
+        multimodal_indices = [i for i, imgs in enumerate(all_images) if imgs]
+        text_only_indices = [i for i, imgs in enumerate(all_images) if not imgs]
 
-            # Extract input_ids - processor returns tensor with return_tensors="pt"
-            input_ids = processor_outputs["input_ids"][0].tolist()
+        # Per-request results storage
+        per_request_input_ids = [None] * len(requests)
+        per_request_pixel_values = [None] * len(requests)
+        per_request_image_grid_thw = [None] * len(requests)
+
+        if multimodal_indices:
+            mm_texts = [all_texts[i] for i in multimodal_indices]
+            # Flatten images for processor: one image per entry for single-image requests
+            # Track how many images each request contributes
+            mm_flat_images = []
+            images_per_request = []
+            for i in multimodal_indices:
+                imgs = all_images[i]
+                mm_flat_images.extend(imgs)
+                images_per_request.append(len(imgs))
+
+            processor_outputs = processor(
+                text=mm_texts,
+                images=mm_flat_images,
+                return_tensors="pt",
+                padding=True,
+            )
+
+            batch_input_ids = processor_outputs["input_ids"]
+            attention_mask = processor_outputs.get("attention_mask")
             pixel_values = processor_outputs.get("pixel_values")
             image_grid_thw = processor_outputs.get("image_grid_thw")
-            
-            # Fix: LlavaNextProcessor with return_tensors="pt" sometimes returns 1D tensor
-            # This is a bug in the processor - it should return a list of tensors
-            # Workaround: If we get 1D tensor, re-process without return_tensors to get list format
-            if pixel_values is not None:
-                if isinstance(pixel_values, torch.Tensor) and pixel_values.dim() == 1:
-                    # This is an error - processor returned 1D tensor
-                    # Log the issue
-                    print(f"\n[WARNING llm_engine.generate_multimodal]")
-                    print(f"  LlavaNextProcessor returned 1D pixel_values tensor with shape {pixel_values.shape}")
-                    print(f"  Attempting to fix by re-processing without return_tensors='pt'")
-                    
-                    # Re-process without return_tensors to get correct list format
-                    processor_kwargs_fix = {
-                        "text": [text],
-                        "padding": True,
-                    }
-                    if images:
-                        processor_kwargs_fix["images"] = images
-                    processor_outputs_fix = processor(**processor_kwargs_fix)
-                    pixel_values_fix = processor_outputs_fix.get("pixel_values")
-                    
-                    print(f"  Fixed pixel_values type: {type(pixel_values_fix)}")
-                    if isinstance(pixel_values_fix, list):
-                        print(f"  Fixed pixel_values length: {len(pixel_values_fix)}")
-                        if len(pixel_values_fix) > 0:
-                            print(f"  First element type: {type(pixel_values_fix[0])}")
-                            if isinstance(pixel_values_fix[0], torch.Tensor):
-                                print(f"  First element shape: {pixel_values_fix[0].shape}")
-                            elif hasattr(pixel_values_fix[0], 'shape'):
-                                print(f"  First element shape: {pixel_values_fix[0].shape}")
-                    
-                    # Also need to update input_ids if it was affected
-                    if "input_ids" in processor_outputs_fix:
-                        input_ids_fix = processor_outputs_fix["input_ids"]
-                        if isinstance(input_ids_fix, list):
-                            input_ids = input_ids_fix[0] if isinstance(input_ids_fix[0], list) else input_ids_fix
-                        elif isinstance(input_ids_fix, torch.Tensor):
-                            input_ids = input_ids_fix[0].tolist()
-                    # Update image_grid_thw if needed
-                    if "image_grid_thw" in processor_outputs_fix:
-                        image_grid_thw_fix = processor_outputs_fix.get("image_grid_thw")
-                        if image_grid_thw_fix is not None:
-                            image_grid_thw = image_grid_thw_fix
-                    
-                    if isinstance(pixel_values_fix, list):
-                        # Convert list elements to tensors if needed
-                        pixel_values = [
-                            torch.tensor(pv) if not isinstance(pv, torch.Tensor) else pv
-                            for pv in pixel_values_fix
-                        ]
-                        print(f"  Successfully fixed pixel_values to list format with {len(pixel_values)} elements")
-                    else:
-                        raise ValueError(
-                            f"Failed to fix pixel_values format. "
-                            f"Original: {type(pixel_values)}, shape: {pixel_values.shape if hasattr(pixel_values, 'shape') else 'N/A'}. "
-                            f"Fixed: {type(pixel_values_fix)}"
-                        )
-            
+
+            # Handle LlavaNext 1D pixel_values bug
+            if pixel_values is not None and isinstance(pixel_values, torch.Tensor) and pixel_values.dim() == 1:
+                import logging
+                logging.warning(f"LlavaNextProcessor returned 1D pixel_values {pixel_values.shape}, re-processing")
+                processor_outputs_fix = processor(
+                    text=mm_texts,
+                    images=mm_flat_images,
+                    padding=True,
+                )
+                pixel_values = processor_outputs_fix.get("pixel_values")
+                if isinstance(pixel_values, list):
+                    pixel_values = [
+                        torch.tensor(pv) if not isinstance(pv, torch.Tensor) else pv
+                        for pv in pixel_values
+                    ]
+                else:
+                    raise ValueError(
+                        f"Failed to fix pixel_values format: {type(pixel_values)}"
+                    )
+                image_grid_thw = processor_outputs_fix.get("image_grid_thw")
+                batch_input_ids = processor_outputs_fix["input_ids"]
+                if isinstance(batch_input_ids, list):
+                    batch_input_ids = torch.tensor(batch_input_ids)
+                attention_mask = processor_outputs_fix.get("attention_mask")
+                if isinstance(attention_mask, list):
+                    attention_mask = torch.tensor(attention_mask)
+
             # Convert image_grid_thw to tensor if needed
             if image_grid_thw is not None and not isinstance(image_grid_thw, torch.Tensor):
                 if isinstance(image_grid_thw, list):
                     image_grid_thw = torch.tensor(image_grid_thw)
                 elif isinstance(image_grid_thw, np.ndarray):
                     image_grid_thw = torch.from_numpy(image_grid_thw)
+
+            # Compute patches-per-image for pixel_values splitting
+            # For Qwen3-VL: pixel_values is [total_patches, hidden_dim]
+            # where patches per image = t * h * w from image_grid_thw
+            patches_per_image = None
+            if image_grid_thw is not None and isinstance(pixel_values, torch.Tensor):
+                thw_2d = image_grid_thw.squeeze(0) if image_grid_thw.dim() == 3 else image_grid_thw
+                if thw_2d.dim() == 2:
+                    patches_per_image = (thw_2d[:, 0] * thw_2d[:, 1] * thw_2d[:, 2]).tolist()
+
+            # Unbatch: distribute results back to per-request storage
+            img_offset = 0
+            patch_offset = 0
+            for batch_idx, req_idx in enumerate(multimodal_indices):
+                # Extract unpadded input_ids using attention_mask
+                if attention_mask is not None:
+                    mask = attention_mask[batch_idx].bool()
+                    ids = batch_input_ids[batch_idx][mask].tolist()
+                else:
+                    ids = batch_input_ids[batch_idx].tolist()
+                per_request_input_ids[req_idx] = ids
+
+                # Slice pixel_values for this request
+                num_imgs = images_per_request[batch_idx]
+                if pixel_values is not None:
+                    if isinstance(pixel_values, list):
+                        # LlavaNext: list of tensors per image
+                        per_request_pixel_values[req_idx] = [
+                            pv.cpu() if isinstance(pv, torch.Tensor) else pv
+                            for pv in pixel_values[img_offset:img_offset + num_imgs]
+                        ]
+                    elif isinstance(pixel_values, torch.Tensor):
+                        if patches_per_image is not None:
+                            # Qwen-VL style: pixel_values is [total_patches, hidden_dim]
+                            # Split by patch count per image
+                            total_patches = sum(patches_per_image[img_offset:img_offset + num_imgs])
+                            pv_slice = pixel_values[patch_offset:patch_offset + total_patches]
+                            per_request_pixel_values[req_idx] = pv_slice.contiguous().cpu()
+                            patch_offset += total_patches
+                        else:
+                            # Fallback: assume dim 0 is image count
+                            pv_slice = pixel_values[img_offset:img_offset + num_imgs]
+                            per_request_pixel_values[req_idx] = pv_slice.contiguous().cpu()
+
+                # Slice image_grid_thw for this request
+                if image_grid_thw is not None:
+                    thw = image_grid_thw
+                    if thw.dim() == 3:
+                        thw = thw.squeeze(0)
+                    if thw.dim() == 2:
+                        per_request_image_grid_thw[req_idx] = thw[img_offset:img_offset + num_imgs].contiguous().cpu()
+                    else:
+                        per_request_image_grid_thw[req_idx] = thw.contiguous().cpu()
+
+                img_offset += num_imgs
+
+        if text_only_indices:
+            to_texts = [all_texts[i] for i in text_only_indices]
+            text_outputs = self.tokenizer(
+                to_texts,
+                return_tensors="pt",
+                padding=True,
+                truncation=False,
+            )
+            text_input_ids = text_outputs["input_ids"]
+            text_attention_mask = text_outputs.get("attention_mask")
+            for batch_idx, req_idx in enumerate(text_only_indices):
+                if text_attention_mask is not None:
+                    mask = text_attention_mask[batch_idx].bool()
+                    ids = text_input_ids[batch_idx][mask].tolist()
+                else:
+                    ids = text_input_ids[batch_idx].tolist()
+                per_request_input_ids[req_idx] = ids
+
+        # Phase 3: Expand vision placeholders and add_request for each sequence
+        for req_idx, sp in enumerate(sampling_params):
+            input_ids = per_request_input_ids[req_idx]
+            pixel_values = per_request_pixel_values[req_idx]
+            image_grid_thw = per_request_image_grid_thw[req_idx]
 
             vision_counts = []
             vision_placeholders = []
@@ -372,59 +450,6 @@ class LLMEngine:
                     else image_grid_thw,
                 )
                 input_ids = expanded_input_ids
-
-            if pixel_values is not None:
-                # Handle different pixel_values formats
-                # According to official LlavaNextProcessor usage and vLLM implementation:
-                # - pixel_values can be a list of tensors (one per image, each with shape (num_patches, c, h, w))
-                # - or a 5D tensor (batch, num_patches, c, h, w) if all images have same num_patches
-                # - or a 4D tensor (batch, c, h, w) for single-resolution images
-                if isinstance(pixel_values, list):
-                    # Keep as list for llavanext - each element is a tensor with shape (num_patches, c, h, w)
-                    # Move each tensor to CPU
-                    pixel_values = [
-                        pv.cpu() if isinstance(pv, torch.Tensor) else pv
-                        for pv in pixel_values
-                    ]
-                    # Debug log
-                    if not hasattr(self, '_debug_pixel_values_list_logged'):
-                        print(f"\n[DEBUG llm_engine.generate_multimodal]")
-                        print(f"  pixel_values is list with {len(pixel_values)} elements")
-                        if len(pixel_values) > 0:
-                            print(f"  First element type: {type(pixel_values[0])}")
-                            if isinstance(pixel_values[0], torch.Tensor):
-                                print(f"  First element shape: {pixel_values[0].shape}")
-                        self._debug_pixel_values_list_logged = True
-                elif isinstance(pixel_values, torch.Tensor):
-                    # Check if it's incorrectly flattened (1D tensor)
-                    if pixel_values.dim() == 1:
-                        # This is an error - pixel_values should not be 1D
-                        # This should have been fixed above, but log it anyway
-                        print(f"\n[ERROR llm_engine.generate_multimodal]")
-                        print(f"  Received 1D pixel_values tensor with shape {pixel_values.shape}")
-                        print(f"  This should have been fixed above. Check fix logic.")
-                        raise ValueError(
-                            f"Received 1D pixel_values tensor with shape {pixel_values.shape}. "
-                            f"This usually happens when processor output is incorrectly converted. "
-                            f"For llavanext, pixel_values should be a list of tensors or a 4D/5D tensor. "
-                            f"Please check processor output format."
-                        )
-                    # For tensor format, move to CPU
-                    pixel_values = pixel_values.contiguous().cpu()
-                    # Debug log
-                    if not hasattr(self, '_debug_pixel_values_tensor_logged'):
-                        print(f"\n[DEBUG llm_engine.generate_multimodal]")
-                        print(f"  pixel_values is tensor, shape: {pixel_values.shape}, dim: {pixel_values.dim()}")
-                        self._debug_pixel_values_tensor_logged = True
-                else:
-                    # Unknown format, try to convert to CPU if possible
-                    if hasattr(pixel_values, 'cpu'):
-                        pixel_values = pixel_values.cpu()
-                    print(f"\n[WARNING llm_engine.generate_multimodal]")
-                    print(f"  pixel_values has unexpected type: {type(pixel_values)}")
-
-            if image_grid_thw is not None:
-                image_grid_thw = image_grid_thw.contiguous().cpu()
 
             self.add_request(
                 input_ids,
@@ -509,46 +534,54 @@ class LLMEngine:
 
         # Handle multimodal case
         if images is not None:
-            # Multimodal embedding: use processor batch processing
-            from transformers import AutoProcessor
-            processor = AutoProcessor.from_pretrained(
-                self.model_runner.config.model, trust_remote_code=True
-            )
+            # Multimodal embedding: use cached processor
+            processor = self._get_processor()
             # Set padding side to left
             if hasattr(processor, 'tokenizer'):
                 processor.tokenizer.padding_side = "left"
 
-            # Collect all formatted texts and images
-            all_formatted_texts = []
+            # Collect all formatted texts and images using batch apply_chat_template
             all_images_list = []
+            messages_batch = []
+            text_only_fallback_indices = []
             
             for i, text in enumerate(texts):
                 if images and i < len(images):
                     img = images[i] if isinstance(images[i], list) else [images[i]]
-                    try:
-                        # Format multimodal input using apply_chat_template
-                        formatted_text = processor.apply_chat_template(
-                            [
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {"type": "image", "image": img[0]},
-                                        {"type": "text", "text": text},
-                                    ],
-                                }
+                    messages_batch.append([
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "image", "image": img[0]},
+                                {"type": "text", "text": text},
                             ],
-                            tokenize=False,
-                            add_generation_prompt=False,
-                        )
-                        all_formatted_texts.append(formatted_text)
-                        all_images_list.append(img[0])
-                    except (AttributeError, TypeError) as e:
-                        # Fallback to text-only
-                        all_formatted_texts.append(text)
-                        all_images_list.append(None)
+                        }
+                    ])
+                    all_images_list.append(img[0])
                 else:
-                    all_formatted_texts.append(text)
+                    messages_batch.append([
+                        {"role": "user", "content": [{"type": "text", "text": text}]}
+                    ])
                     all_images_list.append(None)
+                    text_only_fallback_indices.append(i)
+            
+            # Batch apply_chat_template (much faster than serial calls)
+            try:
+                all_formatted_texts = processor.apply_chat_template(
+                    messages_batch, tokenize=False, add_generation_prompt=False,
+                )
+            except (AttributeError, TypeError):
+                # Fallback to serial if batch not supported
+                all_formatted_texts = []
+                for msgs in messages_batch:
+                    all_formatted_texts.append(
+                        processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+                    )
+            
+            # Qwen3 embedding models use <|endoftext|> as pooling anchor
+            embed_type = getattr(self.model_runner.config, "embedding_type", None)
+            if embed_type in ("qwen3", "qwen3_vl"):
+                all_formatted_texts = [t + "<|endoftext|>" for t in all_formatted_texts]
             
             # Filter out None images and process in batches
             # Separate multimodal and text-only samples
@@ -742,6 +775,11 @@ class LLMEngine:
                     # Decode token IDs to string
                     all_texts.append(self.tokenizer.decode(text))
             
+            # Qwen3 embedding models use <|endoftext|> as pooling anchor
+            embed_type = getattr(self.model_runner.config, "embedding_type", None)
+            if embed_type in ("qwen3", "qwen3_vl"):
+                all_texts = [t + "<|endoftext|>" for t in all_texts]
+            
             # Batch tokenize with left padding
             tokenized = self.tokenizer(
                 all_texts,
@@ -759,10 +797,7 @@ class LLMEngine:
         
         # Generate positions tensor
         max_len = input_ids_tensor.shape[1]
-        positions_tensor = torch.tensor(
-            [[i for i in range(max_len)] for _ in range(batch_size)],
-            dtype=torch.int64
-        )
+        positions_tensor = torch.arange(max_len, dtype=torch.int64).unsqueeze(0).expand(batch_size, -1)
         
         # Restore original padding side
         self.tokenizer.padding_side = original_padding_side
@@ -818,11 +853,7 @@ class LLMEngine:
         processor = None
         if images:
             try:
-                from transformers import AutoProcessor
-                processor = AutoProcessor.from_pretrained(
-                    self.model_runner.config.model,
-                    trust_remote_code=True,
-                )
+                processor = self._get_processor()
                 # Set padding side to left to match Transformers baseline
                 if hasattr(processor, 'tokenizer'):
                     processor.tokenizer.padding_side = "left"
@@ -831,51 +862,38 @@ class LLMEngine:
 
         # Batch processing: collect all inputs first
         if images and processor:
-            # Multimodal reranking: use processor batch processing
-            all_formatted_texts = []
+            # Multimodal reranking: use batch apply_chat_template
             all_images_list = []
+            messages_batch = []
             
             for i, (query, doc) in enumerate(query_doc_pairs):
-                try:
-                    # Format multimodal input using apply_chat_template
-                    formatted_text = processor.apply_chat_template(
-                        [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "image", "image": images[i]},
-                                    {"type": "text", "text": f"{query} {doc}"},
-                                ],
-                            }
+                messages_batch.append([
+                    {
+                        "role": "system",
+                        "content": 'Judge whether the Document is relevant to the Query. Answer only "yes" or "no".',
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "image": images[i]},
+                            {"type": "text", "text": f"<query>{query}</query>\n<document>{doc}</document>"},
                         ],
-                        tokenize=False,
-                        add_generation_prompt=False,
+                    }
+                ])
+                all_images_list.append(images[i])
+            
+            # Batch apply_chat_template (much faster than serial calls)
+            try:
+                all_formatted_texts = processor.apply_chat_template(
+                    messages_batch, tokenize=False, add_generation_prompt=True,
+                )
+            except (AttributeError, TypeError):
+                # Fallback to serial if batch not supported
+                all_formatted_texts = []
+                for msgs in messages_batch:
+                    all_formatted_texts.append(
+                        processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
                     )
-                    all_formatted_texts.append(formatted_text)
-                    all_images_list.append(images[i])
-                except Exception as e:
-                    print(f"Warning: Failed to format multimodal input {i}: {e}")
-                    # Fallback to text-only
-                    sep_token = (
-                        self.tokenizer.sep_token_id or self.tokenizer.eos_token_id
-                    )
-                    if isinstance(query, str):
-                        query_ids = self.tokenizer.encode(
-                            query, add_special_tokens=False
-                        )
-                    else:
-                        query_ids = query
-                    if isinstance(doc, str):
-                        doc_ids = self.tokenizer.encode(
-                            doc, add_special_tokens=False
-                        )
-                    else:
-                        doc_ids = doc
-                    fallback_text = self.tokenizer.decode(
-                        query_ids + [sep_token] + doc_ids
-                    )
-                    all_formatted_texts.append(fallback_text)
-                    all_images_list.append(None)
             
             # Batch process all multimodal inputs at once
             processor_outputs = processor(
@@ -902,28 +920,56 @@ class LLMEngine:
                 attention_mask_tensor = attention_mask_tensor.to(torch.int64)
         else:
             # Text-only reranking: use tokenizer batch processing
+            reranker_type = getattr(self.model_runner.config, "reranker_type", None)
             all_texts = []
-            for query, doc in query_doc_pairs:
-                if isinstance(query, str) and isinstance(doc, str):
-                    sep_token = (
-                        self.tokenizer.sep_token_id or self.tokenizer.eos_token_id
+            if reranker_type in ("qwen3", "qwen3_vl"):
+                # Batch apply_chat_template for Qwen3 rerankers
+                messages_batch = []
+                for query, doc in query_doc_pairs:
+                    if isinstance(query, str) and isinstance(doc, str):
+                        messages_batch.append([
+                            {"role": "system", "content": 'Judge whether the Document is relevant to the Query. Answer only "yes" or "no".'},
+                            {"role": "user", "content": f"<query>{query}</query>\n<document>{doc}</document>"},
+                        ])
+                    else:
+                        # Decode token IDs first
+                        q = self.tokenizer.decode(query) if isinstance(query, list) else query
+                        d = self.tokenizer.decode(doc) if isinstance(doc, list) else doc
+                        messages_batch.append([
+                            {"role": "system", "content": 'Judge whether the Document is relevant to the Query. Answer only "yes" or "no".'},
+                            {"role": "user", "content": f"<query>{q}</query>\n<document>{d}</document>"},
+                        ])
+                try:
+                    all_texts = self.tokenizer.apply_chat_template(
+                        messages_batch, tokenize=False, add_generation_prompt=True
                     )
-                    # Format as query<sep>doc
-                    text = f"{query}{self.tokenizer.decode([sep_token])}{doc}"
-                    all_texts.append(text)
-                else:
-                    # If already token IDs, decode them
-                    if isinstance(query, list) and isinstance(doc, list):
+                except (AttributeError, TypeError):
+                    all_texts = [
+                        self.tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+                        for msgs in messages_batch
+                    ]
+            else:
+                for query, doc in query_doc_pairs:
+                    if isinstance(query, str) and isinstance(doc, str):
+                        # Other rerankers (jina, gemma, etc.) use simple format
                         sep_token = (
                             self.tokenizer.sep_token_id or self.tokenizer.eos_token_id
                         )
-                        combined_ids = query + [sep_token] + doc
-                        text = self.tokenizer.decode(combined_ids)
+                        text = f"{query}{self.tokenizer.decode([sep_token])}{doc}"
                         all_texts.append(text)
                     else:
-                        raise ValueError(
-                            "Mixed string and token ID inputs not supported"
-                        )
+                        # If already token IDs, decode them
+                        if isinstance(query, list) and isinstance(doc, list):
+                            sep_token = (
+                                self.tokenizer.sep_token_id or self.tokenizer.eos_token_id
+                            )
+                            combined_ids = query + [sep_token] + doc
+                            text = self.tokenizer.decode(combined_ids)
+                            all_texts.append(text)
+                        else:
+                            raise ValueError(
+                                "Mixed string and token ID inputs not supported"
+                            )
             
             # Batch tokenize with left padding
             tokenized = self.tokenizer(
@@ -942,10 +988,7 @@ class LLMEngine:
         
         # Generate positions tensor
         max_len = input_ids_tensor.shape[1]
-        positions_tensor = torch.tensor(
-            [[i for i in range(max_len)] for _ in range(batch_size)],
-            dtype=torch.int64
-        )
+        positions_tensor = torch.arange(max_len, dtype=torch.int64).unsqueeze(0).expand(batch_size, -1)
         
         # Restore original padding side
         self.tokenizer.padding_side = original_padding_side
