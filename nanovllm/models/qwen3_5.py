@@ -7,9 +7,6 @@ nano-vllm-multimodal-qwen3_5. It does not implement or depend on Qwen3-VL.
 from __future__ import annotations
 
 import os
-
-# For diagnose_full_attention.py: when NANOVLLM_DEBUG_FA=1, layer 3 full_attention saves intermediates here
-FA_DEBUG_SAVE = {}
 import math
 from typing import List, Optional, Sequence, Tuple
 
@@ -312,10 +309,6 @@ class Qwen3_5TextAttention(nn.Module):
             cos, sin = self.rotary_emb(hidden_states, positions_2d)
             # Apply rotary embedding manually (partial RoPE: cos/sin only cover rotary_dim dims)
             rotary_dim = cos.shape[-1]
-            def rotate_half(x):
-                x1 = x[..., : x.shape[-1] // 2]
-                x2 = x[..., x.shape[-1] // 2 :]
-                return torch.cat((-x2, x1), dim=-1)
             # cos/sin shape: (bs, seq_len, rotary_dim); query_states/k shape: (seq_len, num_heads, head_dim)
             if cos.ndim == 3:
                 cos = cos.squeeze(0).unsqueeze(1)  # (seq_len, 1, rotary_dim)
@@ -385,6 +378,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
+        self.tp_size = tp_size
+        self._force_torch = bool(os.environ.get("NANOVLLM_FORCE_TORCH_GDN"))
+        self._use_float32 = bool(os.environ.get("NANOVLLM_GDN_FLOAT32"))
         self.hidden_size = config.hidden_size
         self.num_v_heads = getattr(config, "linear_num_value_heads", 32)
         self.num_k_heads = getattr(config, "linear_num_key_heads", 16)
@@ -400,7 +396,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         
         # QKV projection
         self.conv_dim = self.key_dim * 2 + self.value_dim
-        
+        self.conv_dim_tp = self.conv_dim // tp_size
+        self.key_dim_tp = self.key_dim // tp_size
+        self.value_dim_tp = self.value_dim // tp_size
+        self.num_k_heads_tp = self.num_k_heads // tp_size
+        self.num_v_heads_tp = self.num_v_heads // tp_size
+
         # Conv1d layer (for causal convolution)
         # Use ColumnParallelLinear instead of nn.Conv1d for tensor parallelism
         self.conv1d = ColumnParallelLinear(
@@ -474,7 +475,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.conv_state = None
         self.recurrent_state = None
         self.state_cache = {}  # sequence_id -> (conv_state, recurrent_state)
-        self._decode_step_counter = {}  # sequence_id -> decode steps (for debug)
 
         # CUDA graph decode state buffers: persistent tensors so in-place updates
         # are captured by the graph and replayed correctly.  Size must be >=
@@ -526,7 +526,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.conv_state = None
         self.recurrent_state = None
         self.state_cache.clear()
-        self._decode_step_counter.clear()
         self._graph_conv_state.zero_()
         self._graph_recurrent_state.zero_()
         self._pool_conv_state.zero_()
@@ -562,8 +561,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         """
         bs = hidden_states.size(0)
         hidden_states = hidden_states.to(self.in_proj_qkv.weight.dtype)
-        tp_size = dist.get_world_size()
-        conv_dim_tp = self.conv_dim // tp_size
 
         # Persistent graph state buffers (in-place updates are captured by CUDA graph)
         conv_state = self._graph_conv_state[:bs]
@@ -571,33 +568,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         # Part 1: Input Projection
         mixed_qkv = self.in_proj_qkv(hidden_states)
-        if isinstance(mixed_qkv, tuple):
-            mixed_qkv = mixed_qkv[0]
-
         z = self.in_proj_z(hidden_states)
-        if isinstance(z, tuple):
-            z = z[0]
         z = z.reshape(bs, -1, self.head_v_dim)
-
         b = self.in_proj_b(hidden_states)
-        if isinstance(b, tuple):
-            b = b[0]
         a = self.in_proj_a(hidden_states)
-        if isinstance(a, tuple):
-            a = a[0]
 
         b = b.contiguous()
         a = a.contiguous()
 
         query, key, value = torch.split(
             mixed_qkv,
-            [self.key_dim // tp_size, self.key_dim // tp_size, self.value_dim // tp_size],
+            [self.key_dim_tp, self.key_dim_tp, self.value_dim_tp],
             dim=-1
         )
 
-        query = query.reshape(bs, self.num_k_heads // tp_size, self.head_k_dim)
-        key = key.reshape(bs, self.num_k_heads // tp_size, self.head_k_dim)
-        value = value.reshape(bs, self.num_v_heads // tp_size, self.head_v_dim)
+        query = query.reshape(bs, self.num_k_heads_tp, self.head_k_dim)
+        key = key.reshape(bs, self.num_k_heads_tp, self.head_k_dim)
+        value = value.reshape(bs, self.num_v_heads_tp, self.head_v_dim)
 
         query_flat = query.reshape(bs, -1)
         key_flat = key.reshape(bs, -1)
@@ -623,16 +610,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         query_conv, key_conv, value_conv = torch.split(
             mixed_qkv_conv,
-            [self.key_dim // tp_size, self.key_dim // tp_size, self.value_dim // tp_size],
+            [self.key_dim_tp, self.key_dim_tp, self.value_dim_tp],
             dim=-1
         )
 
-        query_conv = query_conv.reshape(bs, self.num_k_heads // tp_size, self.head_k_dim)
-        key_conv = key_conv.reshape(bs, self.num_k_heads // tp_size, self.head_k_dim)
-        value_conv = value_conv.reshape(bs, self.num_v_heads // tp_size, self.head_v_dim)
+        query_conv = query_conv.reshape(bs, self.num_k_heads_tp, self.head_k_dim)
+        key_conv = key_conv.reshape(bs, self.num_k_heads_tp, self.head_k_dim)
+        value_conv = value_conv.reshape(bs, self.num_v_heads_tp, self.head_v_dim)
 
-        if self.num_v_heads // tp_size > self.num_k_heads // tp_size:
-            repeat_factor = (self.num_v_heads // tp_size) // (self.num_k_heads // tp_size)
+        if self.num_v_heads_tp > self.num_k_heads_tp:
+            repeat_factor = self.num_v_heads_tp // self.num_k_heads_tp
             query_conv = query_conv.repeat_interleave(repeat_factor, dim=1)
             key_conv = key_conv.repeat_interleave(repeat_factor, dim=1)
 
@@ -643,8 +630,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         g = g.clamp(min=-50.0)
         g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=-50.0)
 
-        use_float32 = bool(os.environ.get("NANOVLLM_GDN_FLOAT32"))
-        if use_float32:
+        if self._use_float32:
             query_conv = query_conv.float()
             key_conv = key_conv.float()
             value_conv = value_conv.float()
@@ -659,8 +645,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         beta_batch = beta.unsqueeze(1).contiguous()
 
         use_triton = (
-            not os.environ.get("NANOVLLM_FORCE_TORCH_GDN")
-            and not use_float32
+            not self._force_torch
+            and not self._use_float32
             and _HAS_FLA_TRITON
             and hidden_states.dtype != torch.float32
         )
@@ -699,7 +685,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         core_attn_out = core_attn_out_batch.squeeze(1)
 
-        if use_float32:
+        if self._use_float32:
             core_attn_out = core_attn_out.to(hidden_states.dtype)
 
         # Output projection with gate
@@ -710,9 +696,175 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(bs, -1)
 
         output = self.out_proj(core_attn_out)
-        if isinstance(output, tuple):
-            output = output[0]
+        return output
 
+    def forward_batch_prefill(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        sequence_lengths: list[int] | None = None,
+        sequence_ids: list[int] | None = None,
+    ) -> torch.Tensor:
+        """Batched prefill: process all sequences in ONE Triton kernel call via cu_seqlens.
+
+        Optimized for prefill-only mode: assumes fresh state (no prior conv/recurrent state)
+        and does NOT persist states after computation (since max_tokens=1 means no decode).
+
+        Args:
+            hidden_states: (total_tokens, hidden_size) - all sequences concatenated
+            positions: (3, total_tokens) or (total_tokens,) for MRoPE
+            sequence_lengths: list of per-sequence token counts
+            sequence_ids: list of sequence IDs for state isolation
+
+        Returns:
+            output: (total_tokens, hidden_size)
+        """
+        total_tokens = hidden_states.size(0)
+        hidden_states = hidden_states.to(self.in_proj_qkv.weight.dtype)
+
+        # --- Linear projections (element-wise, no seq boundary needed) ---
+        mixed_qkv = self.in_proj_qkv(hidden_states)
+        z = self.in_proj_z(hidden_states)
+        z = z.reshape(total_tokens, -1, self.head_v_dim)
+        b = self.in_proj_b(hidden_states)
+        a = self.in_proj_a(hidden_states)
+        b = b.contiguous()
+        a = a.contiguous()
+
+        query, key, value = torch.split(
+            mixed_qkv,
+            [self.key_dim_tp, self.key_dim_tp, self.value_dim_tp],
+            dim=-1,
+        )
+        query = query.reshape(total_tokens, self.num_k_heads_tp, self.head_k_dim)
+        key = key.reshape(total_tokens, self.num_k_heads_tp, self.head_k_dim)
+        value = value.reshape(total_tokens, self.num_v_heads_tp, self.head_v_dim)
+
+        # --- Batched causal conv1d (fresh state = zero padding) ---
+        query_flat = query.reshape(total_tokens, -1)
+        key_flat = key.reshape(total_tokens, -1)
+        value_flat = value.reshape(total_tokens, -1)
+        mixed_qkv_conv_flat = torch.cat([query_flat, key_flat, value_flat], dim=-1)
+
+        pad = self.conv_kernel_size - 1
+        num_seqs = len(sequence_lengths)
+        conv_w = self.conv1d.weight.reshape(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        ).unsqueeze(1)  # (conv_dim, 1, kernel_size)
+
+        if len(set(sequence_lengths)) == 1:
+            # Fast path: all same length → single batched conv1d, no loops
+            seq_len = sequence_lengths[0]
+            batched = mixed_qkv_conv_flat.view(num_seqs, seq_len, self.conv_dim_tp)
+            batched = batched.permute(0, 2, 1)  # (N, conv_dim, seq_len)
+            batched_padded = F.pad(batched, (pad, 0))  # (N, conv_dim, seq_len + pad)
+            conv_out = F.conv1d(batched_padded, conv_w, self.conv1d.bias, groups=self.conv_dim_tp)
+            if self.activation == "silu":
+                conv_out = F.silu(conv_out)
+            conv_out = conv_out.to(mixed_qkv_conv_flat.dtype)
+            mixed_qkv_conv = conv_out.permute(0, 2, 1).reshape(total_tokens, self.conv_dim_tp)
+        else:
+            # Variable length: pad to max and mask
+            max_len = max(sequence_lengths)
+            padded_seqs = torch.zeros(
+                num_seqs, self.conv_dim_tp, max_len + pad,
+                dtype=mixed_qkv_conv_flat.dtype, device=mixed_qkv_conv_flat.device,
+            )
+            offset = 0
+            for i, seq_len in enumerate(sequence_lengths):
+                padded_seqs[i, :, pad:pad + seq_len] = mixed_qkv_conv_flat[offset:offset + seq_len].t()
+                offset += seq_len
+            conv_out = F.conv1d(padded_seqs, conv_w, self.conv1d.bias, groups=self.conv_dim_tp)
+            if self.activation == "silu":
+                conv_out = F.silu(conv_out)
+            conv_out = conv_out.to(mixed_qkv_conv_flat.dtype)
+            # Extract valid tokens
+            conv_outputs = []
+            for i, seq_len in enumerate(sequence_lengths):
+                conv_outputs.append(conv_out[i, :, :seq_len].t())
+            mixed_qkv_conv = torch.cat(conv_outputs, dim=0)
+
+        # Split back into query, key, value after conv
+        query_conv, key_conv, value_conv = torch.split(
+            mixed_qkv_conv,
+            [self.key_dim_tp, self.key_dim_tp, self.value_dim_tp],
+            dim=-1,
+        )
+        query_conv = query_conv.reshape(total_tokens, self.num_k_heads_tp, self.head_k_dim)
+        key_conv = key_conv.reshape(total_tokens, self.num_k_heads_tp, self.head_k_dim)
+        value_conv = value_conv.reshape(total_tokens, self.num_v_heads_tp, self.head_v_dim)
+
+        # Repeat query/key heads if needed
+        if self.num_v_heads_tp > self.num_k_heads_tp:
+            repeat_factor = self.num_v_heads_tp // self.num_k_heads_tp
+            query_conv = query_conv.repeat_interleave(repeat_factor, dim=1)
+            key_conv = key_conv.repeat_interleave(repeat_factor, dim=1)
+
+        # --- Gating parameters (element-wise) ---
+        beta = b.sigmoid()
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
+        g = g.to(hidden_states.dtype)
+        g = g.clamp(min=-50.0)
+        g = torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=-50.0)
+
+        # --- Batched chunk GDN via cu_seqlens (no state persistence) ---
+        cu_seqlens = torch.zeros(num_seqs + 1, dtype=torch.long, device=hidden_states.device)
+        cu_seqlens[1:] = torch.tensor(sequence_lengths, dtype=torch.long, device=hidden_states.device).cumsum(0)
+
+        # Triton expects (B=1, T=total_tokens, H, D)
+        q_batch = query_conv.unsqueeze(0).contiguous()
+        k_batch = key_conv.unsqueeze(0).contiguous()
+        v_batch = value_conv.unsqueeze(0).contiguous()
+        g_batch = g.unsqueeze(0).contiguous()
+        beta_batch = beta.unsqueeze(0).contiguous()
+
+        use_triton = (
+            not self._force_torch
+            and _HAS_FLA_TRITON
+            and hidden_states.dtype != torch.float32
+        )
+
+        if use_triton:
+            core_attn_out_batch, _ = fla_chunk_gated_delta_rule(
+                q=q_batch,
+                k=k_batch,
+                v=v_batch,
+                g=g_batch,
+                beta=beta_batch,
+                initial_state=None,
+                output_final_state=False,
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=True,
+            )
+            core_attn_out = core_attn_out_batch.squeeze(0)
+        else:
+            # Fallback: per-sequence torch path
+            outputs = []
+            offset = 0
+            for i, seq_len in enumerate(sequence_lengths):
+                out_s, _ = torch_chunk_gated_delta_rule(
+                    query_conv[offset:offset+seq_len],
+                    key_conv[offset:offset+seq_len],
+                    value_conv[offset:offset+seq_len],
+                    g[offset:offset+seq_len],
+                    beta[offset:offset+seq_len],
+                    chunk_size=64,
+                    initial_state=None,
+                    output_final_state=False,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                outputs.append(out_s)
+                offset += seq_len
+            core_attn_out = torch.cat(outputs, dim=0)
+
+        # --- Output projection with gate ---
+        core_attn_out_flat = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        z_flat = z.reshape(-1, z.shape[-1])
+        core_attn_out_flat = self.norm(core_attn_out_flat, z_flat)
+        core_attn_out = core_attn_out_flat.reshape(total_tokens, -1, self.head_v_dim)
+        core_attn_out = core_attn_out.reshape(total_tokens, -1)
+
+        output = self.out_proj(core_attn_out)
         return output
 
     def forward(
@@ -742,48 +894,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         conv_state, recurrent_state = self._get_states(sequence_id)
 
-        def _gdn_debug_this_layer():
-            if not os.environ.get("NANOVLLM_DEBUG_GDN"):
-                return False
-            try:
-                return self.layer_idx == int(os.environ.get("NANOVLLM_DEBUG_GDN_LAYER", "0"))
-            except ValueError:
-                return self.layer_idx == 0
-
         # Part 1: Input Projection (separate projections for Qwen3_5)
         mixed_qkv = self.in_proj_qkv(hidden_states)
-        # mixed_qkv is a tuple/list from MergedColumnParallelLinear
-        if isinstance(mixed_qkv, tuple):
-            mixed_qkv = mixed_qkv[0]
-
         z = self.in_proj_z(hidden_states)
-        if isinstance(z, tuple):
-            z = z[0]
         z = z.reshape(seq_len, -1, self.head_v_dim)
-
         b = self.in_proj_b(hidden_states)
-        if isinstance(b, tuple):
-            b = b[0]
         a = self.in_proj_a(hidden_states)
-        if isinstance(a, tuple):
-            a = a[0]
 
         b = b.contiguous()
         a = a.contiguous()
-        
+
         # Split mixed_qkv into query, key, value
         query, key, value = torch.split(
             mixed_qkv,
-            [self.key_dim // dist.get_world_size(),
-             self.key_dim // dist.get_world_size(),
-             self.value_dim // dist.get_world_size()],
+            [self.key_dim_tp, self.key_dim_tp, self.value_dim_tp],
             dim=-1
         )
-        
+
         # Reshape to (seq_len, num_heads, head_dim)
-        query = query.reshape(seq_len, self.num_k_heads // dist.get_world_size(), self.head_k_dim)
-        key = key.reshape(seq_len, self.num_k_heads // dist.get_world_size(), self.head_k_dim)
-        value = value.reshape(seq_len, self.num_v_heads // dist.get_world_size(), self.head_v_dim)
+        query = query.reshape(seq_len, self.num_k_heads_tp, self.head_k_dim)
+        key = key.reshape(seq_len, self.num_k_heads_tp, self.head_k_dim)
+        value = value.reshape(seq_len, self.num_v_heads_tp, self.head_v_dim)
         # Flatten for convolution
         query_flat = query.reshape(seq_len, -1)
         key_flat = key.reshape(seq_len, -1)
@@ -815,19 +946,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Split back into query, key, value
         query_conv, key_conv, value_conv = torch.split(
             mixed_qkv_conv,
-            [self.key_dim // dist.get_world_size(),
-             self.key_dim // dist.get_world_size(),
-             self.value_dim // dist.get_world_size()],
+            [self.key_dim_tp, self.key_dim_tp, self.value_dim_tp],
             dim=-1
         )
-        
+
         # Reshape back to (seq_len, num_heads, head_dim)
-        query_conv = query_conv.reshape(seq_len, self.num_k_heads // dist.get_world_size(), self.head_k_dim)
-        key_conv = key_conv.reshape(seq_len, self.num_k_heads // dist.get_world_size(), self.head_k_dim)
-        value_conv = value_conv.reshape(seq_len, self.num_v_heads // dist.get_world_size(), self.head_v_dim)
+        query_conv = query_conv.reshape(seq_len, self.num_k_heads_tp, self.head_k_dim)
+        key_conv = key_conv.reshape(seq_len, self.num_k_heads_tp, self.head_k_dim)
+        value_conv = value_conv.reshape(seq_len, self.num_v_heads_tp, self.head_v_dim)
         # Repeat query/key if num_v_heads > num_k_heads
-        if self.num_v_heads // dist.get_world_size() > self.num_k_heads // dist.get_world_size():
-            repeat_factor = (self.num_v_heads // dist.get_world_size()) // (self.num_k_heads // dist.get_world_size())
+        if self.num_v_heads_tp > self.num_k_heads_tp:
+            repeat_factor = self.num_v_heads_tp // self.num_k_heads_tp
             query_conv = query_conv.repeat_interleave(repeat_factor, dim=1)
             key_conv = key_conv.repeat_interleave(repeat_factor, dim=1)
         
@@ -842,16 +971,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
 
         # Part 3: Gated Delta Rule (Recurrent Attention)
-        # Prefer Triton FLA ops when available; use NANOVLLM_FORCE_TORCH_GDN=1 to force torch (for debugging NaN).
-        # NANOVLLM_GDN_FLOAT32=1: run in float32 for numerical stability (skips Triton).
-        use_float32 = bool(os.environ.get("NANOVLLM_GDN_FLOAT32"))
-        debug_state = bool(os.environ.get("NANOVLLM_DEBUG_GDN_STATE"))
         is_capturing = (
             torch.cuda.is_available()
             and hidden_states.is_cuda
             and torch.cuda.is_current_stream_capturing()
         )
-        if use_float32:
+        if self._use_float32:
             query_conv = query_conv.float()
             key_conv = key_conv.float()
             value_conv = value_conv.float()
@@ -863,7 +988,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         if seq_len == 1 and recurrent_state is None:
             recurrent_state = torch.zeros(
                 1,
-                self.num_v_heads // dist.get_world_size(),
+                self.num_v_heads_tp,
                 self.head_v_dim,
                 self.head_k_dim,
                 dtype=value_conv.dtype,
@@ -871,18 +996,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             use_recurrent = True
 
-        decode_step = None
-        if seq_len == 1:
-            seq_key = sequence_id if sequence_id is not None else -1
-            decode_step = self._decode_step_counter.get(seq_key, 0) + 1
-            self._decode_step_counter[seq_key] = decode_step
         # Canonical cache layout is (N, H, V, K).
         # NOTE: for Qwen3.5-0.8B, head_k_dim == head_v_dim (both 128), so shape-based
         # auto-detection of (K,V) vs (V,K) is ambiguous and can corrupt state.
         # Keep layout fixed and only convert explicitly at torch fallback boundaries.
         use_triton = (
-            not os.environ.get("NANOVLLM_FORCE_TORCH_GDN")
-            and not use_float32
+            not self._force_torch
+            and not self._use_float32
             and _HAS_FLA_TRITON
             and hidden_states.dtype != torch.float32
         )
@@ -982,7 +1102,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 )
                 if recurrent_state is not None:
                     recurrent_state = recurrent_state.permute(0, 1, 3, 2).contiguous()
-        if use_float32 and core_attn_out is not None:
+        if self._use_float32 and core_attn_out is not None:
             core_attn_out = core_attn_out.to(hidden_states.dtype)
             if recurrent_state is not None:
                 recurrent_state = recurrent_state.to(hidden_states.dtype)
@@ -1007,11 +1127,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         core_attn_out = core_attn_out.reshape(seq_len, -1)
         
         # Output projection
-        # RowParallelLinear may return tuple in some implementations
         output = self.out_proj(core_attn_out)
-        if isinstance(output, tuple):
-            output = output[0]
-
         return output
 
 
@@ -1117,33 +1233,18 @@ class Qwen3_5TextDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         if self.layer_type == "full_attention":
-            debug_fa = os.environ.get("NANOVLLM_DEBUG_FA")
-            try:
-                debug_fa_layer = int(os.environ.get("NANOVLLM_DEBUG_FA_LAYER", "3"))
-            except ValueError:
-                debug_fa_layer = 3
-            if debug_fa and self.layer_idx == debug_fa_layer:
-                FA_DEBUG_SAVE["pre_attn_norm"] = hidden_states.detach().cpu().float()
-            attn_out = self.self_attn(positions, hidden_states)
-            if debug_fa and self.layer_idx == debug_fa_layer:
-                FA_DEBUG_SAVE["attn_output"] = attn_out.detach().cpu().float()
-            hidden_states = attn_out
+            hidden_states = self.self_attn(positions, hidden_states)
         elif self.layer_type == "linear_attention":
             if use_graph:
                 # CUDA graph mode: process entire batch at once using persistent state buffers
                 hidden_states = self.linear_attn(hidden_states, positions, use_graph=True)
             elif sequence_lengths is not None and len(sequence_lengths) > 1 and sequence_ids is not None:
-                # HF-style: per-sequence isolation - process each sequence separately to avoid state cross-contamination
-                outputs = []
-                offset = 0
-                pos_2d = positions.dim() == 2
-                for seq_len, seq_id in zip(sequence_lengths, sequence_ids):
-                    h = hidden_states[offset : offset + seq_len]
-                    p = positions[:, offset : offset + seq_len] if pos_2d else positions[offset : offset + seq_len]
-                    out = self.linear_attn(h, p, sequence_id=seq_id)
-                    outputs.append(out)
-                    offset += seq_len
-                hidden_states = torch.cat(outputs, dim=0)
+                # Batched prefill: single Triton kernel call with cu_seqlens
+                hidden_states = self.linear_attn.forward_batch_prefill(
+                    hidden_states, positions,
+                    sequence_lengths=sequence_lengths,
+                    sequence_ids=sequence_ids,
+                )
             else:
                 seq_id = sequence_ids[0] if (sequence_ids is not None and len(sequence_ids) == 1) else None
                 hidden_states = self.linear_attn(hidden_states, positions, sequence_id=seq_id)

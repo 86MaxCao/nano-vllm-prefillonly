@@ -6,7 +6,7 @@
 
 A specialized optimization of [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) for **prefill-only** inference tasks, designed for industrial-scale discriminative applications with multimodal large language models.
 
-> **Motivation**: This project addresses the problem described in [vllm-project/vllm#29584](https://github.com/vllm-project/vllm/issues/29584) — vLLM unconditionally allocates KV cache even for non-autoregressive tasks (embedding, reranking, classification), wasting up to **85-98% of GPU memory** on completely unused cache tensors. The vLLM maintainers acknowledged this issue but noted that fixing it "would require modifications to a lot of core code" and closed it as not planned. Our framework solves this by **completely eliminating KV cache allocation** for prefill-only workloads, enabling single-GPU deployment of models that would otherwise require multi-GPU setups under vLLM.
+> **Motivation**: This project addresses the problem described in [vllm-project/vllm#29584](https://github.com/vllm-project/vllm/issues/29584) — vLLM unconditionally allocates KV cache even for non-autoregressive tasks (embedding, reranking, classification), wasting up to **80-98% of GPU memory** on completely unused cache tensors. The vLLM maintainers acknowledged this issue but noted that fixing it "would require modifications to a lot of core code" and closed it as not planned. Our framework solves this by **completely eliminating KV cache allocation** for prefill-only workloads, enabling single-GPU deployment of models that would otherwise require multi-GPU setups under vLLM.
 
 ## 🎯 Why Prefill-Only?
 
@@ -44,9 +44,10 @@ All benchmarks measured on a single NVIDIA H20 GPU (96GB). Speed measured as mea
 
 ### Speed Comparison: Text Models (batch=100)
 
-| Model | Category | Transformers (s) | Prefill-Only (s) | Speedup |
-|-------|----------|:-----------------:|:-----------------:|:-------:|
+| Model | Category | Transformers (s) | Prefill-Only (Ours) (s) | Speedup |
+|-------|----------|:-----------------:|:-----------------------:|:-------:|
 | Qwen3-0.6B | Generation | 0.0524 | 0.0309 | **1.70x** |
+| Qwen3.5-0.8B | Generation | 0.0413 | 0.0824 | 0.50x* |
 | Qwen3-Embedding-0.6B | Embedding | 0.0330 | 0.0242 | **1.36x** |
 | bge-multilingual-gemma2 | Embedding | 0.2613 | 0.1595 | **1.64x** |
 | Qwen3-Reranker-0.6B | Reranking | 0.1574 | 0.0610 | **2.58x** |
@@ -55,14 +56,17 @@ All benchmarks measured on a single NVIDIA H20 GPU (96GB). Speed measured as mea
 
 ### Speed Comparison: Multimodal Models (batch=10, 224x224 images)
 
-| Model | Category | Transformers (s) | Prefill-Only (s) | Speedup |
-|-------|----------|:-----------------:|:-----------------:|:-------:|
+| Model | Category | Transformers (s) | Prefill-Only (Ours) (s) | Speedup |
+|-------|----------|:-----------------:|:-----------------------:|:-------:|
 | Qwen3-VL-2B-Instruct | Generation | 0.0864 | 0.0499 | **1.73x** |
+| Qwen3.5-0.8B | Generation | 0.0817 | 0.2132 | 0.38x* |
 | Qwen2.5-VL-3B-Instruct | Generation | 0.1212 | 0.0594 | **2.04x** |
 | Qwen3-VL-Embedding-2B | Embedding | 0.0704 | 0.0651 | **1.08x** |
 | Qwen3-VL-Reranker-2B | Reranking | 0.0829 | 0.0738 | **1.12x** |
 
 > Both Transformers and Prefill-Only use FlashAttention. End-to-end measurement includes preprocessing (tokenization/apply_chat_template + image processing).
+>
+> \* Qwen3.5 uses GatedDeltaNet (GDN) linear attention which requires per-sequence state isolation during prefill. Batched GDN prefill is implemented via Triton `cu_seqlens` (processing all sequences in a single kernel call), but remains slower than Transformers' native batch dimension due to cu_seqlens kernel overhead and engine-level scheduling costs.
 
 ### Why Varlen Attention is Faster (Forward-Only Comparison)
 
@@ -70,7 +74,7 @@ Our framework uses **varlen FlashAttention** (`flash_attn_varlen_func`), which c
 
 **Benchmark**: Qwen3-VL-2B-Instruct, model forward only (excluding preprocessing), NVIDIA H20.
 
-| Scenario | Transformers | Prefill-Only | Speedup | Why |
+| Scenario | Transformers | Prefill-Only (Ours) | Speedup | Why |
 |----------|:------------:|:------------:|:-------:|-----|
 | 10 images, same size (224px) | 67 ms | 66 ms | 1.02x | No padding difference, nearly identical |
 | 100 images, same size (224px) | 565 ms | 534 ms | 1.06x | Slight advantage from avoiding attention_mask overhead |
@@ -86,27 +90,23 @@ Currently, our framework applies `@torch.compile` to **individual operators** (R
 
 This is a known optimization gap. Full-graph `torch.compile` support for prefill-only workloads is planned for a future release.
 
-### VRAM Savings (Prefill-Only vs vLLM-Style KV Cache)
+### VRAM Comparison: Prefill-Only vs vLLM (Minimum Utilization)
 
-Our framework **completely eliminates KV cache allocation** for prefill-only workloads, while vLLM allocates KV cache for ALL models (even when entirely unused for embedding/reranking). On a 96GB H20 GPU, the KV cache alone can consume 40-85GB.
+Measured on a single **NVIDIA H20 (96 GiB)** with vLLM 0.19.0. Minimum viable `gpu_memory_utilization` verified with 0.001 step and 3x repetition (each value must succeed 3/3 times to be considered stable).
 
-| Model | Category | Prefill-Only VRAM | vLLM-Style VRAM | VRAM Saved |
-|-------|----------|:-----------------:|:---------------:|:----------:|
-| Qwen3-0.6B | Text Generation | 1,703 MB | 86,507 MB | **98.0%** |
-| Qwen3-Embedding-0.6B | Text Embedding | 1,177 MB | 86,472 MB | **98.6%** |
-| bge-multilingual-gemma2 | Text Embedding | 17,665 MB | 87,469 MB | **79.8%** |
-| Qwen3-Reranker-0.6B | Text Reranking | 1,453 MB | 86,168 MB | **98.3%** |
-| bge-reranker-v2-gemma | Text Reranking | 4,818 MB | 87,542 MB | **94.5%** |
-| Qwen3-VL-2B-Instruct | Multimodal Generation | 4,812 MB | 52,196 MB | **90.8%** |
-| Qwen2.5-VL-3B-Instruct | Multimodal Generation | 11,005 MB | 62,234 MB | **82.3%** |
-| Qwen3-VL-Embedding-2B | Multimodal Embedding | 4,780 MB | 85,706 MB | **94.4%** |
-| Qwen3-VL-Reranker-2B | Multimodal Reranking | 4,844 MB | 85,706 MB | **94.3%** |
+| Model | Category | Prefill-Only (Ours) | vLLM Min Util | vLLM Min VRAM | vLLM Max Fail Util | vLLM Max Fail VRAM | Ratio |
+|-------|----------|:-------------------:|:-------------:|:-------------:|:------------------:|:------------------:|:-----:|
+| Qwen3-0.6B | Text Generation | 1,703 MB | 0.041 | 3.94 GiB | 0.040 | 3.84 GiB | **2.4x** |
+| Qwen3-Embedding-0.6B | Text Embedding | 1,177 MB | 0.023 | 2.21 GiB | 0.022 | 2.11 GiB | **1.9x** |
+| bge-multilingual-gemma2 | Text Embedding | 17,665 MB | 0.217 | 20.83 GiB | 0.216 | 20.74 GiB | **1.2x** |
+| Qwen3-Reranker-0.6B | Text Reranking | 1,453 MB | 0.042 | 4.03 GiB | 0.041 | 3.94 GiB | **2.8x** |
+| bge-reranker-v2-gemma | Text Reranking | 4,818 MB | 0.090 | 8.64 GiB | 0.089 | 8.54 GiB | **1.8x** |
+| Qwen3-VL-2B-Instruct | Multimodal Generation | 4,812 MB | 0.081 | 7.78 GiB | 0.080 | 7.68 GiB | **1.7x** |
+| Qwen2.5-VL-3B-Instruct | Multimodal Generation | 7,370 MB | 0.104 | 9.98 GiB | 0.103 | 9.89 GiB | **1.4x** |
+| Qwen3-VL-Embedding-2B | Multimodal Embedding | 4,780 MB | 0.080 | 7.68 GiB | 0.079 | 7.58 GiB | **1.6x** |
+| Qwen3-VL-Reranker-2B | Multimodal Reranking | 4,844 MB | 0.084 | 8.06 GiB | 0.083 | 7.97 GiB | **1.7x** |
 
-#### How VRAM is Measured
-
-- **Prefill-Only VRAM**: Peak GPU memory allocated when loading and running inference with our framework (no KV cache). Measured via `torch.cuda.max_memory_allocated()` in isolated subprocesses.
-- **vLLM-Style VRAM**: Simulates vLLM's behavior of allocating KV cache even for embedding/reranker models. For models loadable as generation models, we force KV cache allocation and measure. For others, KV cache size is computed using vLLM's formula and added to model weight VRAM.
-- All measurements taken on NVIDIA H20 (96GB) with subprocess isolation.
+> **vLLM Min Util** = minimum `gpu_memory_utilization` at which vLLM can load the model (3/3 successes). **vLLM Max Fail Util** = maximum `gpu_memory_utilization` at which vLLM OOMs (0/3 successes, provided for reproducibility). **vLLM Min VRAM** = vLLM Min Util × 96 GiB. **Ratio** = vLLM Min VRAM / Prefill-Only (Ours) VRAM. Even at minimum utilization, vLLM requires **1.2–2.8x** more VRAM.
 
 ## 📦 Installation
 

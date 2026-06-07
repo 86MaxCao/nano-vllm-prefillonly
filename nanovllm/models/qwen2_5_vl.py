@@ -1388,11 +1388,7 @@ def load_qwen2_5_vl_model(model_path, config):
     
     from nanovllm.utils.loader import load_model
 
-    logger.debug("[load_qwen2_5_vl_model] Loading Qwen2_5-VL weights...")
-
     def name_mapping(weight_name: str) -> str | None:
-        logger.debug(f"[name_mapping] Original weight name: {weight_name}")
-        
         # Handle model.language_model.* -> language_model.*
         if weight_name.startswith("model.language_model."):
             sub_name = weight_name[len("model.language_model.") :]
@@ -1444,96 +1440,7 @@ def load_qwen2_5_vl_model(model_path, config):
         
         return None
 
-    # Check for unmapped weights (only show warnings, not all details)
-    try:
-        from glob import glob
-        from safetensors import safe_open
-        import os
-        
-        weight_files = glob(os.path.join(model_path, "*.safetensors"))
-        all_weight_names = []
-        for file in weight_files:
-            with safe_open(file, "pt", "cpu") as f:
-                for key in f.keys():
-                    all_weight_names.append(key)
-        
-        # Check which weights are NOT mapped (name_mapping returns None)
-        unmapped_weights = []
-        for weight_name in all_weight_names:
-            mapped = name_mapping(weight_name)
-            if mapped is None:
-                unmapped_weights.append(weight_name)
-        if unmapped_weights:
-            logger.warning(f"[load_qwen2_5_vl_model] Found {len(unmapped_weights)} unmapped weights (will be skipped):")
-            for name in sorted(unmapped_weights)[:10]:
-                logger.warning(f"  {name}")
-            if len(unmapped_weights) > 10:
-                logger.warning(f"  ... and {len(unmapped_weights) - 10} more")
-    except Exception as e:
-        logger.warning(f"[load_qwen2_5_vl_model] Error checking weight names: {e}")
-    
-    # Load weights directly - pretrained model already has qkv.weight and qkv.bias
-    # No need to merge q_proj, k_proj, v_proj since they're already merged in the checkpoint
     load_model(model, model_path, name_mapping=name_mapping)
-    
-    # Check if vision encoder weights are loaded correctly
-    try:
-        vision_params = dict(model.visual.named_parameters())
-        vision_param_count = len(vision_params)
-        vision_nonzero_count = sum(
-            1 for param in vision_params.values() 
-            if param.data.abs().sum() > 0
-        )
-        logger.info(f"[load_qwen2_5_vl_model] Vision encoder: {vision_param_count} parameters, {vision_nonzero_count} non-zero")
-        
-        # Check key vision parameters for NaN/Inf and missing weights
-        key_params = [
-            ("vision.patch_embed.proj.weight", True),
-            ("vision.blocks.0.attn.qkv.weight", True),
-            ("vision.blocks.0.attn.qkv.bias", True),
-            ("vision.blocks.0.attn.proj.weight", True),
-            ("vision.blocks.0.attn.proj.bias", True),
-            ("vision.blocks.0.mlp.gate_proj.weight", True),
-            ("vision.blocks.0.mlp.up_proj.weight", True),
-            ("vision.blocks.0.mlp.down_proj.weight", True),
-            ("vision.merger.ln_q.weight", True),
-            ("vision.merger.mlp.0.weight", True),
-            ("vision.merger.mlp.2.weight", True),
-        ]
-        missing_params = []
-        nan_params = []
-        zero_params = []
-        for key, required in key_params:
-            param = vision_params.get(key)
-            if param is None:
-                if required:
-                    missing_params.append(key)
-            else:
-                if torch.isnan(param.data).any():
-                    nan_params.append(key)
-                if param.data.abs().sum() == 0:
-                    zero_params.append(key)
-        
-        if missing_params:
-            logger.error(f"[load_qwen2_5_vl_model] MISSING REQUIRED parameters: {missing_params}")
-        if nan_params:
-            logger.error(f"[load_qwen2_5_vl_model] Parameters with NaN: {nan_params}")
-        if zero_params:
-            logger.warning(f"[load_qwen2_5_vl_model] Zero parameters: {zero_params}")
-        
-        # Check for uninitialized vision parameters
-        vision_uninitialized = [
-            name for name, param in vision_params.items() 
-            if param.data.abs().sum() == 0
-        ]
-        if vision_uninitialized:
-            logger.warning(f"[load_qwen2_5_vl_model] Found {len(vision_uninitialized)} uninitialized vision parameters (first 10):")
-            for name in vision_uninitialized[:10]:
-                logger.warning(f"  {name}")
-    except Exception as e:
-        logger.error(f"[load_qwen2_5_vl_model] Error checking vision weights: {e}")
-        import traceback
-        traceback.print_exc()
     
     return model
 

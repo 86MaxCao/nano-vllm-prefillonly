@@ -1,5 +1,4 @@
 import pickle
-import random
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -67,9 +66,12 @@ class ModelRunner:
         if not dist.is_initialized():
             # Always initialize process group (even for world_size=1) because
             # code components like VocabParallelEmbedding call dist.get_rank()
-            # Use random port to avoid port conflicts when testing multiple models
-            # Port range: 10000-65535 (avoiding well-known ports)
-            port = random.randint(10000, 65535)
+            # Use socket-based port allocation to avoid conflicts
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(('', 0))
+            port = sock.getsockname()[1]
+            sock.close()
             dist.init_process_group(
                 "nccl",
                 f"tcp://localhost:{port}",
@@ -164,6 +166,7 @@ class ModelRunner:
         # Keep a reference dtype so that cached vision embeddings can be copied
         # back to the GPU without hitting dtype mismatches.
         self.model_dtype = embed_module.embed_tokens.weight.dtype
+        self._image_token_id = getattr(hf_config, "image_token_id", 151655)
         self.sampler = Sampler()
         
         # Model dtype should already be correct (converted before load_model)
@@ -665,28 +668,9 @@ class ModelRunner:
         x: torch.Tensor,  # [batch_size]
         sequence_lengths: list[int],  # [batch_size]
     ) -> torch.Tensor:
-        """Expand [batch_size] tensor to [num_tokens] tensor based on sequence_lengths.
-        
-        For example, if x = [a, b, c] and sequence_lengths = [2, 3, 1], then
-        num_tokens = 6, and expanded_x = [a, a, b, b, b, c].
-        """
-        batch_size = x.shape[0]
-        assert len(sequence_lengths) == batch_size
-        num_tokens = sum(sequence_lengths)
-        expanded_x = x.new_empty(num_tokens)
-        
-        # Calculate cumulative sequence lengths
-        cu_seqlens = [0]
-        for seq_len in sequence_lengths:
-            cu_seqlens.append(cu_seqlens[-1] + seq_len)
-        
-        # Expand: for each sequence, repeat its value for sequence_length times
-        for seq_idx in range(batch_size):
-            seq_start = cu_seqlens[seq_idx]
-            seq_end = cu_seqlens[seq_idx + 1]
-            expanded_x[seq_start:seq_end] = x[seq_idx]
-        
-        return expanded_x
+        """Expand [batch_size] tensor to [num_tokens] tensor based on sequence_lengths."""
+        repeats = torch.tensor(sequence_lengths, device=x.device)
+        return torch.repeat_interleave(x, repeats)
 
     @torch.inference_mode()
     def run_model(
@@ -886,14 +870,7 @@ class ModelRunner:
         # Fill in the actual tokens (non-padding positions)
         if attention_mask is not None:
             mask = attention_mask.bool()
-            # hidden_states_varlen is ordered as: seq0_tokens, seq1_tokens, ...
-            varlen_idx = 0
-            for batch_idx in range(batch_size):
-                seq_len_actual = seq_lens[batch_idx] if seq_lens else seq_len
-                for pos_idx in range(seq_len_actual):
-                    if mask[batch_idx, pos_idx]:
-                        hidden_states[batch_idx, pos_idx] = hidden_states_varlen[varlen_idx]
-                        varlen_idx += 1
+            hidden_states[mask] = hidden_states_varlen
         else:
             # If no attention_mask, reshape directly
             hidden_states = hidden_states_varlen.view(batch_size, seq_len, -1)
@@ -1042,7 +1019,7 @@ class ModelRunner:
                                 seq_tokens_actual = seq_input_ids
                             
                             # Find image placeholder token (151655 for Qwen3-VL)
-                            placeholder_token_id = 151655
+                            placeholder_token_id = self._image_token_id
                             placeholder_positions = (seq_tokens_actual == placeholder_token_id).nonzero(as_tuple=True)[0]
                             if len(placeholder_positions) > 0:
                                 offset_in_seq = int(placeholder_positions[0].item())
@@ -1351,7 +1328,7 @@ class ModelRunner:
                                 seq_tokens_actual = seq_input_ids[seq_mask]
                             else:
                                 seq_tokens_actual = seq_input_ids
-                            placeholder_token_id = 151655
+                            placeholder_token_id = self._image_token_id
                             placeholder_positions = (seq_tokens_actual == placeholder_token_id).nonzero(as_tuple=True)[0]
                             if len(placeholder_positions) > 0:
                                 offset_in_seq = int(placeholder_positions[0].item())

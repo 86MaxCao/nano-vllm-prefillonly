@@ -62,9 +62,10 @@ class JinaRerankerV3(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         block_mask: torch.Tensor | None = None,
+        **kwargs,
     ) -> torch.Tensor:
         """Forward pass for listwise reranking.
-        
+
         Args:
             input_ids: Token IDs, shape [batch_size, seq_len] or flattened
             positions: Position IDs, shape [batch_size, seq_len] or flattened

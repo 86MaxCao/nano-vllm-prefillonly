@@ -51,12 +51,8 @@ class Qwen3Reranker(Qwen3ForCausalLM):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
+        **kwargs,
     ) -> torch.Tensor:
-        """Forward pass for reranking.
-        
-        Returns:
-            hidden_states: Hidden states from the model backbone
-        """
         return self.model(input_ids, positions)
 
     def compute_score(

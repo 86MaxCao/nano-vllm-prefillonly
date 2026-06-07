@@ -38,31 +38,30 @@ class Qwen3Embedding(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        sequence_lengths: list[int] | None = None,
     ) -> torch.Tensor:
-        """Forward pass.
-        
-        Args:
-            input_ids: [batch_size, seq_len]
-            positions: [batch_size, seq_len]
-            attention_mask: [batch_size, seq_len] or None
-        Returns:
-            embeddings: [batch_size, hidden_size]
-        """
         hidden_states = self.model(input_ids, positions)
-        # Reshape from [total_tokens, hidden_size] to [batch_size, seq_len, hidden_size]
-        batch_size = input_ids.shape[0] if len(input_ids.shape) > 1 else 1
-        seq_len = input_ids.shape[-1]
-        hidden_size = hidden_states.shape[-1]
-        
-        if len(hidden_states.shape) == 2:
-            # Flattened format, need to reshape
-            hidden_states = hidden_states.view(batch_size, seq_len, hidden_size)
-        
-        # Pool the hidden states
+
+        if sequence_lengths is not None and len(hidden_states.shape) == 2:
+            splits = hidden_states.split(sequence_lengths)
+            max_len = max(sequence_lengths)
+            padded = torch.zeros(len(splits), max_len, hidden_states.shape[-1],
+                                 dtype=hidden_states.dtype, device=hidden_states.device)
+            mask = torch.zeros(len(splits), max_len,
+                               dtype=torch.bool, device=hidden_states.device)
+            for i, s in enumerate(splits):
+                padded[i, :s.shape[0]] = s
+                mask[i, :s.shape[0]] = True
+            hidden_states = padded
+            attention_mask = mask
+        elif len(hidden_states.shape) == 2:
+            batch_size = input_ids.shape[0] if len(input_ids.shape) > 1 else 1
+            seq_len = input_ids.shape[-1]
+            hidden_states = hidden_states.view(batch_size, seq_len, -1)
+
         embeddings = self.pooler(hidden_states, attention_mask)
-        
-        # Normalize if requested
+
         if self.normalize:
             embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
-        
+
         return embeddings
