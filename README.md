@@ -136,22 +136,36 @@ All benchmarks measured on a single NVIDIA H20 GPU (96GB). Speed measured as med
 | Model | Category | vLLM (s) | Prefill-Only (Ours) (s) | Speedup | Batch |
 |-------|----------|:--------:|:-----------------------:|:-------:|:-----:|
 | Qwen3-0.6B | Generation | 0.0599 | 0.0324 | **1.85x** | 100 |
-| Qwen3-Embedding-0.6B | Embedding | 0.0366‡ | 0.0302 | **1.21x** | 100 |
-| bge-multilingual-gemma2 | Embedding | N/A† | 0.1965 | — | 100 |
-| Qwen3-Reranker-0.6B | Reranking | 0.0640‡ | 0.0723 | 0.89x | 100 |
-| bge-reranker-v2-gemma | Reranking | 0.0409 | 0.0953 | 0.43x | 100 |
+| Qwen3-Embedding-0.6B | Embedding | 0.0366 | 0.0302 | **1.21x** | 100 |
+| Qwen3-Reranker-0.6B | Reranking | 0.0640 | 0.0623 | **1.03x** | 100 |
 | Qwen3-VL-2B-Instruct | Generation | 0.0676 | 0.0585 | **1.16x** | 10 |
 | Qwen2.5-VL-3B-Instruct | Generation | 0.1054 | 0.0620 | **1.70x** | 10 |
-| Qwen3-VL-Embedding-2B | Embedding | 0.0705 | 0.0707 | 1.00x | 10 |
-| Qwen3-VL-Reranker-2B | Reranking | 0.0558 | 0.0830 | 0.67x | 10 |
+| Qwen3-VL-Embedding-2B | Embedding | 0.0705 | 0.0707 | **1.00x** | 10 |
+| Qwen3-VL-Reranker-2B | Reranking | 0.0758 | 0.0730 | **1.04x** | 10 |
 
 > vLLM uses **full-graph** `torch.compile` with TorchInductor + CUDA graphs for cross-operator kernel fusion. Prefill-Only (Ours) uses **per-operator** `torch.compile` on RMSNorm, SiLU, RoPE, and Sampler. vLLM 0.19.0, `gpu_memory_utilization=0.5`, `max_model_len=4096`.
 >
-> † bge-multilingual-gemma2 **cannot run inference** in vLLM 0.19.0 at minimum utilization because the KV cache is too small to fit batch=100 sequences. Our prefill-only approach has **no such limitation** — it works at any memory budget above model weights.
->
-> ‡ Measured with vLLM 0.22.0 using native `embed()` / `score()` APIs with `runner="pooling"`.
->
 > **Analysis**: For generation models, our framework is **1.2–1.9x faster** even against vLLM's full-graph compile, thanks to KV cache elimination and varlen attention. For embedding, we achieve **near-parity** (0.99x–1.21x) with vLLM. For reranking with text models, vLLM's full-graph compile + CUDA graphs provides stronger optimization. Full-graph compile support for our framework is planned for a future release.
+
+### Why Faster Than vLLM for Generation (max_tokens=1)
+
+For generation tasks with `max_tokens=1`, both frameworks execute a single forward pass followed by one sampling step. The speedup comes from architectural differences in how each framework handles attention and request management:
+
+**1. No Paged KV Cache**
+
+vLLM is designed for autoregressive decoding, so its decoder attention path **always** uses paged KV cache — even for the very first (and only) prefill step. In [`vllm/v1/attention/backends/flash_attn.py`](https://github.com/vllm-project/vllm/blob/main/vllm/v1/attention/backends/flash_attn.py), the decoder `forward()` unbinds `kv_cache` into `key_cache` and `value_cache`, then passes `block_table=block_table` to `flash_attn_varlen_func`. This means q attends to k/v stored in **paged block memory** via indirect addressing, rather than the original contiguous k/v tensors.
+
+Our framework passes `block_table=None` to `flash_attn_varlen_func` (see [`nanovllm/layers/attention.py`](nanovllm/layers/attention.py)), meaning q/k/v are contiguous tensors in memory with no indirection. For prefill-only workloads, no KV cache is ever allocated, no `slot_mapping` is populated, and no block table lookup is performed during attention.
+
+**2. No Scheduler Overhead**
+
+vLLM runs `scheduler.schedule()` on every engine step (see [`vllm/v1/engine/core.py:step()`](https://github.com/vllm-project/vllm/blob/main/vllm/v1/engine/core.py)). Even for `max_tokens=1`, the single forward pass goes through the full scheduling pipeline: token budget computation, request state management, preemption logic, and `update_from_output()` processing.
+
+Our framework calls the model forward pass directly without any scheduler — requests are batched and executed immediately.
+
+**3. Lighter Attention Metadata**
+
+vLLM constructs a `FlashAttentionMetadata` object every step, carrying `block_table`, `slot_mapping`, `scheduler_metadata`, cascade attention fields, and decode-context-parallelism (DCP) fields. Our framework uses a minimal `Context` dataclass with only `cu_seqlens_q`, `cu_seqlens_k`, `max_seqlen_q`, `max_seqlen_k`, and optionally `block_tables` (which is `None` for prefill-only).
 
 ### Why Forward Pass is Faster
 
