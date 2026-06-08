@@ -5,6 +5,7 @@ from transformers import Qwen3Config
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
+from nanovllm.layers.hybrid_prefill import is_hybrid_prefill_enabled, chunked_mlp_forward
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
@@ -160,7 +161,10 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-        hidden_states = self.mlp(hidden_states)
+        if is_hybrid_prefill_enabled():
+            hidden_states = chunked_mlp_forward(hidden_states, self.mlp)
+        else:
+            hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 

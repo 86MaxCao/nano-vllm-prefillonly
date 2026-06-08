@@ -15,6 +15,7 @@ from nanovllm.layers.linear import (
 )
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.layers.hybrid_prefill import is_hybrid_prefill_enabled, chunked_mlp_forward
 from nanovllm.utils.loader import sharded_weight_loader
 
 # Import optimized GatedDeltaNet kernels
@@ -1050,7 +1051,10 @@ class Qwen3NextDecoderLayer(nn.Module):
         # HF: residual = hidden_states, then norm(hidden_states); add residual after mlp
         residual = hidden_states
         hidden_states, residual = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        if is_hybrid_prefill_enabled():
+            hidden_states = chunked_mlp_forward(hidden_states, self.mlp)
+        else:
+            hidden_states = self.mlp(hidden_states)
         hidden_states = hidden_states + residual
         return hidden_states, residual
 

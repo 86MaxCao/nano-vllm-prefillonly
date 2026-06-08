@@ -11,6 +11,7 @@ from nanovllm.models.gemma import (
     GemmaForCausalLM,
 )
 from nanovllm.layers.embed_head import VocabParallelEmbedding
+from nanovllm.layers.hybrid_prefill import is_hybrid_prefill_enabled, chunked_mlp_forward
 
 
 class Gemma2DecoderLayer(nn.Module):
@@ -77,7 +78,10 @@ class Gemma2DecoderLayer(nn.Module):
         hidden_states, residual = self.pre_feedforward_layernorm(
             hidden_states, residual
         )
-        hidden_states = self.mlp(hidden_states)
+        if is_hybrid_prefill_enabled():
+            hidden_states = chunked_mlp_forward(hidden_states, self.mlp)
+        else:
+            hidden_states = self.mlp(hidden_states)
         # post_feedforward_layernorm doesn't take residual in vLLM
         hidden_states = self.post_feedforward_layernorm(hidden_states)
 

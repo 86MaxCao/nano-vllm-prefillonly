@@ -28,6 +28,9 @@ class Config:
     prefill_only_mode: bool = False  # Enable prefill-only mode (skip decode phase)
     max_prefill_batch_size: int = 1024  # Max batch size for prefill-only mode
     single_token_mode: bool = False  # Optimize for single token generation
+    # Hybrid prefilling: chunk MLP to reduce peak activation memory for long sequences
+    hybrid_prefill: bool = False
+    hybrid_prefill_chunk_size: int = 4096
     trust_remote_code: bool = False  # Trust remote code for custom models
     hf_config: AutoConfig | None = None
     eos: int = -1
@@ -75,6 +78,11 @@ class Config:
         # Auto-enable prefill_only_mode for embedding/reranker models
         if self.is_embedding or self.is_reranker:
             self.prefill_only_mode = True
-        
+
+        # Initialize hybrid prefill global state
+        if self.hybrid_prefill:
+            from nanovllm.layers.hybrid_prefill import set_hybrid_prefill_config
+            set_hybrid_prefill_config(True, self.hybrid_prefill_chunk_size)
+
         # Auto-enable single_token_mode if max_tokens would be 1
         # (This will be checked per-request in SamplingParams)
