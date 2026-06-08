@@ -276,13 +276,12 @@ class ModelRunner:
         return method(*args, **kwargs)
 
     def warmup_model(self):
-        # Skip warmup for embedding and reranker models as they don't use
-        # sampling
-        if self.is_embedding or self.is_reranker:
-            return
         # Skip warmup for multimodal models as they require pixel_values
         # which are not available during warmup
         if self.is_multimodal:
+            return
+        if self.is_embedding or self.is_reranker:
+            self._warmup_embed_rerank()
             return
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -297,6 +296,24 @@ class ModelRunner:
         torch.cuda.empty_cache()
         # Reset GatedDeltaNet states after warmup to avoid polluting real sequences
         self._reset_gdn_states()
+
+    @torch.inference_mode()
+    def _warmup_embed_rerank(self):
+        """Warmup embed/rerank models by running a dummy forward pass to trigger torch.compile."""
+        torch.cuda.empty_cache()
+        dummy_len = 32
+        dummy_input_ids = torch.zeros(dummy_len, dtype=torch.long)
+        dummy_positions = torch.arange(dummy_len, dtype=torch.long)
+        cu_seqlens = torch.tensor([0, dummy_len], dtype=torch.int32)
+        set_context(True, cu_seqlens, cu_seqlens, dummy_len, dummy_len)
+        try:
+            if hasattr(self.model, 'model'):
+                self.model.model(dummy_input_ids, dummy_positions)
+            else:
+                self.model(dummy_input_ids, dummy_positions)
+        finally:
+            reset_context()
+        torch.cuda.empty_cache()
 
     def _reset_gdn_states(self):
         """Reset Qwen3.5/Qwen3Next linear-attn recurrent states if present."""
@@ -926,9 +943,20 @@ class ModelRunner:
             attention_mask = attention_mask.to(model_device)
         if pixel_values is not None:
             pixel_values = pixel_values.to(model_device)
+            vision_dtype = None
+            if hasattr(self.model, 'visual') and hasattr(self.model.visual, 'vision'):
+                try:
+                    if hasattr(self.model.visual.vision, 'patch_embed') and hasattr(self.model.visual.vision.patch_embed, 'proj'):
+                        vision_dtype = self.model.visual.vision.patch_embed.proj.weight.dtype
+                except AttributeError:
+                    pass
+            if vision_dtype is None:
+                vision_dtype = next(self.model.parameters()).dtype
+            if pixel_values.dtype != vision_dtype:
+                pixel_values = pixel_values.to(dtype=vision_dtype)
         if image_grid_thw is not None:
             image_grid_thw = image_grid_thw.to(model_device)
-        
+
         # Check if this is a multimodal embedding (has pixel_values)
         # Note: We check pixel_values instead of self.is_multimodal because
         # embedding models set self.is_multimodal=False in __init__
@@ -1214,9 +1242,20 @@ class ModelRunner:
             attention_mask = attention_mask.to(model_device)
         if pixel_values is not None:
             pixel_values = pixel_values.to(model_device)
+            vision_dtype = None
+            if hasattr(self.model, 'visual') and hasattr(self.model.visual, 'vision'):
+                try:
+                    if hasattr(self.model.visual.vision, 'patch_embed') and hasattr(self.model.visual.vision.patch_embed, 'proj'):
+                        vision_dtype = self.model.visual.vision.patch_embed.proj.weight.dtype
+                except AttributeError:
+                    pass
+            if vision_dtype is None:
+                vision_dtype = next(self.model.parameters()).dtype
+            if pixel_values.dtype != vision_dtype:
+                pixel_values = pixel_values.to(dtype=vision_dtype)
         if image_grid_thw is not None:
             image_grid_thw = image_grid_thw.to(model_device)
-        
+
         # Check if this is a multimodal reranker (has pixel_values)
         # Note: We check pixel_values instead of self.is_multimodal because
         # reranker models set self.is_multimodal=False in __init__
@@ -1489,20 +1528,9 @@ class ModelRunner:
         )
         
         # Fill in the actual tokens (non-padding positions)
-        # IMPORTANT: hidden_states_varlen is in varlen format (concatenated sequences),
-        # so we need to fill it according to cu_seqlens_q, not just using mask
         if attention_mask is not None:
             mask = attention_mask.bool()  # [batch_size, seq_len]
-            # Fill hidden_states according to cu_seqlens_q order
-            # hidden_states_varlen is ordered as: seq0_tokens, seq1_tokens, seq2_tokens, ...
-            varlen_idx = 0
-            for batch_idx in range(batch_size):
-                seq_len_actual = seq_lens[batch_idx]
-                # Fill only the actual (non-padding) positions for this sequence
-                for pos_idx in range(seq_len_actual):
-                    if mask[batch_idx, pos_idx]:
-                        hidden_states[batch_idx, pos_idx] = hidden_states_varlen[varlen_idx]
-                        varlen_idx += 1
+            hidden_states[mask] = hidden_states_varlen
         else:
             # If no attention_mask, reshape directly
             hidden_states = hidden_states_varlen.view(batch_size, seq_len, -1)

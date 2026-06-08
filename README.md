@@ -29,7 +29,70 @@ In industrial settings, multimodal LLMs are increasingly replacing traditional d
 - **Multimodal Retrieval**: Finding the most relevant image from a large collection, e.g., "Find the image that best represents traditional Chinese architecture" from thousands of building photos
 - **Multimodal Reranking**: Ranking images by relevance, e.g., "Which shop sign is most eye-catching?" from a collection of street photos, or "Which product image best matches the query description?"
 
-When processing **hundreds of millions of images** at scale, the traditional vLLM approach with KV cache becomes inefficient. Our prefill-only optimization eliminates unnecessary KV cache allocation and management overhead, significantly improving inference efficiency for single-token generation tasks.
+### Practical Example: COCO Val2017 Images
+
+All examples below use [COCO val2017](https://cocodataset.org/) images. Each task completes in a **single forward pass** — no autoregressive token-by-token decoding.
+
+---
+
+**1. Single-Token Classification**
+
+<p align="center"><img width="300" src="assets/coco_bear.jpg"></p>
+
+> **Question**: "Is there a bear in the picture? Answer yes or no."
+
+```
+┌────────────┐     ┌─────────────────────┐     ┌─────────┐
+│   Image    │────▶│   Model (Prefill)   │────▶│  "Yes"  │
+│  + Prompt  │     │ Single Forward Pass │     │ 1 token │
+└────────────┘     └─────────────────────┘     └─────────┘
+```
+
+The model reads the entire image and prompt in one pass, then outputs a **single token**. No KV cache needed — no next-token loop.
+
+---
+
+**2. Multimodal Embedding**
+
+<p align="center"><img width="300" src="assets/coco_outdoor.jpg"></p>
+
+> **Task**: Map this outdoor scene to a dense vector for semantic search.
+
+```
+┌────────────┐     ┌─────────────────────┐     ┌──────────────────────────┐
+│   Image    │────▶│   Model (Prefill)   │────▶│ [0.12, -0.34, 0.56, ...] │
+│  + Text    │     │ Single Forward Pass │     │   hidden_size-dim vector │
+└────────────┘     └─────────────────────┘     └──────────────────────────┘
+```
+
+The model encodes the image-text pair into a **fixed-length vector** in one pass. This vector can be indexed for retrieval across millions of images — all without KV cache.
+
+---
+
+**3. Multimodal Reranking**
+
+<p align="center">
+<img width="220" src="assets/coco_indoor.jpg">&nbsp;&nbsp;
+<img width="220" src="assets/coco_fruits.jpg">&nbsp;&nbsp;
+<img width="220" src="assets/coco_building.jpg">
+</p>
+
+> **Query**: "A white building"
+
+```
+┌──────────────┐     ┌─────────────────────┐     ┌────────────────────┐
+│  Query       │     │                     │     │ Image 1: 0.11      │
+│  + Image 1   │────▶│   Model (Prefill)   │────▶│ Image 2: 0.05      │
+│  + Image 2   │     │ Single Forward Pass │     │ Image 3: 0.93  ✓   │
+│  + Image 3   │     │                     │     │                    │
+└──────────────┘     └─────────────────────┘     └────────────────────┘
+```
+
+The model scores each image-query pair in a **single forward pass** and outputs a relevance score. The building image ranks highest — no decoding loop involved.
+
+---
+
+All three tasks — classification, embedding, and reranking — are **prefill-only**: the model processes all input tokens in one forward pass with no autoregressive decode loop. When processing **hundreds of millions of images** at scale, the traditional vLLM approach wastes GPU memory on KV cache that is never reused. Our prefill-only optimization eliminates this overhead entirely.
 
 ## 🚀 Key Features
 
@@ -40,7 +103,7 @@ When processing **hundreds of millions of images** at scale, the traditional vLL
 
 ## 📊 Performance Benchmarks
 
-All benchmarks measured on a single NVIDIA H20 GPU (96GB). Speed measured as mean latency over 5 iterations after warmup. VRAM measured via `torch.cuda.max_memory_allocated()` in isolated subprocesses.
+All benchmarks measured on a single NVIDIA H20 GPU (96GB). Speed measured as median latency over 30 iterations (10 warmup rounds, 2σ outlier removal) unless otherwise noted. VRAM measured via `torch.cuda.max_memory_allocated()` in isolated subprocesses.
 
 ### Speed Comparison: Text Models (batch=100)
 
@@ -58,31 +121,55 @@ All benchmarks measured on a single NVIDIA H20 GPU (96GB). Speed measured as mea
 
 | Model | Category | Transformers (s) | Prefill-Only (Ours) (s) | Speedup |
 |-------|----------|:-----------------:|:-----------------------:|:-------:|
-| Qwen3-VL-2B-Instruct | Generation | 0.0864 | 0.0499 | **1.73x** |
+| Qwen3-VL-2B-Instruct | Generation | 0.1059 | 0.0736 | **1.44x** |
 | Qwen3.5-0.8B | Generation | 0.0817 | 0.2132 | 0.38x* |
 | Qwen2.5-VL-3B-Instruct | Generation | 0.1212 | 0.0594 | **2.04x** |
-| Qwen3-VL-Embedding-2B | Embedding | 0.0704 | 0.0651 | **1.08x** |
-| Qwen3-VL-Reranker-2B | Reranking | 0.0829 | 0.0738 | **1.12x** |
+| Qwen3-VL-Embedding-2B | Embedding | 0.0766 | 0.0707 | **1.08x** |
+| Qwen3-VL-Reranker-2B | Reranking | 0.0906 | 0.0830 | **1.09x** |
 
 > Both Transformers and Prefill-Only use FlashAttention. End-to-end measurement includes preprocessing (tokenization/apply_chat_template + image processing).
 >
 > \* Qwen3.5 uses GatedDeltaNet (GDN) linear attention which requires per-sequence state isolation during prefill. Batched GDN prefill is implemented via Triton `cu_seqlens` (processing all sequences in a single kernel call), but remains slower than Transformers' native batch dimension due to cu_seqlens kernel overhead and engine-level scheduling costs.
 
-### Why Varlen Attention is Faster (Forward-Only Comparison)
+### Speed Comparison vs vLLM (torch.compile, max_tokens=1)
 
-Our framework uses **varlen FlashAttention** (`flash_attn_varlen_func`), which concatenates all sequences into a single 1D tensor and uses `cu_seqlens` to delineate boundaries. This eliminates padding waste that Transformers' standard batch attention suffers from.
+| Model | Category | vLLM (s) | Prefill-Only (Ours) (s) | Speedup | Batch |
+|-------|----------|:--------:|:-----------------------:|:-------:|:-----:|
+| Qwen3-0.6B | Generation | 0.0599 | 0.0324 | **1.85x** | 100 |
+| Qwen3-Embedding-0.6B | Embedding | 0.0366‡ | 0.0302 | **1.21x** | 100 |
+| bge-multilingual-gemma2 | Embedding | N/A† | 0.1965 | — | 100 |
+| Qwen3-Reranker-0.6B | Reranking | 0.0640‡ | 0.0723 | 0.89x | 100 |
+| bge-reranker-v2-gemma | Reranking | 0.0409 | 0.0953 | 0.43x | 100 |
+| Qwen3-VL-2B-Instruct | Generation | 0.0676 | 0.0585 | **1.16x** | 10 |
+| Qwen2.5-VL-3B-Instruct | Generation | 0.1054 | 0.0620 | **1.70x** | 10 |
+| Qwen3-VL-Embedding-2B | Embedding | 0.0705 | 0.0707 | 1.00x | 10 |
+| Qwen3-VL-Reranker-2B | Reranking | 0.0558 | 0.0830 | 0.67x | 10 |
 
-**Benchmark**: Qwen3-VL-2B-Instruct, model forward only (excluding preprocessing), NVIDIA H20.
+> vLLM uses **full-graph** `torch.compile` with TorchInductor + CUDA graphs for cross-operator kernel fusion. Prefill-Only (Ours) uses **per-operator** `torch.compile` on RMSNorm, SiLU, RoPE, and Sampler. vLLM 0.19.0, `gpu_memory_utilization=0.5`, `max_model_len=4096`.
+>
+> † bge-multilingual-gemma2 **cannot run inference** in vLLM 0.19.0 at minimum utilization because the KV cache is too small to fit batch=100 sequences. Our prefill-only approach has **no such limitation** — it works at any memory budget above model weights.
+>
+> ‡ Measured with vLLM 0.22.0 using native `embed()` / `score()` APIs with `runner="pooling"`.
+>
+> **Analysis**: For generation models, our framework is **1.2–1.9x faster** even against vLLM's full-graph compile, thanks to KV cache elimination and varlen attention. For embedding, we achieve **near-parity** (0.99x–1.21x) with vLLM. For reranking with text models, vLLM's full-graph compile + CUDA graphs provides stronger optimization. Full-graph compile support for our framework is planned for a future release.
 
-| Scenario | Transformers | Prefill-Only (Ours) | Speedup | Why |
-|----------|:------------:|:------------:|:-------:|-----|
-| 10 images, same size (224px) | 67 ms | 66 ms | 1.02x | No padding difference, nearly identical |
-| 100 images, same size (224px) | 565 ms | 534 ms | 1.06x | Slight advantage from avoiding attention_mask overhead |
-| 10 images, variable size (224-672px) | 264 ms | 175 ms | **1.50x** | HF pads to max (454 tokens), 48% tokens wasted |
+### Why Forward Pass is Faster
 
-**Key insight**: The speedup scales with **sequence length variance**. When images have different resolutions, Transformers pads all sequences to the longest one, wasting compute on padding tokens. Our varlen approach computes only real tokens — the more diverse the input lengths, the bigger the advantage.
+Our framework achieves faster model forward passes through multiple optimizations:
 
-In production scenarios with mixed-resolution images (common in real-world applications), this translates to 1.3-1.5x faster model forward passes with zero accuracy loss.
+1. **Varlen FlashAttention** (`flash_attn_varlen_func`): Concatenates all sequences into a single 1D tensor with `cu_seqlens` boundaries, eliminating padding waste and attention_mask overhead.
+2. **Vision Feature Caching**: Caches ViT encoder outputs to avoid redundant visual encoding for repeated or identical images.
+3. **Fused Operators**: Per-operator `torch.compile` on RMSNorm, SiLU, RoPE, and Sampler.
+
+**Benchmark**: Qwen3-VL-2B-Instruct, batch=10, 224x224 images, NVIDIA H20.
+
+| Metric | Transformers (ms) | Prefill-Only (Ours) (ms) | Speedup |
+|--------|:------------------:|:------------------------:|:-------:|
+| Forward-only | 78.1 | 30.8 | **2.53x** |
+| End-to-end | 105.9 | 73.6 | **1.44x** |
+| Preprocessing (est.) | 27.8 | 42.8 | 0.65x |
+
+**Key insight**: The forward pass itself is **2.53x faster**, but our current preprocessing pipeline (per-request `apply_chat_template` + processor) is slower than Transformers' native batch processing, which reduces the end-to-end speedup to **1.44x**. The varlen advantage grows further with **variable-length sequences** (mixed-resolution images), where Transformers wastes compute on padding tokens while our approach processes only real tokens.
 
 ### torch.compile Status
 
