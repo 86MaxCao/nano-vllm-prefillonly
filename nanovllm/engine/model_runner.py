@@ -894,6 +894,56 @@ class ModelRunner:
         
         return hidden_states
 
+    def _build_vision_placeholders(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        image_grid_thw: torch.Tensor | None,
+        batch_size: int,
+    ) -> tuple[list[tuple[int, int]], list[list[tuple[int, int]]]]:
+        """Build seq_image_indices and seq_vision_placeholders for multimodal embed/rerank.
+
+        Returns:
+            seq_image_indices: [(start_idx, end_idx), ...] per sequence
+            seq_vision_placeholders: [[(offset, n_tokens), ...], ...] per sequence
+        """
+        seq_image_indices = []
+        seq_vision_placeholders = []
+
+        if image_grid_thw is not None:
+            num_images = image_grid_thw.shape[0]
+            images_per_seq = num_images // batch_size if batch_size > 0 else 0
+            merge_size = getattr(self.model, 'visual', None)
+            if merge_size and hasattr(merge_size, 'config'):
+                spatial_merge = merge_size.config.spatial_merge_size
+            else:
+                spatial_merge = 2
+            placeholder_token_id = self._image_token_id
+
+            for i in range(batch_size):
+                start_idx = i * images_per_seq
+                end_idx = start_idx + images_per_seq
+                seq_image_indices.append((start_idx, end_idx))
+                img_grids = image_grid_thw[start_idx:end_idx]
+                n_vis_tokens = int((img_grids.prod(-1) // (spatial_merge ** 2)).sum().item())
+                seq_input_ids = input_ids[i]
+                if attention_mask is not None:
+                    seq_tokens_actual = seq_input_ids[attention_mask[i].bool()]
+                else:
+                    seq_tokens_actual = seq_input_ids
+                placeholder_positions = (seq_tokens_actual == placeholder_token_id).nonzero(as_tuple=True)[0]
+                if len(placeholder_positions) > 0:
+                    offset_in_seq = int(placeholder_positions[0].item())
+                    seq_vision_placeholders.append([(offset_in_seq, n_vis_tokens)])
+                else:
+                    seq_vision_placeholders.append([(0, n_vis_tokens)])
+        else:
+            for i in range(batch_size):
+                seq_image_indices.append((0, 0))
+                seq_vision_placeholders.append([])
+
+        return seq_image_indices, seq_vision_placeholders
+
     @torch.inference_mode()
     def embed(
         self,
@@ -1012,53 +1062,10 @@ class ModelRunner:
                 )
                 
                 try:
-                    # Build seq_image_indices and seq_vision_placeholders
-                    # like MultimodalHandler.prepare_prefill_only_inputs does
-                    seq_image_indices = []
-                    seq_vision_placeholders = []
-                    current_image_idx = 0
-                    
-                    if image_grid_thw is not None:
-                        num_images = image_grid_thw.shape[0]
-                        # For embedding, typically one image per sequence
-                        images_per_seq = num_images // batch_size if batch_size > 0 else 0
-                        for i in range(batch_size):
-                            start_idx = i * images_per_seq
-                            end_idx = start_idx + images_per_seq
-                            seq_image_indices.append((start_idx, end_idx))
-                            # Find vision placeholder positions in this sequence's tokens
-                            # Vision placeholders are typically at the beginning after varlen flatten
-                            # We compute the expected number of vision tokens from grid_thw
-                            merge_size = getattr(self.model, 'visual', None)
-                            if merge_size and hasattr(merge_size, 'config'):
-                                spatial_merge = merge_size.config.spatial_merge_size
-                            else:
-                                spatial_merge = 2  # default
-                            img_grids = image_grid_thw[start_idx:end_idx]
-                            n_vis_tokens = int((img_grids.prod(-1) // (spatial_merge ** 2)).sum().item())
-                            # Vision placeholder is at the start of each sequence's tokens
-                            # (after the system prompt tokens - find <|image_pad|> tokens)
-                            # Use input_ids to find placeholder positions
-                            seq_input_ids = input_ids[i]
-                            if attention_mask is not None:
-                                seq_mask = attention_mask[i].bool()
-                                seq_tokens_actual = seq_input_ids[seq_mask]
-                            else:
-                                seq_tokens_actual = seq_input_ids
-                            
-                            # Find image placeholder token (151655 for Qwen3-VL)
-                            placeholder_token_id = self._image_token_id
-                            placeholder_positions = (seq_tokens_actual == placeholder_token_id).nonzero(as_tuple=True)[0]
-                            if len(placeholder_positions) > 0:
-                                offset_in_seq = int(placeholder_positions[0].item())
-                                seq_vision_placeholders.append([(offset_in_seq, n_vis_tokens)])
-                            else:
-                                seq_vision_placeholders.append([(0, n_vis_tokens)])
-                    else:
-                        for i in range(batch_size):
-                            seq_image_indices.append((0, 0))
-                            seq_vision_placeholders.append([])
-                    
+                    seq_image_indices, seq_vision_placeholders = self._build_vision_placeholders(
+                        input_ids, attention_mask, image_grid_thw, batch_size
+                    )
+
                     # Forward with varlen input_ids and proper multimodal params
                     embeddings = self.model(
                         input_ids=input_ids_flat,
@@ -1100,12 +1107,17 @@ class ModelRunner:
             mask = attention_mask.bool()  # [batch_size, seq_len]
             # Extract non-padding tokens
             input_ids_flat = input_ids[mask]  # [num_non_pad_tokens]
-            positions_flat = positions[mask]  # [num_non_pad_tokens]
+            # Generate correct per-sequence positions [0,1,...,len_i-1] for each sequence
+            # (positions[mask] is WRONG for left-padded inputs — gives offset positions)
+            positions_flat = torch.cat([
+                torch.arange(sl, dtype=torch.int64, device=input_ids.device)
+                for sl in seq_lens
+            ])
         else:
             # If no attention_mask, use all tokens
             input_ids_flat = input_ids.flatten()
             positions_flat = positions.flatten()
-        
+
         # Create empty slot_mapping (embedding models don't use KV cache)
         slot_mapping = torch.empty(0, dtype=torch.int32, device=model_device)
         
@@ -1137,36 +1149,15 @@ class ModelRunner:
                 )
             
             # hidden_states_varlen shape: [num_non_pad_tokens, hidden_size]
-            # Now we need to pad it back to [batch_size, seq_len, hidden_size] for pooling
-            # This matches vLLM's approach: "varlen排除 + 输出补零"
-            hidden_size = hidden_states_varlen.shape[-1]
-            hidden_states = torch.zeros(
-                batch_size, seq_len, hidden_size,
-                dtype=hidden_states_varlen.dtype,
-                device=hidden_states_varlen.device
-            )
-            
-            # Fill in the actual tokens (non-padding positions)
-            if attention_mask is not None:
-                mask = attention_mask.bool()  # [batch_size, seq_len]
-                hidden_states[mask] = hidden_states_varlen
-            else:
-                # If no attention_mask, reshape directly
-                hidden_states = hidden_states_varlen.view(batch_size, seq_len, -1)
-            
-            # Now call the embedding model's pooler with the padded hidden_states
-            # and normalize if requested
+            # Pool directly from varlen format (no pad-back needed)
             if hasattr(self.model, 'pooler'):
-                # Direct pooling if pooler is accessible
-                embeddings = self.model.pooler(hidden_states, attention_mask)
-                # Normalize if requested
+                embeddings = self.model.pooler.forward_varlen(
+                    hidden_states_varlen, cu_seqlens
+                )
                 if getattr(self.model, 'normalize', False):
                     embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
             else:
-                # Fallback: call forward method with original input_ids
-                # But this would re-process tokens, so it's less efficient
-                # For now, raise error to force proper implementation
-                raise ValueError("Embedding model does not have pooler attribute. Cannot pool hidden_states directly.")
+                raise ValueError("Embedding model does not have pooler attribute.")
             
             return embeddings
         finally:
@@ -1341,44 +1332,10 @@ class ModelRunner:
                 )
                 
                 try:
-                    # Build seq_image_indices and seq_vision_placeholders
-                    seq_image_indices = []
-                    seq_vision_placeholders = []
-                    
-                    if image_grid_thw is not None:
-                        num_images = image_grid_thw.shape[0]
-                        images_per_seq = num_images // batch_size if batch_size > 0 else 0
-                        for i in range(batch_size):
-                            start_idx = i * images_per_seq
-                            end_idx = start_idx + images_per_seq
-                            seq_image_indices.append((start_idx, end_idx))
-                            # Compute expected vision tokens
-                            merge_size = getattr(self.model, 'visual', None)
-                            if merge_size and hasattr(merge_size, 'config'):
-                                spatial_merge = merge_size.config.spatial_merge_size
-                            else:
-                                spatial_merge = 2
-                            img_grids = image_grid_thw[start_idx:end_idx]
-                            n_vis_tokens = int((img_grids.prod(-1) // (spatial_merge ** 2)).sum().item())
-                            # Find placeholder positions
-                            seq_input_ids = input_ids[i]
-                            if attention_mask is not None:
-                                seq_mask = attention_mask[i].bool()
-                                seq_tokens_actual = seq_input_ids[seq_mask]
-                            else:
-                                seq_tokens_actual = seq_input_ids
-                            placeholder_token_id = self._image_token_id
-                            placeholder_positions = (seq_tokens_actual == placeholder_token_id).nonzero(as_tuple=True)[0]
-                            if len(placeholder_positions) > 0:
-                                offset_in_seq = int(placeholder_positions[0].item())
-                                seq_vision_placeholders.append([(offset_in_seq, n_vis_tokens)])
-                            else:
-                                seq_vision_placeholders.append([(0, n_vis_tokens)])
-                    else:
-                        for i in range(batch_size):
-                            seq_image_indices.append((0, 0))
-                            seq_vision_placeholders.append([])
-                    
+                    seq_image_indices, seq_vision_placeholders = self._build_vision_placeholders(
+                        input_ids, attention_mask, image_grid_thw, batch_size
+                    )
+
                     # Forward with varlen input_ids and proper multimodal params
                     scores = self.model(
                         input_ids=input_ids_flat,
@@ -1426,7 +1383,12 @@ class ModelRunner:
                 mask = attention_mask.bool()  # [batch_size, seq_len]
                 # Extract non-padding tokens
                 input_ids_flat = input_ids[mask]  # [num_non_pad_tokens]
-                positions_flat = positions[mask]  # [num_non_pad_tokens]
+                # Generate correct per-sequence positions [0,1,...,len_i-1] for each sequence
+                # (positions[mask] is WRONG for left-padded inputs — gives offset positions)
+                positions_flat = torch.cat([
+                    torch.arange(sl, dtype=torch.int64, device=input_ids.device)
+                    for sl in seq_lens
+                ])
             else:
                 # If no attention_mask, use all tokens
                 input_ids_flat = input_ids.flatten()
@@ -1462,44 +1424,10 @@ class ModelRunner:
         if pixel_values is not None and hasattr(self.model, 'forward'):
             # Multimodal reranker with compute_score (e.g., Qwen3VLReranker)
             # Need to pass pixel_values and related params for vision processing
-            # Build seq_image_indices and seq_vision_placeholders
-            seq_image_indices = []
-            seq_vision_placeholders = []
-            
-            if image_grid_thw is not None:
-                num_images = image_grid_thw.shape[0]
-                images_per_seq = num_images // batch_size if batch_size > 0 else 0
-                for i in range(batch_size):
-                    start_idx = i * images_per_seq
-                    end_idx = start_idx + images_per_seq
-                    seq_image_indices.append((start_idx, end_idx))
-                    # Compute expected vision tokens
-                    merge_size = getattr(self.model, 'visual', None)
-                    if merge_size and hasattr(merge_size, 'config'):
-                        spatial_merge = merge_size.config.spatial_merge_size
-                    else:
-                        spatial_merge = 2
-                    img_grids = image_grid_thw[start_idx:end_idx]
-                    n_vis_tokens = int((img_grids.prod(-1) // (spatial_merge ** 2)).sum().item())
-                    # Find placeholder positions in the original (pre-flatten) input_ids
-                    seq_input_ids = input_ids[i]
-                    if attention_mask is not None:
-                        seq_mask = attention_mask[i].bool()
-                        seq_tokens_actual = seq_input_ids[seq_mask]
-                    else:
-                        seq_tokens_actual = seq_input_ids
-                    placeholder_token_id = 151655
-                    placeholder_positions = (seq_tokens_actual == placeholder_token_id).nonzero(as_tuple=True)[0]
-                    if len(placeholder_positions) > 0:
-                        offset_in_seq = int(placeholder_positions[0].item())
-                        seq_vision_placeholders.append([(offset_in_seq, n_vis_tokens)])
-                    else:
-                        seq_vision_placeholders.append([(0, n_vis_tokens)])
-            else:
-                for i in range(batch_size):
-                    seq_image_indices.append((0, 0))
-                    seq_vision_placeholders.append([])
-            
+            seq_image_indices, seq_vision_placeholders = self._build_vision_placeholders(
+                input_ids, attention_mask, image_grid_thw, batch_size
+            )
+
             # Call model with multimodal params - it returns scores directly
             # when sequence_lengths is provided
             scores = self.model(
@@ -1515,46 +1443,51 @@ class ModelRunner:
             return scores
         
         hidden_states_varlen = self.model(input_ids_flat, positions_flat)
-        
-        # Process hidden_states (text-only rerankers only, multimodal already handled above)
-        # hidden_states_varlen shape: [num_non_pad_tokens, hidden_size]
-        # Now we need to pad it back to [batch_size, seq_len, hidden_size] to match Transformers
-        # This matches vLLM's approach: "varlen排除 + 输出补零"
-        hidden_size = hidden_states_varlen.shape[-1]
-        hidden_states = torch.zeros(
-            batch_size, seq_len, hidden_size,
-            dtype=hidden_states_varlen.dtype,
-            device=hidden_states_varlen.device
-        )
-        
-        # Fill in the actual tokens (non-padding positions)
-        if attention_mask is not None:
-            mask = attention_mask.bool()  # [batch_size, seq_len]
-            hidden_states[mask] = hidden_states_varlen
-        else:
-            # If no attention_mask, reshape directly
-            hidden_states = hidden_states_varlen.view(batch_size, seq_len, -1)
-        
-        # Compute scores
+
+        # Compute scores directly from varlen hidden states when possible
+        if hasattr(self.model, 'compute_score_varlen'):
+            scores = self.model.compute_score_varlen(
+                hidden_states_varlen, cu_seqlens_q
+            )
+            reset_context()
+            return scores
+
+        # Listwise reranker (jina_v3) needs padded format for token search
         if hasattr(self.model, 'compute_scores'):
-            # Listwise reranker (jina_v3)
+            hidden_size = hidden_states_varlen.shape[-1]
+            hidden_states = torch.zeros(
+                batch_size, seq_len, hidden_size,
+                dtype=hidden_states_varlen.dtype,
+                device=hidden_states_varlen.device
+            )
+            if attention_mask is not None:
+                mask = attention_mask.bool()
+                hidden_states[mask] = hidden_states_varlen
+            else:
+                hidden_states = hidden_states_varlen.view(batch_size, seq_len, -1)
             scores, query_embeds, doc_embeds = self.model.compute_scores(
                 hidden_states, input_ids
             )
             reset_context()
             return scores, query_embeds, doc_embeds
         elif hasattr(self.model, 'compute_score'):
-            # Pointwise reranker with compute_score method
+            # Fallback: pad-back for models without varlen support
+            hidden_size = hidden_states_varlen.shape[-1]
+            hidden_states = torch.zeros(
+                batch_size, seq_len, hidden_size,
+                dtype=hidden_states_varlen.dtype,
+                device=hidden_states_varlen.device
+            )
+            if attention_mask is not None:
+                mask = attention_mask.bool()
+                hidden_states[mask] = hidden_states_varlen
+            else:
+                hidden_states = hidden_states_varlen.view(batch_size, seq_len, -1)
             scores = self.model.compute_score(
                 hidden_states, token_indices, attention_mask
             )
             reset_context()
             return scores
-        elif has_forward_rerank:
-            # Native nano-vllm forward rerankers (non-transformers)
-            raise NotImplementedError(
-                "Native nano-vllm forward-rerankers not yet supported."
-            )
         else:
             raise ValueError("Model does not support reranking.")
 

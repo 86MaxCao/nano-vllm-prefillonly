@@ -62,7 +62,7 @@ class Qwen3Reranker(Qwen3ForCausalLM):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute reranking scores from hidden states.
-        
+
         Args:
             hidden_states: Hidden states from forward pass, shape [batch_size, seq_len, hidden_size]
             token_indices: Indices of tokens to extract scores from (within each sequence).
@@ -70,12 +70,12 @@ class Qwen3Reranker(Qwen3ForCausalLM):
                           If None, uses last token for each sequence.
             attention_mask: Attention mask, shape [batch_size, seq_len]. If provided, uses it
                           to find the last real token for each sequence.
-            
+
         Returns:
             scores: Reranking scores, shape [batch_size]
         """
         batch_size, seq_len, hidden_size = hidden_states.shape
-        
+
         if token_indices is None:
             if attention_mask is not None:
                 seq_lens_actual = attention_mask.sum(dim=1)
@@ -86,14 +86,32 @@ class Qwen3Reranker(Qwen3ForCausalLM):
                 dtype=torch.int64,
                 device=hidden_states.device,
             )
-        
+
         batch_indices = torch.arange(batch_size, device=hidden_states.device)
         selected_states = hidden_states[batch_indices, token_indices]
-        
+
         raw_scores = self.score_head(selected_states).squeeze(-1)
-        
+
         scores = torch.sigmoid(raw_scores)
         return scores
+
+    def compute_score_varlen(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute scores directly from varlen hidden states without pad-back.
+
+        Args:
+            hidden_states: [total_tokens, hidden_size] packed without padding
+            cu_seqlens: [batch_size + 1] cumulative sequence lengths
+        Returns:
+            scores: [batch_size]
+        """
+        last_indices = cu_seqlens[1:] - 1
+        selected_states = hidden_states[last_indices]
+        raw_scores = self.score_head(selected_states).squeeze(-1)
+        return torch.sigmoid(raw_scores)
 
     def convert_from_original_reranker(self, tokenizer):
         """Convert original Qwen3-Reranker weights to score_head.

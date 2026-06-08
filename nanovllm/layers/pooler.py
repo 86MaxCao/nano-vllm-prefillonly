@@ -15,13 +15,13 @@ class PoolingType(IntEnum):
 
 class PoolingMethod(nn.Module):
     """Base class for pooling methods."""
-    
+
     @staticmethod
     def from_pooling_type(pooling_type: PoolingType | str) -> "PoolingMethod":
         """Create a pooling method from a pooling type."""
         if isinstance(pooling_type, str):
             pooling_type = PoolingType[pooling_type.upper()]
-        
+
         if pooling_type == PoolingType.LAST:
             return LastPool()
         elif pooling_type == PoolingType.CLS:
@@ -30,7 +30,7 @@ class PoolingMethod(nn.Module):
             return MeanPool()
         else:
             raise ValueError(f"Unsupported pooling type: {pooling_type}")
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -45,10 +45,25 @@ class PoolingMethod(nn.Module):
         """
         raise NotImplementedError
 
+    def forward_varlen(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pool directly from varlen-packed hidden states without pad-back.
+
+        Args:
+            hidden_states: [total_tokens, hidden_size] packed without padding
+            cu_seqlens: [batch_size + 1] cumulative sequence lengths
+        Returns:
+            pooled_states: [batch_size, hidden_size]
+        """
+        raise NotImplementedError
+
 
 class LastPool(PoolingMethod):
     """Pool the last token's hidden state."""
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -61,30 +76,33 @@ class LastPool(PoolingMethod):
         - For right padding: returns the last non-padding token
         """
         if attention_mask is not None:
-            # Check if using left padding (all sequences end with padding)
-            # If attention_mask[:, -1].sum() == batch_size, all last tokens
-            # are padding, meaning left padding is used
             batch_size = hidden_states.shape[0]
             left_padding = (
                 attention_mask[:, -1].sum() == batch_size
             )
-            
+
             if left_padding:
-                # Left padding: last token is the actual last token
                 return hidden_states[:, -1]
             else:
-                # Right padding: get the last non-padding token
-                seq_lengths = attention_mask.sum(dim=1) - 1  # -1 for 0-indexed
+                seq_lengths = attention_mask.sum(dim=1) - 1
                 indices = torch.arange(batch_size, device=hidden_states.device)
                 return hidden_states[indices, seq_lengths]
         else:
-            # Simply take the last token
             return hidden_states[:, -1]
+
+    def forward_varlen(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        # Last token of each sequence is at cu_seqlens[i+1] - 1
+        last_indices = cu_seqlens[1:] - 1  # [batch_size]
+        return hidden_states[last_indices]
 
 
 class CLSPool(PoolingMethod):
     """Pool the CLS token (first token)."""
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -93,10 +111,19 @@ class CLSPool(PoolingMethod):
         """Extract the first token's hidden state."""
         return hidden_states[:, 0]
 
+    def forward_varlen(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        # First token of each sequence is at cu_seqlens[:-1]
+        first_indices = cu_seqlens[:-1]  # [batch_size]
+        return hidden_states[first_indices]
+
 
 class MeanPool(PoolingMethod):
     """Mean pooling over all tokens."""
-    
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -107,12 +134,30 @@ class MeanPool(PoolingMethod):
         If attention_mask is provided, only pool over non-padding tokens.
         """
         if attention_mask is not None:
-            # Expand attention_mask to match hidden_states shape
             attention_mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
-            # Sum over sequence dimension, weighted by attention_mask
             sum_embeddings = torch.sum(hidden_states * attention_mask_expanded, dim=1)
             sum_mask = torch.clamp(attention_mask_expanded.sum(dim=1), min=1e-9)
             return sum_embeddings / sum_mask
         else:
-            # Simple mean pooling
             return hidden_states.mean(dim=1)
+
+    def forward_varlen(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size = cu_seqlens.shape[0] - 1
+        hidden_size = hidden_states.shape[-1]
+        # Use segment_reduce for efficient per-sequence mean
+        seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).float()  # [batch_size]
+        # Compute cumulative sum and subtract to get per-sequence sums
+        cumsum = torch.cumsum(hidden_states, dim=0)  # [total_tokens, hidden_size]
+        # Sum for each sequence: cumsum[end-1] - cumsum[start-1]
+        ends = cu_seqlens[1:] - 1  # last index of each seq
+        starts = cu_seqlens[:-1]  # first index of each seq
+        seq_sums = cumsum[ends]  # [batch_size, hidden_size]
+        # Subtract cumsum at start-1 (for start > 0)
+        prev_mask = starts > 0
+        if prev_mask.any():
+            seq_sums[prev_mask] -= cumsum[starts[prev_mask] - 1]
+        return seq_sums / seq_lens.unsqueeze(-1)

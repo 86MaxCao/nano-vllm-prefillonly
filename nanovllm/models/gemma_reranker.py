@@ -99,6 +99,24 @@ class GemmaReranker(GemmaForCausalLM):
         scores = torch.sigmoid(raw_scores)
         return scores
     
+    def compute_score_varlen(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute scores directly from varlen hidden states without pad-back.
+
+        Args:
+            hidden_states: [total_tokens, hidden_size] packed without padding
+            cu_seqlens: [batch_size + 1] cumulative sequence lengths
+        Returns:
+            scores: [batch_size]
+        """
+        last_indices = cu_seqlens[1:] - 1
+        selected_states = hidden_states[last_indices]
+        raw_scores = self.score_head(selected_states).squeeze(-1)
+        return torch.sigmoid(raw_scores)
+
     def convert_from_original_reranker(self, tokenizer):
         """Convert original Gemma-Reranker weights to score_head.
         
