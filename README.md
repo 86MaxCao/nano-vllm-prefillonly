@@ -100,6 +100,7 @@ All three tasks — classification, embedding, and reranking — are **prefill-o
 * 💾 **Massive Memory Savings** - Up to **10x less memory** compared to original nano-vllm
 * 🎯 **Industrial-Scale Ready** - Designed for high-throughput discriminative inference
 * 🔧 **Based on nano-vllm** - Built on top of the clean, readable nano-vllm codebase
+* 🧩 **[Hybrid Prefilling](https://arxiv.org/abs/2505.07203)** - Chunk MLP execution to reduce peak activation memory by **70%+** for long video understanding (see [`feat/hybrid-prefilling`](../../tree/feat/hybrid-prefilling) branch)
 
 ## 📊 Performance Benchmarks
 
