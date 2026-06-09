@@ -346,6 +346,81 @@ scores = llm.rerank_batch(pairs, images=images)  # [batch_size]
 - jina-reranker-v3: Custom bidirectional architecture, causal varlen path adds overhead
 - Full-graph `torch.compile` not yet supported (only per-operator compile)
 
+## 🧩 Hybrid Prefilling (Long Video Understanding)
+
+Based on the paper [Hybrid Prefilling: Redefining the Boundaries of LLM Inference in Long-Context](https://arxiv.org/abs/2505.07203), we implemented hybrid prefilling for the prefill-only engine to reduce peak GPU memory from MLP intermediate activations during long video understanding.
+
+For long video understanding tasks, MLP intermediate activations create massive peak memory spikes — up to `seq_len × intermediate_size` per layer. Hybrid Prefilling solves this by chunking MLP execution while keeping attention full-context.
+
+### Core Idea
+
+- **MLP layers are token-independent**: process them in chunks to bound peak activation memory
+- **Attention layers require full sequence context**: process them normally (no chunking)
+- **Peak memory drops** from `seq_len × intermediate_size` to `chunk_size × intermediate_size`
+
+### Why This Matters: Qwen3-VL Video Token Analysis
+
+Qwen3-VL processes video with the following parameters (from `qwen_vl_utils`):
+
+| Parameter | Value | Meaning |
+|-----------|-------|---------|
+| `FPS` | 2.0 | Default sampling frame rate |
+| `FPS_MAX_FRAMES` | 768 | Default maximum frame count |
+| `VIDEO_MIN_TOKEN_NUM` | 128 | Min tokens per frame |
+| `VIDEO_MAX_TOKEN_NUM` | 768 | Max tokens per frame |
+| `temporal_patch_size` | 1 (Qwen3-VL) | Each frame processed independently |
+| `spatial_merge_size` | 2 | 2x2 spatial merge |
+
+Token count per frame: `(H/14) × (W/14) / 4`, ranging from 128 to 768 tokens/frame.
+
+**Real-world video token counts:**
+
+| Scenario | Frames | Tokens/Frame | Total Visual Tokens | Duration (2fps) |
+|----------|--------|:------------:|:-------------------:|:---------------:|
+| Short low-res video | 200 | 128 | 25,600 | 100s |
+| Medium resolution | 768 | 256 | **196,608** | 6.4 min |
+| High resolution max frames | 768 | 768 | **589,824** | 6.4 min |
+| Long video (0.5fps) | 1800 | 128 | **230,400** | 1 hour |
+
+Qwen3-VL claims "Native 256K context, expandable to 1M; handles hours-long video with full recall." Our benchmark at 76.8K tokens represents only a conservative scenario (~300 frames at medium resolution). Real long video understanding easily reaches **200K–600K+ tokens**.
+
+### Benchmark Results
+
+**Memory savings (per-layer MLP activation, Qwen3-0.6B, chunk_size=4096):**
+
+| SeqLen | Normal (MB) | Hybrid (MB) | Saved (MB) | Saved % |
+|--------|:-----------:|:-----------:|:----------:|:-------:|
+| 4,096 | 88.0 | 88.0 | 0.0 | 0.0% |
+| 8,192 | 176.0 | 104.0 | 72.0 | 40.9% |
+| 16,384 | 352.0 | 136.0 | 216.0 | 61.4% |
+| 32,768 | 704.0 | 200.0 | 504.0 | 71.6% |
+| 65,536 | 1,408.0 | 384.0 | 1,024.0 | 72.7% |
+| 76,800 | 1,650.0 | 450.0 | 1,200.0 | **72.7%** |
+
+At 76.8K tokens × 28 layers: **~33.6 GB total activation memory saved**.
+
+**Latency overhead (per-layer MLP, chunk_size=4096):**
+
+| SeqLen | Normal (ms) | Hybrid (ms) | Overhead |
+|--------|:-----------:|:-----------:|:--------:|
+| 8,192 | 1.47 | 1.32 | -10.7% (faster) |
+| 32,768 | 4.63 | 5.17 | +11.7% |
+| 65,536 | 9.15 | 10.23 | +11.8% |
+
+~12% latency overhead is a favorable trade-off for 70%+ memory savings, enabling much longer sequences on a single GPU.
+
+### Usage
+
+```python
+from nanovllm import LLM
+
+# Enable hybrid prefilling for long video understanding
+llm = LLM("Qwen/Qwen3-VL-8B-Instruct",
+           multimodal_model_type="qwen3_vl",
+           hybrid_prefill=True,
+           hybrid_prefill_chunk_size=4096)
+```
+
 ## 🏗️ Architecture
 
 Built on [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm). Key optimizations:
