@@ -24,8 +24,15 @@ class Gemma2DecoderLayer(nn.Module):
     def __init__(
         self,
         config: Gemma2Config,
+        layer_idx: int = 0,
     ) -> None:
         super().__init__()
+        # Gemma2 alternates local and global attention. HF expresses this with
+        # sliding_window_pattern (default 2): even layers attend locally.
+        pattern = getattr(config, "sliding_window_pattern", None) or 2
+        is_sliding = (layer_idx % pattern) != (pattern - 1)
+        sliding_window = getattr(config, "sliding_window", None) if is_sliding else None
+
         self.self_attn = GemmaAttention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
@@ -33,6 +40,9 @@ class Gemma2DecoderLayer(nn.Module):
             max_position=config.max_position_embeddings,
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, 'rope_theta', 10000),
+            query_pre_attn_scalar=getattr(config, "query_pre_attn_scalar", None),
+            attn_logit_softcapping=getattr(config, "attn_logit_softcapping", None),
+            sliding_window=sliding_window,
         )
         self.mlp = GemmaMLP(
             hidden_size=config.hidden_size,
@@ -108,8 +118,8 @@ class Gemma2Model(nn.Module):
             config.vocab_size, config.hidden_size
         )
         self.layers = nn.ModuleList([
-            Gemma2DecoderLayer(config)
-            for _ in range(config.num_hidden_layers)
+            Gemma2DecoderLayer(config, layer_idx)
+            for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 

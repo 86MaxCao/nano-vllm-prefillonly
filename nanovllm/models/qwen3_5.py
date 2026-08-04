@@ -25,7 +25,7 @@ from nanovllm.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from nanovllm.layers.rotary_embedding import get_rope
+from nanovllm.layers.rotary_embedding import get_rope, rope_params_from_config
 from nanovllm.models.qwen3_next import (
     Qwen3NextRMSNorm,
     Qwen3NextRMSNormGated,
@@ -1138,9 +1138,9 @@ class Qwen3_5TextDecoderLayerMerged(nn.Module):
         config,
     ) -> None:
         super().__init__()
-        rope_scaling = getattr(config, "rope_scaling", None)
-        if isinstance(rope_scaling, dict):
-            rope_scaling = None
+        rope_theta, rope_scaling = rope_params_from_config(
+            config, default_theta=1000000
+        )
 
         self.self_attn = Qwen3_5TextAttentionMerged(
             hidden_size=config.hidden_size,
@@ -1150,7 +1150,7 @@ class Qwen3_5TextDecoderLayerMerged(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, "attention_bias", True),
             head_dim=getattr(config, "head_dim", None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
+            rope_theta=rope_theta,
             rope_scaling=rope_scaling,
         )
         self.mlp = Qwen3_5TextMLPMerged(
@@ -1171,9 +1171,9 @@ class Qwen3_5TextDecoderLayer(nn.Module):
         layer_idx: int = 0,
     ) -> None:
         super().__init__()
-        rope_scaling = getattr(config, "rope_scaling", None)
-        if isinstance(rope_scaling, dict):
-            rope_scaling = None
+        rope_theta, rope_scaling = rope_params_from_config(
+            config, default_theta=1000000
+        )
 
         self.layer_idx = layer_idx
         # Support layer_types (full_attention or linear_attention)
@@ -1196,7 +1196,7 @@ class Qwen3_5TextDecoderLayer(nn.Module):
                 rms_norm_eps=config.rms_norm_eps,
                 qkv_bias=getattr(config, "attention_bias", False),
                 head_dim=getattr(config, "head_dim", None),
-                rope_theta=getattr(config, "rope_theta", 1000000),
+                rope_theta=rope_theta,
                 rope_scaling=rope_scaling,
                 config=config,
             )

@@ -13,7 +13,7 @@ from nanovllm.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from nanovllm.layers.rotary_embedding import get_rope
+from nanovllm.layers.rotary_embedding import get_rope, rope_params_from_config
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 from nanovllm.utils.loader import sharded_weight_loader
 
@@ -974,9 +974,9 @@ class Qwen3NextDecoderLayer(nn.Module):
         layer_idx: int = 0,
     ) -> None:
         super().__init__()
-        rope_scaling = getattr(config, "rope_scaling", None)
-        if isinstance(rope_scaling, dict):
-            rope_scaling = None  # TODO: MRoPE support
+        rope_theta, rope_scaling = rope_params_from_config(
+            config, default_theta=1000000
+        )
 
         # layer_types: "full_attention" or "linear_attention" per layer (vllm/transformers)
         layer_types = getattr(config, "layer_types", None)
@@ -994,7 +994,7 @@ class Qwen3NextDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
                 qkv_bias=getattr(config, 'attention_bias', False),
             head_dim=getattr(config, 'head_dim', None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
+            rope_theta=rope_theta,
             rope_scaling=rope_scaling,
         )
             self.linear_attn = None

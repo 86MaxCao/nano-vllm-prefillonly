@@ -5,7 +5,6 @@ from transformers import Qwen3Config
 from nanovllm.layers.linear import ReplicatedLinear
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.jina_reranker_v3_model import JinaRerankerV3Model
-from nanovllm.layers.flex_attention import parse_jina_v3_structure
 
 
 class JinaRerankerV3(nn.Module):

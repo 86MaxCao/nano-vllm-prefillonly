@@ -59,9 +59,11 @@ class Qwen3Embedding(nn.Module):
             seq_len = input_ids.shape[-1]
             hidden_states = hidden_states.view(batch_size, seq_len, -1)
 
-        embeddings = self.pooler(hidden_states, attention_mask)
+        # Pool and normalise in float32; a bf16 L2 norm loses precision on
+        # large hidden sizes and is what the reference implementations do.
+        embeddings = self.pooler(hidden_states.to(torch.float32), attention_mask)
 
         if self.normalize:
-            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=-1)
 
         return embeddings

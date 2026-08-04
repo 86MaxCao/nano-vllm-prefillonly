@@ -7,7 +7,7 @@ from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
-from nanovllm.layers.rotary_embedding import get_rope
+from nanovllm.layers.rotary_embedding import get_rope, rope_params_from_config
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
 
@@ -123,12 +123,9 @@ class Qwen3DecoderLayer(nn.Module):
         config: Qwen3Config,
     ) -> None:
         super().__init__()
-        # Handle rope_scaling: HF configs may store it as a dict with rope_theta inside
-        rope_scaling = getattr(config, "rope_scaling", None)
-        rope_theta = getattr(config, "rope_theta", 1000000)
-        if isinstance(rope_scaling, dict):
-            rope_theta = rope_scaling.get("rope_theta", rope_theta)
-            rope_scaling = None
+        rope_theta, rope_scaling = rope_params_from_config(
+            config, default_theta=1000000
+        )
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,

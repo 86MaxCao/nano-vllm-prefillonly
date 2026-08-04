@@ -45,6 +45,7 @@ from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanovllm.layers.layernorm import RMSNorm
+from nanovllm.layers.rotary_embedding import rope_params_from_config
 from nanovllm.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -282,12 +283,9 @@ class Qwen2VLTextDecoderLayer(nn.Module):
         config,
     ) -> None:
         super().__init__()
-        rope_scaling = getattr(config, "rope_scaling", None)
-        rope_theta = getattr(config, "rope_theta", 1000000)
-        # Handle dict config: rope_theta may be nested inside rope_scaling
-        if isinstance(rope_scaling, dict):
-            rope_theta = rope_scaling.get("rope_theta", rope_theta)
-            rope_scaling = None
+        rope_theta, rope_scaling = rope_params_from_config(
+            config, default_theta=1000000
+        )
         
         self.self_attn = Qwen2VLTextAttention(
             config=config,
@@ -693,6 +691,15 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         if self.vision_config is None: raise ValueError("vision_config missing")
 
         self.visual = create_vision_model(self.vision_config)
+        # tie_word_embeddings is declared on the top-level config for these
+        # checkpoints, but the text sub-config drives the language model; carry
+        # it across so the lm_head is tied instead of left uninitialised.
+        if not hasattr(self.text_config, "tie_word_embeddings") or getattr(
+            self.text_config, "tie_word_embeddings", None
+        ) is None:
+            self.text_config.tie_word_embeddings = getattr(
+                config, "tie_word_embeddings", False
+            )
         self.language_model = Qwen2VLTextForCausalLM(self.text_config)
         self.packed_modules_mapping = {
             "mlp.gate_proj": ("mlp.gate_up_proj", 0), "mlp.up_proj": ("mlp.gate_up_proj", 1),

@@ -23,7 +23,7 @@ from nanovllm.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from nanovllm.layers.rotary_embedding import get_rope
+from nanovllm.layers.rotary_embedding import get_rope, rope_params_from_config
 
 
 # ---------------------------------------------------------------------------
@@ -143,9 +143,9 @@ class Qwen3VLTextDecoderLayer(nn.Module):
         config,
     ) -> None:
         super().__init__()
-        rope_scaling = getattr(config, "rope_scaling", None)
-        if isinstance(rope_scaling, dict):
-            rope_scaling = None
+        rope_theta, rope_scaling = rope_params_from_config(
+            config, default_theta=1000000
+        )
 
         self.self_attn = Qwen3VLTextAttention(
             hidden_size=config.hidden_size,
@@ -155,7 +155,7 @@ class Qwen3VLTextDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, "attention_bias", True),
             head_dim=getattr(config, "head_dim", None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
+            rope_theta=rope_theta,
             rope_scaling=rope_scaling,
         )
         self.mlp = Qwen3VLTextMLP(
@@ -228,7 +228,9 @@ class Qwen3VLTextModel(nn.Module):
                 if visual_pos_mask is not None:
                     if mask_tensor is None:
                         mask_tensor = visual_pos_mask.bool()
-                    if mask_tensor.sum().item() != ds.size(0):
+                    # Compare on-device; .item() would synchronise on every
+                    # DeepStack layer of every forward pass.
+                    if mask_tensor.sum() != ds.size(0):
                         raise ValueError("DeepStack features do not match the visual mask length")
                     hidden_states[mask_tensor] += ds
                 else:
@@ -845,6 +847,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             raise ValueError("vision_config is missing; cannot build a multimodal model")
 
         self.visual = create_vision_model(self.vision_config)
+        # tie_word_embeddings is declared on the top-level config for these
+        # checkpoints, but the text sub-config drives the language model; carry
+        # it across so the lm_head is tied instead of left uninitialised.
+        if not hasattr(self.text_config, "tie_word_embeddings") or getattr(
+            self.text_config, "tie_word_embeddings", None
+        ) is None:
+            self.text_config.tie_word_embeddings = getattr(
+                config, "tie_word_embeddings", False
+            )
         self.language_model = Qwen3VLTextForCausalLM(self.text_config)
 
         # print("[Qwen3VLForConditionalGeneration] Initialization complete")
@@ -1207,15 +1218,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                                         ], dim=0)
                                         deepstack_collect[layer_idx].append(layer_concat)
             else:
-                # Fallback: original logic (assumes one image per sequence)
-                # if not hasattr(self, '_debug_fallback_original_logged'):
-                    # print(
-                        # f"[DEBUG qwen3vl.forward (fallback)] "
-                        # f"WARNING: No seq_image_indices, using original 1:1 mapping "
-                        # f"(assumes one image per sequence)"
-                    # )
-                    # self._debug_fallback_original_logged = True
-
+                # Fallback when per-sequence image indices are unavailable:
+                # assume one image chunk per sequence, in order.
                 image_iter = iter(image_chunks)
                 deepstack_iter = [iter(layer) for layer in deepstack_layers_raw] if deepstack_layers_raw else None
 
@@ -1229,24 +1233,24 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     except StopIteration:
                         break
 
-                token_slice = token_slice.to(inputs_embeds.device, inputs_embeds.dtype)
-                slice_len = token_slice.size(0)
-                if slice_len > seq_length:
-                    raise ValueError("Visual tokens exceed the available sequence length")
+                    token_slice = token_slice.to(inputs_embeds.device, inputs_embeds.dtype)
+                    slice_len = token_slice.size(0)
+                    if slice_len > seq_length:
+                        raise ValueError("Visual tokens exceed the available sequence length")
 
-                inputs_embeds[start : start + slice_len] = token_slice
-                visual_pos_mask[start : start + slice_len] = True
-                total_replaced += slice_len
+                    inputs_embeds[start : start + slice_len] = token_slice
+                    visual_pos_mask[start : start + slice_len] = True
+                    total_replaced += slice_len
 
-                if deepstack_iter:
-                    if deepstack_collect is None:
-                        deepstack_collect = [[] for _ in deepstack_layers_raw]
-                    for layer_idx, iterator in enumerate(deepstack_iter):
-                        try:
-                            layer_slice = next(iterator).to(inputs_embeds.device, inputs_embeds.dtype)
-                        except StopIteration:
-                            continue
-                        deepstack_collect[layer_idx].append(layer_slice)
+                    if deepstack_iter:
+                        if deepstack_collect is None:
+                            deepstack_collect = [[] for _ in deepstack_layers_raw]
+                        for layer_idx, iterator in enumerate(deepstack_iter):
+                            try:
+                                layer_slice = next(iterator).to(inputs_embeds.device, inputs_embeds.dtype)
+                            except StopIteration:
+                                continue
+                            deepstack_collect[layer_idx].append(layer_slice)
 
             if deepstack_collect is not None:
                 hidden_dim = inputs_embeds.size(-1)
@@ -1331,7 +1335,6 @@ def load_qwen3_vl_model(model_path, config):
         if weight_name.startswith("model.visual."):
             sub_name = weight_name[len("model.visual.") :]
             return "visual.vision." + sub_name
-            return None
 
     load_model(model, model_path, name_mapping=name_mapping)
     return model

@@ -75,6 +75,9 @@ class GemmaAttention(nn.Module):
         max_position: int = 8192,
         head_dim: int | None = None,
         rope_theta: float = 10000,
+        query_pre_attn_scalar: int | None = None,
+        attn_logit_softcapping: float | None = None,
+        sliding_window: int | None = None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -90,7 +93,9 @@ class GemmaAttention(nn.Module):
         self.head_dim = head_dim or hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim ** -0.5
+        # Gemma2 normalises queries by query_pre_attn_scalar, which can differ
+        # from head_dim (e.g. 256 vs 256 for 9B but not for every variant).
+        self.scaling = (query_pre_attn_scalar or self.head_dim) ** -0.5
         
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -115,6 +120,8 @@ class GemmaAttention(nn.Module):
             self.head_dim,
             self.scaling,
             self.num_kv_heads,
+            softcap=attn_logit_softcapping or 0.0,
+            sliding_window=sliding_window,
         )
     
     def forward(

@@ -136,8 +136,9 @@ class GemmaReranker(GemmaForCausalLM):
         # Get the dtype and device of the model weights
         model_dtype = embed_weight.dtype
         model_device = embed_weight.device
-        # Use [[token_id]] to keep 2D shape, matching vLLM approach
-        score_weight = embed_weight[[token_id]].to(torch.float32).to(model_dtype)  # [1, hidden_size]
+        # Single-row extraction with no arithmetic, so no float32 round-trip is
+        # needed. Keep 2D shape ([1, hidden_size]) to match score_head.weight.
+        score_weight = embed_weight[[token_id]].clone()
         
         # Create score_head and load the converted weight
         self.score_head = ReplicatedLinear(

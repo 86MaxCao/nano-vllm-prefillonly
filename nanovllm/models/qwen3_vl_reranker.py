@@ -44,14 +44,11 @@ class Qwen3VLReranker(Qwen3VLForConditionalGeneration):
                 bias=False,
             )
         else:
-            # Original reranker: create temporary lm_head for weight loading
+            # Original reranker: scores come from the yes/no token embeddings,
+            # which convert_from_original_reranker() reads off the language
+            # model's existing (possibly tied) lm_head or embed_tokens.
             assert len(self.classifier_from_token) == 2, \
                 "Original Qwen3-VL-Reranker requires exactly 2 tokens (e.g., ['no', 'yes'])"
-            from nanovllm.layers.embed_head import ParallelLMHead
-            self.language_model.lm_head = ParallelLMHead(
-                self.text_config.vocab_size,
-                self.text_config.hidden_size
-            )
 
     def forward(
         self,

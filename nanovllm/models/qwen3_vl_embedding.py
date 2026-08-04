@@ -87,12 +87,13 @@ class Qwen3VLEmbedding(Qwen3VLForConditionalGeneration):
         )
         torch.cumsum(seq_lens_tensor, dim=0, out=cu_seqlens[1:])
 
-        # Extract last token embeddings using cu_seqlens
-        last_token_indices = cu_seqlens[1:] - 1  # [batch_size]
-        embeddings = hidden_states[last_token_indices]  # [batch_size, hidden_size]
+        # Pool with the configured method; forward_varlen understands the
+        # cu_seqlens boundaries of the packed hidden states. Upcast first so
+        # mean pooling accumulates in full precision.
+        embeddings = self.pooler.forward_varlen(
+            hidden_states.to(torch.float32), cu_seqlens
+        )
 
-        # Normalize
-        embeddings = embeddings.to(torch.float32)
         if self.normalize:
             embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=-1)
 
