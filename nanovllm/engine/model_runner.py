@@ -1,3 +1,4 @@
+import logging
 import pickle
 import torch
 import torch.distributed as dist
@@ -6,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
+from nanovllm.engine import model_loader as _model_loader
 from nanovllm.engine.model_loader import (
     ModelLoader,
     get_torch_dtype,
@@ -13,11 +15,16 @@ from nanovllm.engine.model_loader import (
     infer_embedding_type,
     infer_reranker_type,
     infer_multimodal_model_type,
-    MULTIMODAL_AVAILABLE,
 )
 from nanovllm.engine.multimodal_handler import MultimodalHandler
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
+
+
+logger = logging.getLogger(__name__)
+
+# Size of the shared-memory buffer used to broadcast RPCs to TP workers.
+SHM_SIZE = 2**20
 
 
 class GDNSlotManager:
@@ -29,6 +36,14 @@ class GDNSlotManager:
         self._free_slots: list[int] = list(range(max_slots - 1, -1, -1))
 
     def allocate(self, seq_id: int) -> int:
+        existing = self._seq_to_slot.get(seq_id)
+        if existing is not None:
+            return existing
+        if not self._free_slots:
+            raise RuntimeError(
+                f"GDN state pool exhausted: all {self.max_slots} slots are in "
+                f"use. Lower max_num_seqs or raise the pool size."
+            )
         slot = self._free_slots.pop()
         self._seq_to_slot[seq_id] = slot
         return slot
@@ -108,7 +123,7 @@ class ModelRunner:
         # Note: Only set is_multimodal if NOT embedding/reranker (they handle multimodal separately)
         self.is_multimodal = (
             getattr(config, "is_multimodal", False) 
-            and MULTIMODAL_AVAILABLE
+            and _model_loader.MULTIMODAL_AVAILABLE
             and not self.is_embedding
             and not self.is_reranker
         )
@@ -174,7 +189,7 @@ class ModelRunner:
         if self.is_embedding or self.is_reranker:
             model_dtype = next(self.model.parameters()).dtype
             if model_dtype == torch.float32:
-                print(f"[WARNING] Model dtype is still {model_dtype} after loading, converting to float16 for FlashAttention compatibility")
+                logger.warning("Model dtype is still %s after loading; converting to float16 for FlashAttention compatibility", model_dtype)
                 self.model = self.model.to(torch.float16)
                 # Explicitly clear cache to free the float32 model memory
                 torch.cuda.empty_cache()
@@ -204,7 +219,7 @@ class ModelRunner:
                     self.shm = SharedMemory(
                         name="nanovllm",
                         create=True,
-                        size=2**20,
+                        size=SHM_SIZE,
                     )
                 except FileExistsError:
                     # Shared memory already exists, try to open it
@@ -248,7 +263,7 @@ class ModelRunner:
         assert self.world_size > 1 and self.rank > 0
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
-        data = pickle.loads(self.shm.buf[4:n+4])
+        data = pickle.loads(bytes(self.shm.buf[4:n + 4]))
         method_name = data[0]
         # Last element is kwargs if it's a dict, otherwise all remaining are args
         if len(data) > 1 and isinstance(data[-1], dict):
@@ -258,16 +273,29 @@ class ModelRunner:
             args = tuple(data[1:])
             kwargs = {}
         self.event.clear()
+        # Tell rank 0 the buffer is free for the next message.
+        if dist.is_initialized():
+            dist.barrier()
         return method_name, args, kwargs
 
     def write_shm(self, method_name, *args, **kwargs):
         assert self.world_size > 1 and self.rank == 0
         data = pickle.dumps([method_name, *args, kwargs])
         n = len(data)
+        if n + 4 > SHM_SIZE:
+            raise RuntimeError(
+                f"Tensor-parallel payload for '{method_name}' is {n} bytes, "
+                f"exceeding the {SHM_SIZE}-byte shared-memory buffer. Reduce "
+                f"max_num_seqs or max_num_batched_tokens."
+            )
         self.shm.buf[0:4] = n.to_bytes(4, "little")
-        self.shm.buf[4:n+4] = data
+        self.shm.buf[4:n + 4] = data
         for event in self.event:
             event.set()
+        # Wait until every worker has copied the message out of the buffer,
+        # otherwise a rapid follow-up call would overwrite it mid-read.
+        if dist.is_initialized():
+            dist.barrier()
 
     def call(self, method_name, *args, **kwargs):
         if self.world_size > 1 and self.rank == 0:
@@ -299,7 +327,13 @@ class ModelRunner:
 
     @torch.inference_mode()
     def _warmup_embed_rerank(self):
-        """Warmup embed/rerank models by running a dummy forward pass to trigger torch.compile."""
+        """Trigger torch.compile with a dummy forward pass.
+
+        Warmup is an optimisation, not a correctness requirement: models that
+        wrap a transformers implementation expect batched ``[batch, seq]``
+        inputs rather than the varlen layout used here, so a failure here is
+        logged and ignored.
+        """
         torch.cuda.empty_cache()
         dummy_len = 32
         dummy_input_ids = torch.zeros(dummy_len, dtype=torch.long)
@@ -311,6 +345,13 @@ class ModelRunner:
                 self.model.model(dummy_input_ids, dummy_positions)
             else:
                 self.model(dummy_input_ids, dummy_positions)
+        except Exception as exc:  # noqa: BLE001 - warmup is best-effort
+            logger.debug(
+                "Skipping warmup for %s: %s: %s",
+                type(self.model).__name__,
+                type(exc).__name__,
+                exc,
+            )
         finally:
             reset_context()
         torch.cuda.empty_cache()
@@ -382,28 +423,19 @@ class ModelRunner:
             gdn._pool_conv_state[idx] = gdn._graph_conv_state[:bs]
 
     def allocate_kv_cache(self):
-        # Reranker and embedding models don't need KV cache (prefill-only)
-        # Check both config flags and instance flags for safety
-        config_is_reranker = getattr(self.config, "is_reranker", False)
-        config_is_embedding = getattr(self.config, "is_embedding", False)
-        if config_is_reranker or config_is_embedding or self.is_reranker or self.is_embedding:
-            self.kv_cache = None
-            # Explicitly set num_kvcache_blocks to 0 for reranker/embedding models
-            # to prevent any downstream code from trying to use it
-            self.config.num_kvcache_blocks = 0
-            return
-        
-        # Prefill-only single-token generation doesn't need KV cache
-        # Since we only generate one token, we don't need decode-phase KV cache
-        # Prefill phase can use temporary cache without pre-allocation
-        config_prefill_only = getattr(self.config, "prefill_only_mode", False)
-        config_single_token = getattr(self.config, "single_token_mode", False)
-        if config_prefill_only and config_single_token:
-            self.kv_cache = None
-            self.config.num_kvcache_blocks = 0
-            return
-        
+        """Allocate paged KV cache, unless this engine never decodes.
+
+        Prefill-only workloads (embedding, reranking, single-token generation)
+        run one forward pass per sequence, so the cache would only ever be
+        written and never read.
+        """
         config = self.config
+        if config.prefill_only_mode:
+            self.kv_cache = None
+            config.num_kvcache_blocks = 0
+            logger.debug("Prefill-only mode: skipping KV cache allocation")
+            return
+
         hf_config = config.hf_config
         text_config = getattr(hf_config, "text_config", hf_config)
         free, total = torch.cuda.mem_get_info()
@@ -449,34 +481,9 @@ class ModelRunner:
         # Ensure head_dim is not None
         if head_dim is None:
             head_dim = 128  # Default fallback
-        dtype = getattr(
-            text_config,
-            "torch_dtype",
-            getattr(hf_config, "torch_dtype", torch.float16),
-        )
-        # Handle different dtype formats
-        if dtype is None:
-            dtype = torch.float16  # Default fallback
-        elif isinstance(dtype, str):
-            # Convert string dtype to torch.dtype
-            # Handle special cases like "auto", "float16", "bfloat16", etc.
-            dtype_str = dtype  # Save original string
-            if dtype_str == "auto":
-                dtype = torch.float16  # Default for "auto"
-            else:
-                # Try to get from torch module first
-                dtype = getattr(torch, dtype_str, None)
-                if dtype is None or not isinstance(dtype, torch.dtype):
-                    # Try with different naming (e.g., "float16" -> torch.float16)
-                    dtype_map = {
-                        "float16": torch.float16,
-                        "bfloat16": torch.bfloat16,
-                        "float32": torch.float32,
-                    }
-                    dtype = dtype_map.get(dtype_str.lower(), torch.float16)
-        # Ensure dtype is a valid torch.dtype, not None
-        if dtype is None or not isinstance(dtype, torch.dtype):
-            dtype = torch.float16  # Final fallback
+        # Match the loaded weights rather than the config, which may disagree
+        # (e.g. torch_dtype="auto") and would break the attention kernel.
+        dtype = self.model_dtype
         
         # Get num_hidden_layers, handle llavanext which may not have it in
         # text_config
@@ -671,14 +678,23 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
-        temperatures = []
-        for seq in seqs:
-            temperatures.append(seq.temperature)
         temperatures = (
-            torch.tensor(temperatures, dtype=torch.float32, pin_memory=True)
+            torch.tensor(
+                [seq.temperature for seq in seqs],
+                dtype=torch.float32,
+                pin_memory=True,
+            )
             .cuda(non_blocking=True)
         )
-        return temperatures
+        top_p = (
+            torch.tensor(
+                [getattr(seq, "top_p", 1.0) for seq in seqs],
+                dtype=torch.float32,
+                pin_memory=True,
+            )
+            .cuda(non_blocking=True)
+        )
+        return temperatures, top_p
     
     def expand_batch_to_tokens(
         self,
@@ -688,6 +704,15 @@ class ModelRunner:
         """Expand [batch_size] tensor to [num_tokens] tensor based on sequence_lengths."""
         repeats = torch.tensor(sequence_lengths, device=x.device)
         return torch.repeat_interleave(x, repeats)
+
+    def _select_last_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Reduce varlen-packed hidden states to one row per sequence."""
+        context = get_context()
+        if not context.is_prefill or context.cu_seqlens_q is None:
+            # Decode already produces exactly one row per sequence.
+            return hidden_states
+        last_indices = context.cu_seqlens_q[1:].long() - 1
+        return hidden_states[last_indices].contiguous()
 
     @torch.inference_mode()
     def run_model(
@@ -699,7 +724,8 @@ class ModelRunner:
         vision_slices_per_seq: list[list[dict]] | None = None,
         seqs: list[Sequence] | None = None,
     ):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        max_graph_bs = self.graph_bs[-1] if getattr(self, "graph_bs", None) else 0
+        if is_prefill or self.enforce_eager or input_ids.size(0) > max_graph_bs:
             model_kwargs = {}
             
             # Determine if we should process multimodal inputs
@@ -735,12 +761,12 @@ class ModelRunner:
             
             # For embedding models, forward() returns embeddings directly
             # For reranker models, forward() returns hidden_states (no logits)
-            # For language models, forward() returns hidden_states and needs
-            # compute_logits
+            # For language models, project only the final hidden state of each
+            # sequence so logits are always [batch_size, vocab].
             if self.is_embedding or self.is_reranker:
                 return outputs
             elif hasattr(self.model, 'compute_logits'):
-                return self.model.compute_logits(outputs)
+                return self.model.compute_logits(self._select_last_tokens(outputs))
             else:
                 return outputs
         else:
@@ -798,10 +824,7 @@ class ModelRunner:
         
         model_kwargs["sequence_lengths"] = sequence_lengths
         
-        config_prefill_only = getattr(self.config, "prefill_only_mode", False)
-        config_single_token = getattr(self.config, "single_token_mode", False)
-        
-        if config_prefill_only and config_single_token and seqs is not None:
+        if self.config.prefill_only_mode and seqs is not None:
             model_kwargs.update(MultimodalHandler.prepare_prefill_only_inputs(self.model, seqs))
             model_kwargs["sequence_lengths"] = sequence_lengths
         elif vision_slices_per_seq is not None:
@@ -903,44 +926,64 @@ class ModelRunner:
     ) -> tuple[list[tuple[int, int]], list[list[tuple[int, int]]]]:
         """Build seq_image_indices and seq_vision_placeholders for multimodal embed/rerank.
 
+        Each sequence's share of `image_grid_thw` comes from its own placeholder
+        tokens; a uniform images-per-sequence split would misassign grids as soon
+        as the batch mixes single- and multi-image inputs.
+
         Returns:
             seq_image_indices: [(start_idx, end_idx), ...] per sequence
             seq_vision_placeholders: [[(offset, n_tokens), ...], ...] per sequence
         """
-        seq_image_indices = []
-        seq_vision_placeholders = []
+        if image_grid_thw is None:
+            return (
+                [(0, 0) for _ in range(batch_size)],
+                [[] for _ in range(batch_size)],
+            )
 
-        if image_grid_thw is not None:
-            num_images = image_grid_thw.shape[0]
-            images_per_seq = num_images // batch_size if batch_size > 0 else 0
-            merge_size = getattr(self.model, 'visual', None)
-            if merge_size and hasattr(merge_size, 'config'):
-                spatial_merge = merge_size.config.spatial_merge_size
-            else:
-                spatial_merge = 2
-            placeholder_token_id = self._image_token_id
-
-            for i in range(batch_size):
-                start_idx = i * images_per_seq
-                end_idx = start_idx + images_per_seq
-                seq_image_indices.append((start_idx, end_idx))
-                img_grids = image_grid_thw[start_idx:end_idx]
-                n_vis_tokens = int((img_grids.prod(-1) // (spatial_merge ** 2)).sum().item())
-                seq_input_ids = input_ids[i]
-                if attention_mask is not None:
-                    seq_tokens_actual = seq_input_ids[attention_mask[i].bool()]
-                else:
-                    seq_tokens_actual = seq_input_ids
-                placeholder_positions = (seq_tokens_actual == placeholder_token_id).nonzero(as_tuple=True)[0]
-                if len(placeholder_positions) > 0:
-                    offset_in_seq = int(placeholder_positions[0].item())
-                    seq_vision_placeholders.append([(offset_in_seq, n_vis_tokens)])
-                else:
-                    seq_vision_placeholders.append([(0, n_vis_tokens)])
+        visual = getattr(self.model, "visual", None)
+        if visual is not None and hasattr(visual, "config"):
+            spatial_merge = visual.config.spatial_merge_size
         else:
-            for i in range(batch_size):
-                seq_image_indices.append((0, 0))
+            spatial_merge = 2
+        placeholder_token_id = self._image_token_id
+
+        # Tokens contributed by each image, in checkpoint order.
+        tokens_per_image = (image_grid_thw.prod(-1) // (spatial_merge**2)).tolist()
+        num_images = len(tokens_per_image)
+
+        seq_image_indices: list[tuple[int, int]] = []
+        seq_vision_placeholders: list[list[tuple[int, int]]] = []
+        next_image = 0
+        for i in range(batch_size):
+            seq_input_ids = input_ids[i]
+            if attention_mask is not None:
+                seq_tokens_actual = seq_input_ids[attention_mask[i].bool()]
+            else:
+                seq_tokens_actual = seq_input_ids
+            placeholder_positions = (
+                seq_tokens_actual == placeholder_token_id
+            ).nonzero(as_tuple=True)[0]
+            n_placeholders = int(placeholder_positions.numel())
+
+            # Consume images until they cover this sequence's placeholders.
+            start_idx = next_image
+            covered = 0
+            while covered < n_placeholders and next_image < num_images:
+                covered += tokens_per_image[next_image]
+                next_image += 1
+            seq_image_indices.append((start_idx, next_image))
+
+            if n_placeholders > 0:
+                offset_in_seq = int(placeholder_positions[0].item())
+                seq_vision_placeholders.append([(offset_in_seq, covered)])
+            else:
                 seq_vision_placeholders.append([])
+
+        if next_image != num_images:
+            raise ValueError(
+                f"{num_images - next_image} image grid(s) had no matching "
+                f"placeholder tokens in the batch"
+            )
 
         return seq_image_indices, seq_vision_placeholders
 
@@ -975,7 +1018,7 @@ class ModelRunner:
         if model_dtype not in (torch.float16, torch.bfloat16):
             # Try to convert model to fp16 if it's fp32
             if model_dtype == torch.float32:
-                print(f"[WARNING] Model dtype is {model_dtype}, converting to float16 for FlashAttention compatibility")
+                logger.warning("Model dtype is %s; converting to float16 for FlashAttention compatibility", model_dtype)
                 self.model = self.model.to(torch.float16)
                 model_dtype = torch.float16
                 # Explicitly clear cache to free the float32 model memory
@@ -1215,7 +1258,7 @@ class ModelRunner:
         if model_dtype not in (torch.float16, torch.bfloat16):
             # Try to convert model to fp16 if it's fp32
             if model_dtype == torch.float32:
-                print(f"[WARNING] Model dtype is {model_dtype}, converting to float16 for FlashAttention compatibility")
+                logger.warning("Model dtype is %s; converting to float16 for FlashAttention compatibility", model_dtype)
                 self.model = self.model.to(torch.float16)
                 model_dtype = torch.float16
                 # Explicitly clear cache to free the float32 model memory
@@ -1638,7 +1681,10 @@ class ModelRunner:
                     seq.cached_vision_tokens = None
                     seq.cached_deepstack_tokens = None
 
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        if self.rank == 0:
+            temperatures, top_p = self.prepare_sample(seqs)
+        else:
+            temperatures = top_p = None
         logits = self.run_model(
             input_ids,
             positions,
@@ -1653,9 +1699,7 @@ class ModelRunner:
         # cache tensors so they can be garbage collected. Do NOT call
         # torch.cuda.empty_cache() here - it thrashes the CUDA memory pool and
         # causes expensive re-allocations on every iteration.
-        config_prefill_only = getattr(self.config, "prefill_only_mode", False)
-        config_single_token = getattr(self.config, "single_token_mode", False)
-        if config_prefill_only and config_single_token:
+        if self.config.prefill_only_mode:
             # Clear GPU memory used by vision slices immediately after use
             if vision_slices_per_seq:
                 for slices in vision_slices_per_seq:
@@ -1677,49 +1721,12 @@ class ModelRunner:
                     seq.cached_deepstack_tokens = None
         
         if self.rank == 0:
-            # Expand temperatures from batch format to varlen format if needed
-            # Check if logits and temperatures shapes are compatible
-            if logits.dim() == 2 and temperatures.dim() == 1:
-                logits_num_tokens = logits.shape[0]
-                temperatures_batch_size = temperatures.shape[0]
-                
-                # If shapes don't match, we need to expand temperatures
-                if logits_num_tokens != temperatures_batch_size:
-                    # Get sequence_lengths if not available
-                    if sequence_lengths is None and is_prefill:
-                        sequence_lengths = [
-                            len(seq) - seq.num_cached_tokens for seq in seqs
-                        ]
-                    
-                    # Check if we can expand
-                    if sequence_lengths is not None:
-                        expected_total = sum(sequence_lengths)
-                        if expected_total == logits_num_tokens:
-                            # Expand temperatures to varlen
-                            temperatures_varlen = self.expand_batch_to_tokens(
-                                temperatures, sequence_lengths
-                            )
-                            token_ids = self.sampler(logits, temperatures_varlen).tolist()
-                        else:
-                            # Shape mismatch - this is an error condition
-                            raise ValueError(
-                                f"logits shape {logits.shape} doesn't match "
-                                f"expected total tokens {expected_total} from "
-                                f"sequence_lengths {sequence_lengths}"
-                            )
-                    else:
-                        # Cannot expand without sequence_lengths
-                        raise ValueError(
-                            f"Cannot expand temperatures: logits has {logits_num_tokens} "
-                            f"tokens but temperatures has {temperatures_batch_size} values, "
-                            f"and sequence_lengths is not available"
-                        )
-                else:
-                    # Shapes match - use as-is
-                    token_ids = self.sampler(logits, temperatures).tolist()
-            else:
-                # Unexpected dimensions - use as-is (fallback)
-                token_ids = self.sampler(logits, temperatures).tolist()
+            if logits.size(0) != len(seqs):
+                raise RuntimeError(
+                    f"expected one logits row per sequence, got "
+                    f"{tuple(logits.shape)} for {len(seqs)} sequences"
+                )
+            token_ids = self.sampler(logits, temperatures, top_p).tolist()
         else:
             token_ids = None
         reset_context()
@@ -1809,9 +1816,7 @@ class ModelRunner:
         # Since sequences are short, we don't need chunked prefill, so vision cache
         # is unnecessary. Instead, we'll pass pixel_values directly to the model
         # which will compute vision tokens on-the-fly (fallback path).
-        config_prefill_only = getattr(self.config, "prefill_only_mode", False)
-        config_single_token = getattr(self.config, "single_token_mode", False)
-        if config_prefill_only and config_single_token:
+        if self.config.prefill_only_mode:
             # Don't cache vision tokens - save memory by avoiding GPU->CPU->GPU transfer
             # Keep pixel_values and image_grid_thw so they can be passed to model
             # The model's forward method has a fallback path that accepts pixel_values
