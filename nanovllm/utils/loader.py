@@ -1,51 +1,117 @@
+"""Weight loading utilities.
+
+Loading is deliberately strict: a checkpoint that does not fully populate the
+model is a hard error. Silently tolerating mismatches leaves parameters holding
+uninitialised memory, which surfaces later as unexplainable accuracy loss.
+"""
 import inspect
+import logging
 import os
-import re
 from glob import glob
+
 import torch
 from safetensors import safe_open
 
+logger = logging.getLogger(__name__)
 
-def default_weight_loader(param, loaded_weight):
-    try:
-        if param.shape != loaded_weight.shape:
-            raise ValueError(f"Shape mismatch: {param.shape} vs {loaded_weight.shape}")
-        param.data.copy_(loaded_weight)
-    except Exception as e:
-        # 兼容一些特殊情况，有时候default loader可能接收多余参数，这里做个简单处理
-        pass
+
+class WeightLoadError(RuntimeError):
+    """Raised when a checkpoint cannot be mapped onto the model."""
+
+
+def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor):
+    if param.shape != loaded_weight.shape:
+        if param.numel() != loaded_weight.numel():
+            raise WeightLoadError(
+                f"Shape mismatch: parameter {tuple(param.shape)} vs "
+                f"checkpoint {tuple(loaded_weight.shape)}"
+            )
+        loaded_weight = loaded_weight.view(param.shape)
+    param.data.copy_(loaded_weight)
 
 
 def sharded_weight_loader(shard_axis: int):
+    """Shard `loaded_weight` along `shard_axis` by tensor-parallel rank.
+
+    Used for parameters such as GatedDeltaNet's ``A_log`` and ``dt_bias`` that
+    are stored unsharded in the checkpoint.
     """
-    Return a weight loader that shards loaded_weight along shard_axis by TP rank
-    (vLLM-style). Use for A_log, dt_bias when tensor_parallel_size > 1.
-    """
-    def loader(param, loaded_weight):
+
+    def loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor):
         tp_rank = 0
-        try:
-            import torch.distributed as dist
-            if dist.is_initialized():
-                tp_rank = dist.get_rank()
-        except Exception:
-            pass
+        tp_size = 1
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            tp_rank = torch.distributed.get_rank()
+            tp_size = torch.distributed.get_world_size()
         shard_size = param.data.shape[shard_axis]
-        start_idx = tp_rank * shard_size
-        loaded_shard = loaded_weight.narrow(shard_axis, start_idx, shard_size)
+        full_size = loaded_weight.shape[shard_axis]
+        if shard_size * tp_size != full_size:
+            raise WeightLoadError(
+                f"Cannot shard axis {shard_axis}: checkpoint size {full_size} is "
+                f"not {tp_size} x parameter size {shard_size}"
+            )
+        loaded_shard = loaded_weight.narrow(shard_axis, tp_rank * shard_size, shard_size)
         param.data.copy_(loaded_shard)
+
     return loader
 
 
-def load_model(model, path, name_mapping=None):
-    # 1. 获取模型的合并映射规则
-    # 格式通常是: {'q_proj': ('qkv_proj', 'q'), 'up_proj': ('gate_up_proj', 'up'), ...}
+def _matches_component(weight_name: str, key: str) -> bool:
+    """Match `key` against dot-delimited component boundaries of `weight_name`.
+
+    Plain substring matching would let ``proj`` collide with ``q_proj``. Keys may
+    span several components (``mlp.gate_proj``) and some models write them with
+    leading dots to anchor a substring match, so normalise both sides to
+    component lists before comparing.
+    """
+    parts = weight_name.split(".")
+    key_parts = [p for p in key.split(".") if p]
+    n = len(key_parts)
+    if n == 0:
+        return False
+    return any(parts[i : i + n] == key_parts for i in range(len(parts) - n + 1))
+
+
+def _resolve_packed(weight_name: str, target_name: str, packed_modules_mapping: dict):
+    """Return ``(search_names, shard_id)`` for a possibly packed parameter."""
+    for source_key, (target_key, shard_id) in packed_modules_mapping.items():
+        if _matches_component(weight_name, source_key):
+            return [target_name.replace(source_key, target_key)], shard_id
+    return [target_name], None
+
+
+def _tied_parameter_names(named_params: dict) -> dict:
+    """Group parameter names by the storage they share.
+
+    Weight tying (``lm_head`` reusing ``embed_tokens``) means one checkpoint
+    tensor legitimately covers several named parameters.
+    """
+    by_storage: dict[int, list[str]] = {}
+    for name, param in named_params.items():
+        by_storage.setdefault(param.data_ptr(), []).append(name)
+    return by_storage
+
+
+def load_model(model: torch.nn.Module, path: str, name_mapping=None):
+    """Load safetensors weights from `path` into `model`.
+
+    Raises:
+        WeightLoadError: if no checkpoint is found, a tensor cannot be copied,
+            or any model parameter is left unpopulated.
+    """
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
 
-    model_params = dict(model.named_parameters())
-    model_keys = set(model_params.keys())
+    named_params = dict(model.named_parameters())
+    model_keys = set(named_params.keys())
+    loaded_names: set[str] = set()
+    unmatched_checkpoint_keys: list[str] = []
 
-    for file in glob(os.path.join(path, "*.safetensors")):
-        print(f"Loading weights from {file}...")
+    files = sorted(glob(os.path.join(path, "*.safetensors")))
+    if not files:
+        raise WeightLoadError(f"No .safetensors files found in {path}")
+
+    for file in files:
+        logger.info("Loading weights from %s", file)
         with safe_open(file, "pt", "cpu") as f:
             for weight_name in f.keys():
                 target_name = weight_name
@@ -54,44 +120,16 @@ def load_model(model, path, name_mapping=None):
                     if target_name is None:
                         continue
 
-                # 2. 初始化 shard_id
-                shard_id = None
-
-                # 视觉层通常不参与这种合并，先排除
-                is_vision = "visual" in weight_name.lower() or "vision" in weight_name.lower()
-
-                search_names = []
-
-                if not is_vision:
-                    # --- 核心修复逻辑开始 ---
-                    # 检查当前权重名是否在 packed_modules_mapping 的 key 中
-                    # 例如 weight_name 是 "model.layers.0.self_attn.q_proj.weight"
-                    # 我们要找它是否包含 "q_proj"
-
-                    found_packing = False
-                    for source_key, (target_key, s_id) in packed_modules_mapping.items():
-                        # 使用简单的字符串包含判断，或者更严谨的正则
-                        # 这里假设 source_key (如 'q_proj') 是 weight_name 的一部分
-                        if source_key in weight_name:
-                            # 构造合并后的名字：把 q_proj 换成 qkv_proj
-                            packed_name = target_name.replace(source_key, target_key)
-                            search_names.append(packed_name)
-
-                            # 【关键】记录 shard_id，比如 'q' 或 'up'
-                            shard_id = s_id
-                            found_packing = True
-                            # 找到了就跳出，防止匹配到多个
-                            # (注意：如果 key 存在包含关系，如 'proj' 和 'q_proj'，需要小心顺序，通常 Qwen 的 key 区分度很高)
-                            break
-
-                    if not found_packing:
-                        # 没命中合并规则，尝试普通加载逻辑 (比如 output.weight)
-                        search_names.append(target_name)
-                    # --- 核心修复逻辑结束 ---
+                is_vision = (
+                    "visual" in weight_name.lower() or "vision" in weight_name.lower()
+                )
+                if is_vision:
+                    search_names, shard_id = [target_name], None
                 else:
-                    search_names.append(target_name)
+                    search_names, shard_id = _resolve_packed(
+                        weight_name, target_name, packed_modules_mapping
+                    )
 
-                # 3. 寻找参数对象
                 found_param_name = None
                 for name in search_names:
                     if name in model_keys:
@@ -101,30 +139,84 @@ def load_model(model, path, name_mapping=None):
                         found_param_name = f"model.{name}"
                         break
 
-                if found_param_name:
-                    param = model.get_parameter(found_param_name)
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                if found_param_name is None:
+                    unmatched_checkpoint_keys.append(weight_name)
+                    continue
 
-                    tensor = f.get_tensor(weight_name)
-                    if tensor.dtype != param.dtype:
-                        tensor = tensor.to(param.dtype)
+                param = named_params[found_param_name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                tensor = f.get_tensor(weight_name)
+                if tensor.dtype != param.dtype:
+                    tensor = tensor.to(param.dtype)
 
-                    # 4. 调用 loader
+                try:
                     if shard_id is not None:
                         weight_loader(param, tensor, shard_id)
                     else:
                         sig = inspect.signature(weight_loader)
-                        if len(sig.parameters) >= 3 and "loaded_shard_id" in sig.parameters:
-                            module = getattr(weight_loader, "__self__", None)
-                            if module is not None and hasattr(module, "output_sizes"):
-                                # Single merged tensor (e.g. gate_up_proj, in_proj_qkv): split and load each shard
-                                output_sizes = module.output_sizes
-                                offset = 0
-                                for s_id, size in enumerate(output_sizes):
-                                    part = tensor.narrow(0, offset, size)
-                                    weight_loader(param, part, s_id)
-                                    offset += size
-                            else:
-                                weight_loader(param, tensor, 0)
+                        takes_shard_id = (
+                            len(sig.parameters) >= 3
+                            and "loaded_shard_id" in sig.parameters
+                        )
+                        module = getattr(weight_loader, "__self__", None)
+                        if takes_shard_id and module is not None and hasattr(
+                            module, "output_sizes"
+                        ):
+                            # A single merged checkpoint tensor (gate_up_proj,
+                            # in_proj_qkv): split it and load each shard.
+                            offset = 0
+                            for s_id, size in enumerate(module.output_sizes):
+                                weight_loader(param, tensor.narrow(0, offset, size), s_id)
+                                offset += size
+                        elif takes_shard_id:
+                            weight_loader(param, tensor, 0)
                         else:
                             weight_loader(param, tensor)
+                except Exception as exc:
+                    raise WeightLoadError(
+                        f"Failed to load checkpoint tensor '{weight_name}' into "
+                        f"parameter '{found_param_name}' "
+                        f"(param {tuple(param.shape)}, tensor {tuple(tensor.shape)}): {exc}"
+                    ) from exc
+
+                loaded_names.add(found_param_name)
+
+    _verify_coverage(named_params, model_keys, loaded_names)
+
+    if unmatched_checkpoint_keys:
+        preview = ", ".join(sorted(unmatched_checkpoint_keys)[:10])
+        logger.warning(
+            "%d checkpoint tensor(s) had no matching parameter and were ignored: %s%s",
+            len(unmatched_checkpoint_keys),
+            preview,
+            "..." if len(unmatched_checkpoint_keys) > 10 else "",
+        )
+
+
+def _verify_coverage(named_params: dict, model_keys: set, loaded_names: set):
+    """Fail if any parameter was never written to by the checkpoint."""
+    missing = model_keys - loaded_names
+    if not missing:
+        return
+
+    # Tied weights share storage with a parameter that was loaded.
+    by_storage = _tied_parameter_names(named_params)
+    still_missing = []
+    for name in sorted(missing):
+        siblings = by_storage.get(named_params[name].data_ptr(), [])
+        if any(sibling in loaded_names for sibling in siblings):
+            continue
+        still_missing.append(name)
+
+    if still_missing:
+        preview = "\n  ".join(still_missing[:20])
+        suffix = (
+            f"\n  ... and {len(still_missing) - 20} more"
+            if len(still_missing) > 20
+            else ""
+        )
+        raise WeightLoadError(
+            f"{len(still_missing)} parameter(s) were not initialised from the "
+            f"checkpoint; the model would run on uninitialised memory:\n  "
+            f"{preview}{suffix}"
+        )
