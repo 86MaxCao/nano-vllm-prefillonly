@@ -273,7 +273,6 @@ def test_memory_comparison(model_path: Optional[str] = None):
         enforce_eager=True,
         tensor_parallel_size=1,
         prefill_only_mode=True,
-        single_token_mode=True,
     )
 
     prompts = ["Is the capital of China Beijing? Answer with Yes or No."] * 10
@@ -304,7 +303,6 @@ def test_memory_comparison(model_path: Optional[str] = None):
         enforce_eager=True,
         tensor_parallel_size=1,
         prefill_only_mode=False,
-        single_token_mode=True,
     )
 
     _ = llm_original.generate_single_token(
@@ -766,7 +764,6 @@ class ComprehensiveGenerationTest(ComprehensiveTestBase):
             enforce_eager=True,
             tensor_parallel_size=1,
             prefill_only_mode=True,  # Optimized version
-            single_token_mode=True,
             seed=0,  # Set seed for reproducibility
         )
         
@@ -817,7 +814,6 @@ class ComprehensiveGenerationTest(ComprehensiveTestBase):
             enforce_eager=True,
             tensor_parallel_size=1,
             prefill_only_mode=False,  # Original version
-            single_token_mode=True,
             seed=0,  # Set seed for reproducibility
         )
         
@@ -1128,7 +1124,6 @@ class ComprehensiveMultimodalGenerationTest(ComprehensiveTestBase):
             enforce_eager=True,
             tensor_parallel_size=1,
             prefill_only_mode=True,
-            single_token_mode=True,
             seed=0,
             trust_remote_code=True,
         )
@@ -1227,7 +1222,6 @@ class ComprehensiveMultimodalGenerationTest(ComprehensiveTestBase):
             enforce_eager=True,
             tensor_parallel_size=1,
             prefill_only_mode=False,
-            single_token_mode=True,
             seed=0,
             trust_remote_code=True,
         )
