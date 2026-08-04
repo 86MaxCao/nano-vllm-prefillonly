@@ -18,6 +18,11 @@ class Sequence:
     block_size = 256
     counter = count()
 
+    @classmethod
+    def configure(cls, block_size: int):
+        """Align sequence block geometry with the engine's KV cache block size."""
+        cls.block_size = block_size
+
     def __init__(
         self,
         token_ids: list[int],
@@ -37,6 +42,7 @@ class Sequence:
         self.num_cached_tokens = 0
         self.block_table = []
         self.temperature = sampling_params.temperature
+        self.top_p = sampling_params.top_p
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         # Multimodal metadata
@@ -104,29 +110,32 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    # Tensor-parallel workers receive sequences by pickling. Ship every field
+    # the worker-side code reads (ids, sampling settings, scheduling state) but
+    # drop the multimodal payloads, which rank 0 handles and which would
+    # otherwise dominate the transfer.
+    _PICKLED_FIELDS = (
+        "seq_id",
+        "status",
+        "token_ids",
+        "last_token",
+        "num_tokens",
+        "num_prompt_tokens",
+        "num_cached_tokens",
+        "block_table",
+        "temperature",
+        "top_p",
+        "max_tokens",
+        "ignore_eos",
+    )
+
     def __getstate__(self):
-        return (
-            self.num_tokens,
-            self.num_prompt_tokens,
-            self.num_cached_tokens,
-            self.block_table,
-            self.token_ids
-            if self.num_completion_tokens == 0
-            else self.last_token,
-        )
+        return {name: getattr(self, name) for name in self._PICKLED_FIELDS}
 
     def __setstate__(self, state):
-        (
-            self.num_tokens,
-            self.num_prompt_tokens,
-            self.num_cached_tokens,
-            self.block_table,
-        ) = state[:-1]
-        if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
-        else:
-            self.last_token = state[-1]
-        # Reset multimodal caches when the sequence is restored.
+        for name in self._PICKLED_FIELDS:
+            setattr(self, name, state[name])
+        # Multimodal payloads are not transferred to workers.
         self.images = None
         self.pixel_values = None
         self.image_grid_thw = None
