@@ -3,9 +3,7 @@ import os
 
 import pytest
 
-MODEL_ROOT = os.environ.get(
-    "NANOVLLM_TEST_MODEL_ROOT", "/mnt/nas-tbt/tbt/checkpoint/hf_cache"
-)
+MODEL_ROOT = os.environ.get("NANOVLLM_TEST_MODEL_ROOT")
 
 MODELS = {
     "qwen3": "Qwen3-0.6B",
@@ -23,6 +21,12 @@ MODELS = {
 
 def model_path(key: str) -> str:
     """Resolve a logical model key to an on-disk path, skipping if absent."""
+    if not MODEL_ROOT:
+        pytest.skip(
+            "NANOVLLM_TEST_MODEL_ROOT is not set; point it at a directory "
+            "containing the HuggingFace checkpoints listed in tests/conftest.py "
+            "(e.g. Qwen3-0.6B, Qwen3-VL-Embedding-2B, ...)"
+        )
     name = MODELS.get(key, key)
     path = os.path.join(MODEL_ROOT, name)
     if not os.path.isdir(path):

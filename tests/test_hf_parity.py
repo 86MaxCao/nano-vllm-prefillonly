@@ -1,10 +1,10 @@
-"""Golden accuracy tests: compare nano-vllm-prefillonly against Transformers.
+"""HF parity tests: compare nano-vllm-prefillonly against Transformers.
 
 These are the regression net for weight loading, attention, RoPE, and pooling.
 They need GPU + local model weights and are therefore marked `slow`.
 
 Run with:
-    pytest tests/test_golden.py -m slow -v
+    pytest tests/test_hf_parity.py -m slow -v
 """
 import pytest
 
@@ -227,6 +227,69 @@ def test_multimodal_embedding_is_discriminative(model_key):
     same = cosine(embeds[0], embeds[1])
     diff = cosine(embeds[0], embeds[2])
     assert same > diff, f"same={same:.4f} diff={diff:.4f}"
+
+
+@pytest.mark.parametrize("model_key", ["qwen3_vl_embedding"])
+def test_mixed_image_and_text_embedding_batch(model_key):
+    """A mixed batch must not disturb the image request's embedding."""
+    requires_cuda()
+    from PIL import Image
+
+    from nanovllm import LLM
+
+    path = model_path(model_key)
+    llm = LLM(
+        path,
+        multimodal_model_type="qwen3_vl",
+        is_embedding=True,
+        embedding_type="qwen3_vl",
+        enforce_eager=True,
+    )
+    try:
+        img = Image.new("RGB", (224, 224), color=(200, 30, 30))
+        img_prompt, text_prompt = "Describe the image.", "plain text query"
+
+        alone_img = llm.embed_batch([img_prompt], images=[img]).float().cpu()
+        together = llm.embed_batch(
+            [img_prompt, text_prompt], images=[img]
+        ).float().cpu()
+    finally:
+        llm.exit()
+
+    assert together.shape == (2, alone_img.shape[1])
+    sim = cosine(together[0], alone_img[0]).item()
+    assert sim > 0.999, f"image request changed in mixed batch: {sim:.6f}"
+
+
+@pytest.mark.parametrize("model_key", ["qwen3_vl_embedding"])
+def test_none_image_entry_is_text_only(model_key):
+    """images=[img, None] must embed the second entry as plain text."""
+    requires_cuda()
+    from PIL import Image
+
+    from nanovllm import LLM
+
+    path = model_path(model_key)
+    llm = LLM(
+        path,
+        multimodal_model_type="qwen3_vl",
+        is_embedding=True,
+        embedding_type="qwen3_vl",
+        enforce_eager=True,
+    )
+    try:
+        img = Image.new("RGB", (224, 224), color=(30, 30, 200))
+        texts = ["Describe the image.", "plain text query"]
+
+        got = llm.embed_batch(texts, images=[img, None]).float().cpu()
+        # Reference goes through the same multimodal branch (chat template
+        # applied); embed_batch without images would not.
+        ref_text = llm.embed_batch([texts[1]], images=[None]).float().cpu()
+    finally:
+        llm.exit()
+
+    sim = cosine(got[1], ref_text[0]).item()
+    assert sim > 0.999, f"None-image entry drifted: {sim:.6f}"
 
 
 def test_batch_invariance_for_embeddings():
