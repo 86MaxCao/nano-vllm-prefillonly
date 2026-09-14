@@ -101,6 +101,7 @@ All three tasks — classification, embedding, and reranking — are **prefill-o
 * 🎯 **Industrial-Scale Ready** - Designed for high-throughput discriminative inference
 * 🔧 **Based on nano-vllm** - Built on top of the clean, readable nano-vllm codebase
 * 🧩 **[Hybrid Prefilling](https://arxiv.org/abs/2505.07203)** - Chunk MLP execution to reduce peak activation memory by **70%+** for long video understanding (see [`feat/hybrid-prefilling`](../../tree/feat/hybrid-prefilling) branch)
+* 🔢 **M-RoPE Support** - Native multimodal 3D rotary position embedding (t/h/w) for Qwen3-VL and Qwen2.5-VL, covering both the interleaved (`mrope_interleaved`) and chunked layouts — verified bit-exact against HF Transformers
 
 ## 📊 Performance Benchmarks
 
