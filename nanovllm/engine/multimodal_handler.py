@@ -181,6 +181,50 @@ class MultimodalHandler:
                             ig = ig.view(-1, 3)
                         ig_tensors_2d.append(ig)
                     model_kwargs["image_grid_thw"] = torch.cat(ig_tensors_2d, dim=0)
+        elif any(pv is not None for pv in pixel_values_list):
+            # Mixed image/text batch: only the image requests contribute
+            # tensors. seq_image_indices is built from the per-sequence grids,
+            # so text-only sequences get an empty image range and the mapping
+            # stays correct as long as the concatenated tensors keep request
+            # order. Passing nothing here would leave the image requests'
+            # placeholder tokens without vision input (silently wrong output).
+            pv_tensors = []
+            for pv in pixel_values_list:
+                if pv is None:
+                    continue
+                if not isinstance(pv, torch.Tensor):
+                    raise ValueError(f"pixel_values must be torch.Tensor, got {type(pv)}")
+                if pv.device != model_device or pv.dtype != vision_dtype:
+                    pv = pv.to(device=model_device, dtype=vision_dtype, non_blocking=True)
+                pv_tensors.append(pv)
+
+            if len(pv_tensors) == 1:
+                model_kwargs["pixel_values"] = pv_tensors[0]
+            else:
+                shapes = [pv.shape for pv in pv_tensors]
+                if len(set(shapes)) == 1:
+                    model_kwargs["pixel_values"] = torch.stack(pv_tensors, dim=0)
+                else:
+                    model_kwargs["pixel_values"] = torch.cat(pv_tensors, dim=0)
+            del pv_tensors
+
+            ig_tensors_2d = []
+            for ig in image_grid_thw_list:
+                if ig is None:
+                    continue
+                if isinstance(ig, torch.Tensor):
+                    if ig.device != model_device:
+                        ig = ig.to(model_device, non_blocking=True)
+                else:
+                    raise ValueError(f"image_grid_thw must be torch.Tensor, got {type(ig)}")
+                if ig.dim() == 1:
+                    ig = ig.unsqueeze(0)
+                elif ig.dim() == 3:
+                    ig = ig.view(-1, 3)
+                elif ig.dim() != 2:
+                    raise ValueError(f"image_grid_thw must be [n, 3], got shape {tuple(ig.shape)}")
+                ig_tensors_2d.append(ig)
+            model_kwargs["image_grid_thw"] = torch.cat(ig_tensors_2d, dim=0)
 
         model_kwargs["vision_slices_per_seq"] = None
         model_kwargs["seq_image_indices"] = seq_image_indices

@@ -197,6 +197,121 @@ def test_multimodal_generation_matches_transformers(model_key):
     assert got == expected, f"token mismatch: {got} != {expected}"
 
 
+@pytest.mark.parametrize("model_key", ["qwen3_vl"])
+def test_mixed_image_and_text_generation_batch(model_key):
+    """A text-only request in the same batch must not disturb the image request.
+
+    Regression test: `prepare_prefill_only_inputs` used to drop pixel_values
+    whenever any request in the batch had no image, so the image request was
+    answered as if it were text-only. Purple requires vision to answer.
+    """
+    requires_cuda()
+    from PIL import Image
+    from transformers import AutoProcessor
+
+    from nanovllm import LLM, SamplingParams
+
+    path = model_path(model_key)
+    processor = AutoProcessor.from_pretrained(path)
+
+    img = Image.new("RGB", (224, 224), color=(128, 0, 128))
+    question = "What is the dominant color? Answer in one word."
+
+    def image_request():
+        return {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": img},
+                        {"type": "text", "text": question},
+                    ],
+                }
+            ],
+            "images": [img],
+        }
+
+    text_request = {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Hello!"}]}
+        ],
+    }
+
+    llm = LLM(path, multimodal_model_type=model_key, enforce_eager=True)
+    try:
+        params = SamplingParams(temperature=0.0, max_tokens=1)
+        alone = llm.generate_multimodal(
+            [image_request()], params, processor, use_tqdm=False
+        )
+        together = llm.generate_multimodal(
+            [image_request(), text_request], params, processor, use_tqdm=False
+        )
+    finally:
+        llm.exit()
+
+    assert len(together) == 2
+    assert (
+        together[0]["token_ids"] == alone[0]["token_ids"]
+    ), f"image request changed when batched with text: {together[0]} vs {alone[0]}"
+    # The text-only request must still produce a valid token.
+    assert len(together[1]["token_ids"]) == 1
+
+
+@pytest.mark.parametrize("model_key", ["qwen3_vl", "qwen2_5_vl"])
+def test_multi_image_single_request_matches_transformers(model_key):
+    """Two images in one message must land in their own placeholder ranges."""
+    requires_cuda()
+    from PIL import Image
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    from nanovllm import LLM, SamplingParams
+
+    path = model_path(model_key)
+    processor = AutoProcessor.from_pretrained(path)
+
+    img_red = Image.new("RGB", (224, 224), color=(200, 30, 30))
+    img_blue = Image.new("RGB", (224, 224), color=(30, 30, 200))
+    question = "What color is the second image? Answer in one word."
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": img_red},
+                {"type": "image", "image": img_blue},
+                {"type": "text", "text": question},
+            ],
+        }
+    ]
+
+    hf = AutoModelForImageTextToText.from_pretrained(
+        path, dtype=torch.bfloat16, attn_implementation="flash_attention_2"
+    ).cuda().eval()
+    with torch.inference_mode():
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = processor(
+            text=[text], images=[img_red, img_blue], return_tensors="pt"
+        ).to("cuda")
+        expected = int(hf(**inputs).logits[0, -1].argmax())
+    del hf
+    torch.cuda.empty_cache()
+
+    llm = LLM(path, multimodal_model_type=model_key, enforce_eager=True)
+    try:
+        results = llm.generate_multimodal(
+            [{"messages": messages, "images": [img_red, img_blue]}],
+            SamplingParams(temperature=0.0, max_tokens=1),
+            processor,
+            use_tqdm=False,
+        )
+    finally:
+        llm.exit()
+
+    got = results[0]["token_ids"][0]
+    assert got == expected, f"token mismatch: {got} != {expected}"
+
+
 @pytest.mark.parametrize("model_key", ["qwen3_vl_embedding"])
 def test_multimodal_embedding_is_discriminative(model_key):
     """Same-colour images must embed closer to each other than to a different one."""

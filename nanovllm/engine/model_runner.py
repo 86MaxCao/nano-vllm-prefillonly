@@ -104,6 +104,7 @@ class ModelRunner:
                 )
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
+        default_device = torch.get_default_device()
         torch_dtype = get_torch_dtype(hf_config)
         torch.set_default_dtype(torch_dtype)
         torch.set_default_device("cuda")
@@ -214,7 +215,7 @@ class ModelRunner:
         finally:
             # Restore the process-global defaults even if initialisation
             # fails halfway (model load, warmup, KV allocation, OOM).
-            torch.set_default_device("cpu")
+            torch.set_default_device(default_device)
             torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
@@ -978,8 +979,25 @@ class ModelRunner:
             seq_image_indices.append((start_idx, next_image))
 
             if n_placeholders > 0:
-                offset_in_seq = int(placeholder_positions[0].item())
-                seq_vision_placeholders.append([(offset_in_seq, covered)])
+                if covered != n_placeholders:
+                    raise ValueError(
+                        f"sequence {i}: placeholder token count ({n_placeholders}) "
+                        f"does not match the assigned image grids' token count "
+                        f"({covered})"
+                    )
+                # One placeholder range per image, in order. Each image takes
+                # tokens_per_image[j] consecutive placeholder tokens, which is
+                # what the model-side placement and M-RoPE position building
+                # both consume.
+                seq_placeholders = []
+                consumed = 0
+                for j in range(start_idx, next_image):
+                    n = tokens_per_image[j]
+                    seq_placeholders.append(
+                        (int(placeholder_positions[consumed].item()), n)
+                    )
+                    consumed += n
+                seq_vision_placeholders.append(seq_placeholders)
             else:
                 seq_vision_placeholders.append([])
 

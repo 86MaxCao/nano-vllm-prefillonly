@@ -1134,76 +1134,37 @@ class Qwen2_5VLForConditionalGeneration(nn.Module):
                     if seq_vision_placeholders and seq_idx < len(seq_vision_placeholders):
                         placeholders = seq_vision_placeholders[seq_idx]
                         if placeholders:
-                            # Use the first placeholder's offset (typically there's only one)
-                            if len(placeholders) == 1:
-                                target_offset, expected_length = placeholders[0]
-                                if expected_length != slice_len:
-                                    pass  # length mismatch is non-fatal
-
+                            # One placeholder range per image: place each
+                            # image's tokens at that image's own offset.
+                            if len(placeholders) != len(seq_image_embeds):
+                                raise ValueError(
+                                    f"Sequence {seq_idx}: {len(placeholders)} "
+                                    f"placeholder range(s) do not match "
+                                    f"{len(seq_image_embeds)} image(s)"
+                                )
+                            for (target_offset, expected_length), emb in zip(
+                                placeholders, seq_image_embeds
+                            ):
+                                chunk_tokens = emb.to(
+                                    inputs_embeds.device, inputs_embeds.dtype
+                                )
+                                chunk_len = chunk_tokens.size(0)
+                                if expected_length != chunk_len:
+                                    raise ValueError(
+                                        f"Sequence {seq_idx}: placeholder "
+                                        f"length {expected_length} does not "
+                                        f"match image token count {chunk_len}"
+                                    )
                                 target_start = start + target_offset
-                                target_end = target_start + slice_len
+                                target_end = target_start + chunk_len
                                 if target_end > end:
                                     raise ValueError(
                                         f"Visual token target range [{target_start}, {target_end}) "
                                         f"is out of sequence bounds [{start}, {end})"
                                     )
-                                
-                                # if not hasattr(self, f'_debug_placement_{seq_idx}_logged'):
-                                    # print(
-                                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
-                                        # f"=== Sequence {seq_idx} Vision Token Placement ==="
-                                    # )
-                                    # print(
-                                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
-                                        # f"Sequence {seq_idx}: placing {slice_len} vision tokens "
-                                        # f"at offset {target_offset} (absolute position {target_start}:{target_end}), "
-                                        # f"images [{img_start_idx}:{img_end_idx}]"
-                                    # )
-                                    # print(
-                                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
-                                        # f"Sequence {seq_idx}: seq_vision_tokens shape={seq_vision_tokens.shape}, "
-                                        # f"dtype={seq_vision_tokens.dtype}, device={seq_vision_tokens.device}"
-                                    # )
-                                    # print(
-                                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
-                                        # f"Sequence {seq_idx}: seq_vision_tokens[0, 0:5] (first token, first 5 dims):\n"
-                                        # f"{seq_vision_tokens[0, 0:5].cpu().tolist()}"
-                                    # )
-                                    # # Log inputs_embeds before replacement
-                                    # print(
-                                        # f"[DEBUG qwen2.5vl.forward (fallback)] "
-                                        # f"Sequence {seq_idx}: inputs_embeds[{target_start}:{target_start+3}, 0:3] "
-                                        # f"BEFORE replacement:\n"
-                                        # f"{inputs_embeds[target_start:target_start+3, 0:3].cpu().tolist()}"
-                                    # )
-                                    # setattr(self, f'_debug_placement_{seq_idx}_logged', True)
-
-                                inputs_embeds[target_start:target_end] = seq_vision_tokens
+                                inputs_embeds[target_start:target_end] = chunk_tokens
                                 visual_pos_mask[target_start:target_end] = True
-                                total_replaced += slice_len
-                                
-                                # Log inputs_embeds after replacement (only for first sequence)
-                                if seq_idx == 0 and not hasattr(self, f'_debug_after_replacement_{seq_idx}_logged'):
-                                    print(
-                                        f"[DEBUG qwen2.5vl.forward (fallback)] "
-                                        f"Sequence {seq_idx}: inputs_embeds[{target_start}:{target_start+3}, 0:3] "
-                                        f"AFTER replacement:\n"
-                                        f"{inputs_embeds[target_start:target_start+3, 0:3].cpu().tolist()}"
-                                    )
-                                    setattr(self, f'_debug_after_replacement_{seq_idx}_logged', True)
-                            else:
-                                # Multiple placeholders - use first one
-                                target_offset, expected_length = placeholders[0]
-                                target_start = start + target_offset
-                                target_end = target_start + slice_len
-                                if target_end > end:
-                                    raise ValueError(
-                                        f"Visual token target range [{target_start}, {target_end}) "
-                                        f"is out of sequence bounds [{start}, {end})"
-                                    )
-                                inputs_embeds[target_start:target_end] = seq_vision_tokens
-                                visual_pos_mask[target_start:target_end] = True
-                                total_replaced += slice_len
+                                total_replaced += chunk_len
                         else:
                             # No placeholders for this sequence - fallback to beginning
                             inputs_embeds[start : start + slice_len] = seq_vision_tokens

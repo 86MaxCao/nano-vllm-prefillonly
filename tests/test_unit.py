@@ -260,6 +260,56 @@ class TestBlockManager:
         assert seq.block_table == []
 
 
+class TestVisionPlaceholders:
+    """_build_vision_placeholders must reject inconsistent batches.
+
+    A silent mismatch between placeholder tokens, image grids, and their
+    token counts previously produced misaligned multimodal input instead
+    of an error.
+    """
+
+    IMAGE_TOKEN = 151655
+
+    def _runner(self):
+        from types import SimpleNamespace
+
+        from nanovllm.engine.model_runner import ModelRunner
+
+        class FakeConfig:
+            spatial_merge_size = 2
+
+        fake_model = SimpleNamespace(
+            visual=SimpleNamespace(config=FakeConfig()),
+            _image_token_id=None,
+        )
+        fake = SimpleNamespace(
+            model=fake_model, _image_token_id=self.IMAGE_TOKEN
+        )
+        return ModelRunner._build_vision_placeholders.__get__(fake)
+
+    def test_multi_image_per_sequence(self):
+        """Two images in one sequence map to two placeholder ranges."""
+        grids = torch.tensor([[1, 8, 12], [1, 6, 6]])  # 24 and 9 tokens
+        ids = [1, 2] + [self.IMAGE_TOKEN] * 24 + [5, 6] + [self.IMAGE_TOKEN] * 9 + [7]
+        indices, placeholders = self._runner()(
+            torch.tensor([ids]), None, grids, 1
+        )
+        assert indices == [(0, 2)]
+        assert placeholders == [[(2, 24), (28, 9)]]
+
+    def test_placeholder_count_mismatch_raises(self):
+        grids = torch.tensor([[1, 8, 12]])  # 24 tokens
+        ids = [1, 2] + [self.IMAGE_TOKEN] * 23 + [3]  # one token short
+        with pytest.raises(ValueError, match="does not match"):
+            self._runner()(torch.tensor([ids]), None, grids, 1)
+
+    def test_grid_without_placeholder_raises(self):
+        grids = torch.tensor([[1, 8, 12], [1, 6, 6]])
+        ids = [1, 2] + [self.IMAGE_TOKEN] * 24 + [3]  # second image unmatched
+        with pytest.raises(ValueError, match="no matching"):
+            self._runner()(torch.tensor([ids]), None, grids, 1)
+
+
 class TestEosHandling:
     def test_scheduler_accepts_list_eos(self):
         """Some configs expose `eos_token_id` as a list of ids."""
