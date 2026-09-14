@@ -98,6 +98,28 @@ class RotaryEmbedding(nn.Module):
         cache = torch.cat((freqs.cos(), freqs.sin()), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
+        # Multimodal RoPE: map each frequency slot (rotary_dim // 2 of them)
+        # to the position component that supplies it: 0=temporal, 1=height,
+        # 2=width. Qwen3-VL interleaves the components across slots
+        # (THWTHW...TT), Qwen2-VL/Qwen2.5-VL chunks them (TTT...HHH...WWW).
+        self.mrope_section: list[int] | None = None
+        comp = None
+        if rope_scaling is not None and rope_scaling.get("mrope_section") is not None:
+            section = [int(x) for x in rope_scaling["mrope_section"]]
+            comp = torch.zeros(rotary_dim // 2, dtype=torch.long)
+            if rope_scaling.get("mrope_interleaved"):
+                for dim in (1, 2):
+                    length = section[dim] * 3
+                    comp[dim:length:3] = dim
+            else:
+                comp[section[0] : section[0] + section[1]] = 1
+                comp[section[0] + section[1] :] = 2
+            self.mrope_section = section
+        self.register_buffer(
+            "mrope_component", comp if comp is not None else torch.zeros(0, dtype=torch.long),
+            persistent=False,
+        )
+
     @torch.compile
     def forward(
         self,
@@ -105,8 +127,25 @@ class RotaryEmbedding(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        cos_sin = self.cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
+        if positions.dim() == 2:
+            # Multimodal RoPE: positions is [3, num_tokens] (t, h, w).
+            comp = self.mrope_component
+            if comp.numel() != self.rotary_dim // 2:
+                raise ValueError(
+                    "mrope positions [3, N] require a rope with mrope_section configured"
+                )
+            cos_sin = self.cos_sin_cache[positions]  # [3, N, rotary_dim]
+            cos, sin = cos_sin.chunk(2, dim=-1)  # each [3, N, rotary_dim // 2]
+            # Slot j takes cos/sin of component comp[j].
+            cos = torch.where(
+                comp == 0, cos[0], torch.where(comp == 1, cos[1], cos[2])
+            )
+            sin = torch.where(
+                comp == 0, sin[0], torch.where(comp == 1, sin[1], sin[2])
+            )
+        else:
+            cos_sin = self.cos_sin_cache[positions]
+            cos, sin = cos_sin.chunk(2, dim=-1)
         if self.rotary_dim == self.head_size:
             return (
                 apply_rotary_emb(query, cos, sin),
@@ -121,6 +160,69 @@ class RotaryEmbedding(nn.Module):
             (apply_rotary_emb(key[..., :d], cos, sin), key[..., d:]), dim=-1
         )
         return query, key
+
+
+def build_mrope_positions(
+    sequence_lengths: list[int],
+    seq_vision_placeholders: list[list[tuple[int, int]]] | None,
+    image_grid_thw: torch.Tensor | None,
+    spatial_merge_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build ``[3, total_tokens]`` mrope position ids (t, h, w).
+
+    Mirrors HF ``get_rope_index`` for image-only inputs, which is the scheme
+    shared by Qwen2-VL/Qwen2.5-VL (chunked sections) and Qwen3-VL
+    (interleaved sections): text tokens get identical sequential ids in all
+    three components; image tokens get spatial ids and the running position
+    advances by ``max(h', w')`` per image. Placeholder offsets are relative to
+    the start of each sequence.
+    """
+    total = int(sum(sequence_lengths))
+    pos = torch.zeros(3, total, dtype=torch.long, device=device)
+    grids = image_grid_thw.tolist() if image_grid_thw is not None else []
+    image_idx = 0
+    base = 0
+    for seq_len, placeholders in zip(
+        sequence_lengths, seq_vision_placeholders or [[]] * len(sequence_lengths)
+    ):
+        cursor = 0
+        current_pos = 0
+        for offset, n_tokens in placeholders or []:
+            text_len = offset - cursor
+            if text_len > 0:
+                idx = torch.arange(
+                    current_pos, current_pos + text_len, device=device
+                )
+                pos[:, base + cursor : base + offset] = idx.unsqueeze(0)
+                current_pos += text_len
+            if image_idx >= len(grids):
+                raise ValueError("image_grid_thw has fewer images than placeholders")
+            t, h, w = (int(v) for v in grids[image_idx])
+            image_idx += 1
+            gh = h // spatial_merge_size
+            gw = w // spatial_merge_size
+            if n_tokens != t * gh * gw:
+                raise ValueError(
+                    f"placeholder length {n_tokens} does not match grid "
+                    f"tokens {t}x{gh}x{gw}"
+                )
+            seg = slice(base + offset, base + offset + n_tokens)
+            # Images have a single temporal frame: t is constant.
+            pos[0, seg] = current_pos
+            pos[1, seg] = (
+                torch.arange(gh, device=device) + current_pos
+            ).repeat_interleave(gw)
+            pos[2, seg] = (torch.arange(gw, device=device) + current_pos).repeat(gh)
+            current_pos += max(gh, gw)
+            cursor = offset + n_tokens
+        if cursor < seq_len:
+            idx = torch.arange(
+                current_pos, current_pos + (seq_len - cursor), device=device
+            )
+            pos[:, base + cursor : base + seq_len] = idx.unsqueeze(0)
+        base += seq_len
+    return pos
 
 
 @lru_cache(maxsize=None)

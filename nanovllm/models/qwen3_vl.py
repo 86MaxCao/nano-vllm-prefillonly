@@ -23,7 +23,11 @@ from nanovllm.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from nanovllm.layers.rotary_embedding import get_rope, rope_params_from_config
+from nanovllm.layers.rotary_embedding import (
+    build_mrope_positions,
+    get_rope,
+    rope_params_from_config,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1265,6 +1269,24 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if vision_token_count == 0:
             visual_pos_mask = None
             deepstack_layers = None
+
+        use_mrope = (
+            vision_token_count
+            and image_grid_thw is not None
+            and sequence_lengths is not None
+            and seq_vision_placeholders is not None
+            and any(seq_vision_placeholders)
+        )
+        if use_mrope:
+            visual_config = getattr(self.visual, "config", None)
+            spatial_merge = getattr(visual_config, "spatial_merge_size", 2) or 2
+            positions = build_mrope_positions(
+                sequence_lengths,
+                seq_vision_placeholders,
+                image_grid_thw,
+                spatial_merge,
+                inputs_embeds.device,
+            )
 
         if positions is None:
             positions = torch.arange(
