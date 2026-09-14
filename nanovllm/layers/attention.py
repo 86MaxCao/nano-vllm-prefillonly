@@ -6,10 +6,21 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
 
 logger = logging.getLogger(__name__)
+
+
+def _import_flash_attn():
+    """Import flash-attn lazily.
+
+    flash-attn needs a CUDA toolchain to build, so it may be absent on
+    CPU-only machines (e.g. CI). Importing it lazily lets the rest of
+    the package stay importable for weight-loading and config tests.
+    """
+    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+    return flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 @functools.lru_cache(maxsize=1)
@@ -23,6 +34,7 @@ def _paged_kvcache_is_usable() -> bool:
     """
     if not torch.cuda.is_available():
         return False
+    _, flash_attn_with_kvcache = _import_flash_attn()
     try:
         head_dim = 64
         q = torch.zeros(1, 1, 2, head_dim, dtype=torch.float16, device="cuda")
@@ -110,6 +122,7 @@ class Attention(nn.Module):
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
+        flash_attn_varlen_func, flash_attn_with_kvcache = _import_flash_attn()
         k_cache, v_cache = self.k_cache, self.v_cache
         if (k_cache.numel() and v_cache.numel() and
             context.slot_mapping is not None and

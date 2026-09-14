@@ -20,9 +20,12 @@ jobs:
       - name: Install CPU dependencies
         run: |
           python -m pip install --upgrade pip
-          # CPU-only torch keeps CI light; flash-attn/triton are not needed for
-          # the unit suite, which never touches CUDA.
+          # CPU-only torch keeps CI light; flash-attn needs a CUDA toolchain to
+          # build, so it is skipped — the unit suite never launches attention.
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install transformers safetensors numpy xxhash pytest
+          # Install the package without deps so `import nanovllm` resolves.
+          # triton is a module-level import in layers/attention.py.
+          pip install -e . --no-deps
+          pip install triton transformers safetensors numpy xxhash pillow huggingface_hub pytest
       - name: Run unit tests
         run: pytest tests/test_unit.py -v
