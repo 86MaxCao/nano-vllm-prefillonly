@@ -100,6 +100,8 @@ All three tasks — classification, embedding, and reranking — are **prefill-o
 * 💾 **Massive Memory Savings** - Up to **10x less memory** compared to original nano-vllm
 * 🎯 **Industrial-Scale Ready** - Designed for high-throughput discriminative inference
 * 🔧 **Based on nano-vllm** - Built on top of the clean, readable nano-vllm codebase
+* 🧩 **[Hybrid Prefilling](https://arxiv.org/abs/2505.07203)** - Chunk MLP execution to reduce peak activation memory by **70%+** for long video understanding (see [`feat/hybrid-prefilling`](../../tree/feat/hybrid-prefilling) branch)
+* 🔢 **M-RoPE Support** - Native multimodal 3D rotary position embedding (t/h/w) for Qwen3-VL and Qwen2.5-VL, covering both the interleaved (`mrope_interleaved`) and chunked layouts — verified bit-exact against HF Transformers
 
 ## 📊 Performance Benchmarks
 
@@ -172,7 +174,7 @@ vLLM constructs a `FlashAttentionMetadata` object every step, carrying `block_ta
 Our framework achieves faster model forward passes through multiple optimizations:
 
 1. **Varlen FlashAttention** (`flash_attn_varlen_func`): Concatenates all sequences into a single 1D tensor with `cu_seqlens` boundaries, eliminating padding waste and attention_mask overhead.
-2. **Vision Feature Caching**: Caches ViT encoder outputs to avoid redundant visual encoding for repeated or identical images.
+2. **Single-Pass Vision Encoding**: Each image is encoded once during its sequence's single prefill pass; there is no autoregressive re-encoding.
 3. **Fused Operators**: Per-operator `torch.compile` on RMSNorm, SiLU, RoPE, and Sampler.
 
 **Benchmark**: Qwen3-VL-2B-Instruct, batch=10, 224x224 images, NVIDIA H20.
@@ -226,18 +228,13 @@ pip install -e .
 ```python
 from nanovllm import LLM, SamplingParams
 
-llm = LLM("Qwen/Qwen3-0.6B")
-sp = SamplingParams(max_tokens=1)
+# max_tokens_hint=1 tells the engine you only need one token per prompt,
+# so it skips KV-cache allocation entirely.
+llm = LLM("Qwen/Qwen3-0.6B", max_tokens_hint=1)
+sp = SamplingParams(temperature=0.0, max_tokens=1)
 
 prompts = ["Is the Earth round? Answer Yes or No."] * 100
-for p in prompts:
-    llm.add_request(p, sp)
-
-outputs = {}
-while not llm.is_finished():
-    output, _ = llm.step()
-    for seq_id, token_ids in output:
-        outputs[seq_id] = token_ids
+tokens = llm.generate_single_token(prompts, sp)  # list[int], one per prompt
 ```
 
 ### Multimodal Generation
@@ -343,7 +340,7 @@ scores = llm.rerank_batch(pairs, images=images)  # [batch_size]
 - Accuracy matching with Transformers baseline
 
 **Known Limitations:**
-- jina-reranker-v3: Custom bidirectional architecture, causal varlen path adds overhead
+- Multi-token autoregressive decoding is out of scope. This engine is prefill-only (embedding, reranking, single-token generation). Some flash-attn builds have a broken paged-KV-cache kernel; when detected, `max_tokens > 1` is refused with a clear error rather than returning silently wrong tokens.
 - Full-graph `torch.compile` not yet supported (only per-operator compile)
 
 ## 🧩 Hybrid Prefilling (Long Video Understanding)

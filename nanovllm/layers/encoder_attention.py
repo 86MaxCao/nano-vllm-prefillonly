@@ -2,8 +2,14 @@
 import torch
 from torch import nn
 
-from flash_attn import flash_attn_varlen_func
 from nanovllm.utils.context import get_context
+
+
+def _import_flash_attn():
+    """Import flash-attn lazily so CPU-only environments can import this module."""
+    from flash_attn import flash_attn_varlen_func
+
+    return flash_attn_varlen_func
 
 
 class EncoderOnlyAttention(nn.Module):
@@ -25,6 +31,7 @@ class EncoderOnlyAttention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         """Forward pass with bidirectional attention (causal=False)."""
         context = get_context()
+        flash_attn_varlen_func = _import_flash_attn()
         # Encoder-only attention doesn't use KV cache
         # All tokens can attend to all tokens
         o = flash_attn_varlen_func(

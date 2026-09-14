@@ -1,5 +1,6 @@
 import atexit
-from dataclasses import fields
+from contextlib import contextmanager
+from dataclasses import fields, replace
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -34,10 +35,36 @@ class LLMEngine:
             config.model,
             use_fast=True,
         )
-        config.eos = self.tokenizer.eos_token_id
+        # Prefer the config's stop ids, which may list several; fall back to the
+        # tokenizer only when the config did not provide any.
+        if config.eos in (-1, None) and self.tokenizer.eos_token_id is not None:
+            config.eos = self.tokenizer.eos_token_id
+        self.config = config
         self.scheduler = Scheduler(config)
         self._processor = None  # Lazily loaded for multimodal
         atexit.register(self.exit)
+
+    @contextmanager
+    def _left_padding(self):
+        """Temporarily left-pad, restoring the previous setting on any exit.
+
+        Last-token pooling relies on left padding; restoring in a finally block
+        keeps a mid-batch failure from corrupting later tokenization.
+        """
+        original = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+        processor_tokenizer = getattr(self._processor, "tokenizer", None)
+        processor_original = (
+            processor_tokenizer.padding_side if processor_tokenizer else None
+        )
+        if processor_tokenizer is not None:
+            processor_tokenizer.padding_side = "left"
+        try:
+            yield
+        finally:
+            self.tokenizer.padding_side = original
+            if processor_tokenizer is not None:
+                processor_tokenizer.padding_side = processor_original
 
     def _get_processor(self):
         """Lazily load and cache the AutoProcessor for multimodal inputs."""
@@ -47,6 +74,21 @@ class LLMEngine:
                 self.model_runner.config.model, trust_remote_code=True
             )
         return self._processor
+
+    @staticmethod
+    def _normalize_pixel_values(pixel_values, num_texts: int):
+        """Normalise processor pixel_values to 2-D (total_patches, channels).
+
+        Some processors return (num_images, num_patches, channels); the model
+        runner expects the patches of all images concatenated along dim 0.
+        """
+        if pixel_values is None:
+            return None
+        if pixel_values.dim() == 3 and pixel_values.shape[0] == num_texts:
+            return pixel_values.reshape(-1, pixel_values.shape[-1])
+        if pixel_values.dim() == 2:
+            return pixel_values
+        return pixel_values.reshape(-1, pixel_values.shape[-1])
 
     def _expand_vision_placeholders(
         self,
@@ -163,6 +205,10 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        if not seqs:
+            # Nothing runnable this step; the caller loops again once the
+            # scheduler frees blocks or new requests arrive.
+            return [], 0
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids)
         # Clean up GDN states for finished sequences
@@ -519,6 +565,25 @@ class LLMEngine:
         Returns:
             embeddings: Tensor of shape [batch_size, hidden_size]
         """
+        with self._left_padding():
+            return self._embed_batch_impl(texts, images, use_tqdm)
+
+    def _embed_batch_impl(
+        self,
+        texts: list[str] | list[list[int]],
+        images: list | None = None,
+        use_tqdm: bool = False,
+    ) -> torch.Tensor:
+        """Batch embedding generation (prefill-only).
+
+        Args:
+            texts: List of text prompts or token IDs
+            images: Optional list of images for multimodal embedding
+            use_tqdm: Whether to show progress bar
+
+        Returns:
+            embeddings: Tensor of shape [batch_size, hidden_size]
+        """
         if not self.model_runner.is_embedding:
             msg = "Model is not configured for embedding. Set is_embedding=True."
             raise ValueError(msg)
@@ -526,9 +591,6 @@ class LLMEngine:
         if use_tqdm:
             pbar = tqdm(total=len(texts), desc="Embedding", dynamic_ncols=True)
 
-        # Set tokenizer padding side to left for consistent last token extraction
-        original_padding_side = self.tokenizer.padding_side
-        self.tokenizer.padding_side = "left"
 
         batch_size = len(texts)
 
@@ -545,10 +607,26 @@ class LLMEngine:
             messages_batch = []
             text_only_fallback_indices = []
             
+            # Qwen3-VL embedding models follow the official script
+            # (scripts/qwen3_vl_embedding.py): system instruction +
+            # add_generation_prompt=True, last-token pooling, no anchor.
+            # NOTE: do NOT append the endoftext anchor manually: the Qwen
+            # embedding tokenizers auto-append it via add_special_tokens,
+            # so a manual append doubles it and shifts pooling.
+            embed_type = getattr(self.model_runner.config, "embedding_type", None)
+            is_qwen3_vl_embed = embed_type == "qwen3_vl"
+
             for i, text in enumerate(texts):
-                if images and i < len(images):
+                if images and i < len(images) and images[i] is not None:
                     img = images[i] if isinstance(images[i], list) else [images[i]]
                     messages_batch.append([
+                        *(
+                            [{
+                                "role": "system",
+                                "content": [{"type": "text", "text": "Represent the user's input."}],
+                            }]
+                            if is_qwen3_vl_embed else []
+                        ),
                         {
                             "role": "user",
                             "content": [
@@ -560,29 +638,33 @@ class LLMEngine:
                     all_images_list.append(img[0])
                 else:
                     messages_batch.append([
+                        *(
+                            [{
+                                "role": "system",
+                                "content": [{"type": "text", "text": "Represent the user's input."}],
+                            }]
+                            if is_qwen3_vl_embed else []
+                        ),
                         {"role": "user", "content": [{"type": "text", "text": text}]}
                     ])
                     all_images_list.append(None)
                     text_only_fallback_indices.append(i)
-            
+
             # Batch apply_chat_template (much faster than serial calls)
             try:
                 all_formatted_texts = processor.apply_chat_template(
-                    messages_batch, tokenize=False, add_generation_prompt=False,
+                    messages_batch, tokenize=False,
+                    add_generation_prompt=is_qwen3_vl_embed,
                 )
             except (AttributeError, TypeError):
                 # Fallback to serial if batch not supported
                 all_formatted_texts = []
                 for msgs in messages_batch:
                     all_formatted_texts.append(
-                        processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+                        processor.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=is_qwen3_vl_embed)
                     )
-            
-            # Qwen3 embedding models use <|endoftext|> as pooling anchor
-            embed_type = getattr(self.model_runner.config, "embedding_type", None)
-            if embed_type in ("qwen3", "qwen3_vl"):
-                all_formatted_texts = [t + "<|endoftext|>" for t in all_formatted_texts]
-            
+
             # Filter out None images and process in batches
             # Separate multimodal and text-only samples
             multimodal_texts = []
@@ -680,78 +762,39 @@ class LLMEngine:
                 # Merge in original order
                 input_ids_list = [None] * batch_size
                 attention_mask_list = [None] * batch_size
-                pixel_values_list = [None] * batch_size
-                image_grid_thw_list = [None] * batch_size
-                
+
                 for idx, orig_idx in enumerate(multimodal_indices):
                     input_ids_list[orig_idx] = multimodal_input_ids[idx]
                     if multimodal_attention_mask is not None:
                         attention_mask_list[orig_idx] = multimodal_attention_mask[idx]
-                    if multimodal_pixel_values is not None:
-                        pixel_values_list[orig_idx] = multimodal_pixel_values[idx]
-                    if multimodal_image_grid_thw is not None:
-                        image_grid_thw_list[orig_idx] = multimodal_image_grid_thw[idx]
-                
+
                 for idx, orig_idx in enumerate(text_only_indices):
                     input_ids_list[orig_idx] = text_only_input_ids[idx]
                     if text_only_attention_mask is not None:
                         attention_mask_list[orig_idx] = text_only_attention_mask[idx]
-                
+
                 input_ids_tensor = torch.stack(input_ids_list)
                 if attention_mask_list[0] is not None:
                     attention_mask_tensor = torch.stack(attention_mask_list)
                 else:
                     attention_mask_tensor = None
-                
-                # Handle pixel_values and image_grid_thw
-                if any(pv is not None for pv in pixel_values_list):
-                    # Ensure each pv is 2D (num_patches, cps) before concatenating
-                    pv_list = []
-                    for pv in pixel_values_list:
-                        if pv is not None:
-                            # If 3D, squeeze or reshape to 2D
-                            if pv.dim() == 3:
-                                # (1, num_patches, cps) -> (num_patches, cps)
-                                if pv.shape[0] == 1:
-                                    pv = pv.squeeze(0)
-                                else:
-                                    # (batch, num_patches, cps) -> (batch*num_patches, cps)
-                                    pv = pv.view(-1, pv.shape[-1])
-                            elif pv.dim() > 2:
-                                # Other high-dim cases, reshape to 2D
-                                pv = pv.view(-1, pv.shape[-1])
-                            pv_list.append(pv)
-                    pixel_values_batch = torch.cat(pv_list, dim=0) if pv_list else None
-                else:
-                    pixel_values_batch = None
-                
-                if any(thw is not None for thw in image_grid_thw_list):
-                    image_grid_thw_batch = torch.stack([thw for thw in image_grid_thw_list if thw is not None], dim=0)
-                else:
-                    image_grid_thw_batch = None
+
+                # pixel_values / image_grid_thw from the processor are already
+                # concatenated over the multimodal requests (in order). They are
+                # NOT per-sequence rows: indexing pixel_values[idx] would grab a
+                # single patch row, not a whole image. The model runner assigns
+                # images to sequences by scanning placeholder tokens, so the
+                # concatenated tensors keep the correct mapping.
+                pixel_values_batch = self._normalize_pixel_values(
+                    multimodal_pixel_values, len(multimodal_texts)
+                )
+                image_grid_thw_batch = multimodal_image_grid_thw
             elif multimodal_input_ids is not None:
                 input_ids_tensor = multimodal_input_ids
                 attention_mask_tensor = multimodal_attention_mask
-                # Ensure pixel_values is 2D (total_patches, cps) format
-                if multimodal_pixel_values is not None:
-                    if multimodal_pixel_values.dim() == 3:
-                        # (batch, num_patches, cps) -> (batch*num_patches, cps)
-                        # But wait, this might be wrong - processor might return per-image format
-                        # Check if it's already flattened or needs flattening
-                        if multimodal_pixel_values.shape[0] == len(multimodal_texts):
-                            # Likely (batch, num_patches_per_image, cps) - need to flatten
-                            pixel_values_batch = multimodal_pixel_values.view(-1, multimodal_pixel_values.shape[-1])
-                        else:
-                            # Already in correct format or single image
-                            pixel_values_batch = multimodal_pixel_values
-                    elif multimodal_pixel_values.dim() == 2:
-                        # Already in correct format (total_patches, cps)
-                        pixel_values_batch = multimodal_pixel_values
-                    else:
-                        # Other cases, try to reshape to 2D
-                        pixel_values_batch = multimodal_pixel_values.view(-1, multimodal_pixel_values.shape[-1])
-                else:
-                    pixel_values_batch = None
+                pixel_values_batch = self._normalize_pixel_values(
+                    multimodal_pixel_values, len(multimodal_texts)
+                )
                 image_grid_thw_batch = multimodal_image_grid_thw
             else:
                 input_ids_tensor = text_only_input_ids
@@ -775,11 +818,9 @@ class LLMEngine:
                     # Decode token IDs to string
                     all_texts.append(self.tokenizer.decode(text))
             
-            # Qwen3 embedding models use <|endoftext|> as pooling anchor
-            embed_type = getattr(self.model_runner.config, "embedding_type", None)
-            if embed_type in ("qwen3", "qwen3_vl"):
-                all_texts = [t + "<|endoftext|>" for t in all_texts]
-            
+            # Qwen3-Embedding tokenizers auto-append the endoftext
+            # token via add_special_tokens, matching the official model
+            # card usage; do not append it manually (it would double).
             # Batch tokenize with left padding
             tokenized = self.tokenizer(
                 all_texts,
@@ -799,8 +840,6 @@ class LLMEngine:
         max_len = input_ids_tensor.shape[1]
         positions_tensor = torch.arange(max_len, dtype=torch.int64).unsqueeze(0).expand(batch_size, -1)
         
-        # Restore original padding side
-        self.tokenizer.padding_side = original_padding_side
 
         # Call embed method
         embeddings = self.model_runner.call(
@@ -834,6 +873,26 @@ class LLMEngine:
             For pointwise rerankers: scores tensor [batch_size]
             For listwise rerankers: (scores, query_embeds, doc_embeds)
         """
+        with self._left_padding():
+            return self._rerank_batch_impl(query_doc_pairs, images, use_tqdm)
+
+    def _rerank_batch_impl(
+        self,
+        query_doc_pairs: list[tuple[str, str]] | list[tuple[list[int], list[int]]],
+        images: list | None = None,
+        use_tqdm: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Batch reranking (prefill-only).
+
+        Args:
+            query_doc_pairs: List of (query, document) pairs
+            images: Optional list of images for multimodal reranking
+            use_tqdm: Whether to show progress bar
+
+        Returns:
+            For pointwise rerankers: scores tensor [batch_size]
+            For listwise rerankers: (scores, query_embeds, doc_embeds)
+        """
         if not self.model_runner.is_reranker:
             msg = "Model is not configured for reranking. Set is_reranker=True."
             raise ValueError(msg)
@@ -843,22 +902,16 @@ class LLMEngine:
                 total=len(query_doc_pairs), desc="Reranking", dynamic_ncols=True
             )
 
-        # Set tokenizer padding side to left for consistent last token extraction
-        original_padding_side = self.tokenizer.padding_side
-        self.tokenizer.padding_side = "left"
 
         batch_size = len(query_doc_pairs)
 
-        # Check if we have a processor for multimodal reranking
+        # Multimodal reranking needs a processor; swallowing a load failure here
+        # would silently downgrade to text-only scoring, so let it surface.
         processor = None
         if images:
-            try:
-                processor = self._get_processor()
-                # Set padding side to left to match Transformers baseline
-                if hasattr(processor, 'tokenizer'):
-                    processor.tokenizer.padding_side = "left"
-            except Exception:
-                processor = None
+            processor = self._get_processor()
+            if hasattr(processor, "tokenizer"):
+                processor.tokenizer.padding_side = "left"
 
         # Batch processing: collect all inputs first
         if images and processor:
@@ -948,29 +1001,52 @@ class LLMEngine:
                         self.tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
                         for msgs in messages_batch
                     ]
+            elif reranker_type == "jina_v3":
+                # jina-reranker-v3 locates query/doc embeddings at special
+                # tokens; the generic sep format omits them, which collapses
+                # every score. Build its listwise prompt (one passage per pair).
+                prefix = (
+                    "<|im_start|>system\n"
+                    "You are a search relevance expert who can determine a ranking "
+                    "of the passages based on how relevant they are to the query. "
+                    "If the query is a question, how relevant a passage is depends "
+                    "on how well it answers the question. If not, try to analyze "
+                    "the intent of the query and assess how well each passage "
+                    "satisfies the intent. If an instruction is provided, you "
+                    "should follow the instruction when determining the ranking."
+                    "<|im_end|>\n<|im_start|>user\n"
+                )
+                suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                for query, doc in query_doc_pairs:
+                    q = self.tokenizer.decode(query) if isinstance(query, list) else query
+                    d = self.tokenizer.decode(doc) if isinstance(doc, list) else doc
+                    body = (
+                        f"I will provide you with 1 passages, each indicated by a "
+                        f"numerical identifier. Rank the passages based on their "
+                        f"relevance to query: {q}\n"
+                        f'<passage id="0">\n{d}<|embed_token|>\n</passage>\n'
+                        f"<query>\n{q}<|rerank_token|>\n</query>"
+                    )
+                    all_texts.append(prefix + body + suffix)
             else:
                 for query, doc in query_doc_pairs:
                     if isinstance(query, str) and isinstance(doc, str):
-                        # Other rerankers (jina, gemma, etc.) use simple format
                         sep_token = (
                             self.tokenizer.sep_token_id or self.tokenizer.eos_token_id
                         )
                         text = f"{query}{self.tokenizer.decode([sep_token])}{doc}"
                         all_texts.append(text)
+                    elif isinstance(query, list) and isinstance(doc, list):
+                        sep_token = (
+                            self.tokenizer.sep_token_id or self.tokenizer.eos_token_id
+                        )
+                        combined_ids = query + [sep_token] + doc
+                        all_texts.append(self.tokenizer.decode(combined_ids))
                     else:
-                        # If already token IDs, decode them
-                        if isinstance(query, list) and isinstance(doc, list):
-                            sep_token = (
-                                self.tokenizer.sep_token_id or self.tokenizer.eos_token_id
-                            )
-                            combined_ids = query + [sep_token] + doc
-                            text = self.tokenizer.decode(combined_ids)
-                            all_texts.append(text)
-                        else:
-                            raise ValueError(
-                                "Mixed string and token ID inputs not supported"
-                            )
-            
+                        raise ValueError(
+                            "Mixed string and token ID inputs not supported"
+                        )
+
             # Batch tokenize with left padding
             tokenized = self.tokenizer(
                 all_texts,
@@ -990,8 +1066,6 @@ class LLMEngine:
         max_len = input_ids_tensor.shape[1]
         positions_tensor = torch.arange(max_len, dtype=torch.int64).unsqueeze(0).expand(batch_size, -1)
         
-        # Restore original padding side
-        self.tokenizer.padding_side = original_padding_side
 
         # Call rerank method
         result = self.model_runner.call(
@@ -1013,55 +1087,73 @@ class LLMEngine:
     def generate_single_token(
         self,
         prompts: list[str] | list[list[int]],
-        sampling_params: SamplingParams | None = None,
+        sampling_params: SamplingParams | list[SamplingParams] | None = None,
         images: list | None = None,
         use_tqdm: bool = False,
     ) -> list[int]:
-        """Single token generation (prefill + one sample, optimized path).
+        """Prefill plus one sampling step, returning a token id per prompt.
 
         Args:
-            prompts: List of text prompts or token IDs
-            sampling_params: Sampling parameters (max_tokens set to 1)
-            images: Optional list of images for multimodal generation
-            use_tqdm: Whether to show progress bar
-
-        Returns:
-            List of generated token IDs (one per prompt)
+            prompts: Text prompts or pre-tokenized ids.
+            sampling_params: Sampling settings; max_tokens is forced to 1.
+            images: Optional images, one entry per prompt, for multimodal input.
+            use_tqdm: Whether to show a progress bar.
         """
         if sampling_params is None:
-            sampling_params = SamplingParams(max_tokens=1)
+            base_params = [SamplingParams(max_tokens=1)] * len(prompts)
+        elif isinstance(sampling_params, list):
+            base_params = sampling_params
         else:
-            # Force max_tokens to 1 for single token generation
-            sampling_params.max_tokens = 1
+            base_params = [sampling_params] * len(prompts)
+
+        # Never mutate the caller's objects; derive single-token copies instead.
+        params = [replace(sp, max_tokens=1) for sp in base_params]
+
+        if images:
+            # Images must go through the processor to become vision tokens;
+            # add_request cannot do that on its own.
+            requests = []
+            for prompt, image in zip(prompts, images):
+                text = (
+                    prompt
+                    if isinstance(prompt, str)
+                    else self.tokenizer.decode(prompt)
+                )
+                image_list = image if isinstance(image, (list, tuple)) else [image]
+                requests.append(
+                    {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    *(
+                                        {"type": "image", "image": img}
+                                        for img in image_list
+                                    ),
+                                    {"type": "text", "text": text},
+                                ],
+                            }
+                        ],
+                        "images": list(image_list),
+                    }
+                )
+            results = self.generate_multimodal(
+                requests, params, self._get_processor(), use_tqdm=use_tqdm
+            )
+            return [r["token_ids"][0] if r["token_ids"] else None for r in results]
 
         if use_tqdm:
             pbar = tqdm(
                 total=len(prompts), desc="Single Token", dynamic_ncols=True
             )
 
-        if not isinstance(sampling_params, list):
-            sampling_params_list = [sampling_params] * len(prompts)
-        else:
-            sampling_params_list = sampling_params
-
-        # Add all requests
-        for i, prompt in enumerate(prompts):
-            sp = sampling_params_list[i]
-            sp.max_tokens = 1  # Ensure single token
-            if images and i < len(images):
-                # For multimodal, use generate_multimodal
-                # This is a simplified version - full multimodal support
-                # would need proper request formatting
-                img = images[i] if isinstance(images[i], list) else [images[i]]
-                self.add_request(prompt, sp, images=img)
-            else:
-                self.add_request(prompt, sp)
+        for prompt, sp in zip(prompts, params):
+            self.add_request(prompt, sp)
 
         outputs = {}
         while not self.is_finished():
             output, _ = self.step()
             for seq_id, token_ids in output:
-                # Get first (and only) token
                 outputs[seq_id] = token_ids[0] if token_ids else None
                 if use_tqdm:
                     pbar.update(1)
@@ -1069,8 +1161,4 @@ class LLMEngine:
         if use_tqdm:
             pbar.close()
 
-        # Return in order
-        result = [
-            outputs.get(seq_id, None) for seq_id in sorted(outputs.keys())
-        ]
-        return result
+        return [outputs[seq_id] for seq_id in sorted(outputs)]

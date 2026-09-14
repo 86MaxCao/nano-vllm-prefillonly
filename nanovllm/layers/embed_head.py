@@ -3,8 +3,6 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from nanovllm.utils.context import get_context
-
 
 class VocabParallelEmbedding(nn.Module):
 
@@ -54,13 +52,11 @@ class ParallelLMHead(VocabParallelEmbedding):
         super().__init__(num_embeddings, embedding_dim)
 
     def forward(self, x: torch.Tensor):
-        context = get_context()
-        if context.is_prefill:
-            last_indices = context.cu_seqlens_q[1:] - 1
-            x = x[last_indices].contiguous()
+        # Last-token selection happens in ModelRunner so that every model,
+        # including those that project with F.linear directly, behaves alike.
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
-            dist.gather(logits, all_logits, 0)
-            logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
+            shards = [torch.empty_like(logits) for _ in range(self.tp_size)]
+            dist.all_gather(shards, logits)
+            logits = torch.cat(shards, -1)
         return logits

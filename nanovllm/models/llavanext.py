@@ -15,6 +15,7 @@ import math
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+import logging
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -34,6 +35,9 @@ from nanovllm.layers.linear import (
 # ---------------------------------------------------------------------------
 # Multimodal Projector
 # ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
 
 class LlavaNextMultiModalProjector(nn.Module):
     """Multimodal projector that projects vision features to text space.
@@ -130,10 +134,12 @@ class LlavaNextForConditionalGeneration(nn.Module):
         except ImportError:
             raise ImportError("transformers is required for language model. Install with: pip install transformers")
 
-        print("[LlavaNextForConditionalGeneration] Initialization complete")
-        print(f"  - Vision encoder: {type(self.vision_tower).__name__}")
-        print(f"  - Language model: {type(self.language_model).__name__}")
-        print(f"  - Multimodal projector: {type(self.multi_modal_projector).__name__}")
+        logger.debug(
+            "LlavaNext initialised: vision=%s language=%s projector=%s",
+            type(self.vision_tower).__name__,
+            type(self.language_model).__name__,
+            type(self.multi_modal_projector).__name__,
+        )
     
     def get_input_embeddings(self):
         return self.language_model.get_input_embeddings()
@@ -606,22 +612,21 @@ class LlavaNextForConditionalGeneration(nn.Module):
                                 inputs_embeds = inputs_embeds_flat
                             else:
                                 # No image tokens found - this is an error
-                                print("[WARNING llavanext.forward] No image tokens found!")
-                                print(f"  input_ids shape: {input_ids.shape}")
-                                print(f"  image_token_id: {image_token_id}")
-                                print("  This might indicate a problem with tokenization")
+                                logger.warning(
+                                    "llavanext: no image tokens found (input_ids %s, image_token_id %s); "
+                                    "possible tokenization problem",
+                                    tuple(input_ids.shape), image_token_id,
+                                )
                                 # Do NOT modify inputs_embeds length - just skip
                                 pass
                     else:
                         # No image_token_id in config
-                        print("[WARNING llavanext.forward] No image_token_id found!")
-                        print("  Cannot insert image features without image_token_id")
+                        logger.warning("llavanext: no image_token_id; cannot insert image features")
                         # Do NOT modify inputs_embeds length
                         pass
                 else:
                     # No input_ids - cannot insert image features
-                    print("[WARNING llavanext.forward] No input_ids provided!")
-                    print("  Cannot insert image features without input_ids")
+                    logger.warning("llavanext: no input_ids; cannot insert image features")
                     # Do NOT modify inputs_embeds length
                     pass
                 
@@ -810,7 +815,7 @@ def load_llavanext_model(model_path, config):
     
     from nanovllm.utils.loader import load_model
 
-    print("[load_llavanext_model] Loading LLaVANext weights...")
+    logger.info("Loading LLaVANext weights...")
 
     def name_mapping(weight_name: str) -> str | None:
         # Map transformers weight names to our structure

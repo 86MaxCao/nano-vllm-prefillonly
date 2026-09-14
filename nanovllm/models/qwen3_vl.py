@@ -23,8 +23,12 @@ from nanovllm.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from nanovllm.layers.rotary_embedding import get_rope
-from nanovllm.layers.hybrid_prefill import is_hybrid_prefill_enabled, chunked_mlp_forward
+from nanovllm.layers.hybrid_prefill import chunked_mlp_forward, is_hybrid_prefill_enabled
+from nanovllm.layers.rotary_embedding import (
+    build_mrope_positions,
+    get_rope,
+    rope_params_from_config,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -144,9 +148,9 @@ class Qwen3VLTextDecoderLayer(nn.Module):
         config,
     ) -> None:
         super().__init__()
-        rope_scaling = getattr(config, "rope_scaling", None)
-        if isinstance(rope_scaling, dict):
-            rope_scaling = None
+        rope_theta, rope_scaling = rope_params_from_config(
+            config, default_theta=1000000
+        )
 
         self.self_attn = Qwen3VLTextAttention(
             hidden_size=config.hidden_size,
@@ -156,7 +160,7 @@ class Qwen3VLTextDecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, "attention_bias", True),
             head_dim=getattr(config, "head_dim", None),
-            rope_theta=getattr(config, "rope_theta", 1000000),
+            rope_theta=rope_theta,
             rope_scaling=rope_scaling,
         )
         self.mlp = Qwen3VLTextMLP(
@@ -232,7 +236,9 @@ class Qwen3VLTextModel(nn.Module):
                 if visual_pos_mask is not None:
                     if mask_tensor is None:
                         mask_tensor = visual_pos_mask.bool()
-                    if mask_tensor.sum().item() != ds.size(0):
+                    # Compare on-device; .item() would synchronise on every
+                    # DeepStack layer of every forward pass.
+                    if mask_tensor.sum() != ds.size(0):
                         raise ValueError("DeepStack features do not match the visual mask length")
                     hidden_states[mask_tensor] += ds
                 else:
@@ -849,6 +855,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             raise ValueError("vision_config is missing; cannot build a multimodal model")
 
         self.visual = create_vision_model(self.vision_config)
+        # tie_word_embeddings is declared on the top-level config for these
+        # checkpoints, but the text sub-config drives the language model; carry
+        # it across so the lm_head is tied instead of left uninitialised.
+        if not hasattr(self.text_config, "tie_word_embeddings") or getattr(
+            self.text_config, "tie_word_embeddings", None
+        ) is None:
+            self.text_config.tie_word_embeddings = getattr(
+                config, "tie_word_embeddings", False
+            )
         self.language_model = Qwen3VLTextForCausalLM(self.text_config)
 
         # print("[Qwen3VLForConditionalGeneration] Initialization complete")
@@ -1124,55 +1139,37 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                         if seq_vision_placeholders and seq_idx < len(seq_vision_placeholders):
                             placeholders = seq_vision_placeholders[seq_idx]
                             if placeholders:
-                                # Use the first placeholder's offset (typically there's only one)
-                                # If multiple placeholders, we need to split seq_vision_tokens accordingly
-                                if len(placeholders) == 1:
-                                    target_offset, expected_length = placeholders[0]
-                                    if expected_length != slice_len:
-                                        pass  # length mismatch is non-fatal, use actual length
-
+                                # One placeholder range per image: place each
+                                # image's tokens at that image's own offset.
+                                if len(placeholders) != len(seq_image_chunks):
+                                    raise ValueError(
+                                        f"Sequence {seq_idx}: {len(placeholders)} "
+                                        f"placeholder range(s) do not match "
+                                        f"{len(seq_image_chunks)} image chunk(s)"
+                                    )
+                                for (target_offset, expected_length), chunk in zip(
+                                    placeholders, seq_image_chunks
+                                ):
+                                    chunk_tokens = chunk.to(
+                                        inputs_embeds.device, inputs_embeds.dtype
+                                    )
+                                    chunk_len = chunk_tokens.size(0)
+                                    if expected_length != chunk_len:
+                                        raise ValueError(
+                                            f"Sequence {seq_idx}: placeholder "
+                                            f"length {expected_length} does not "
+                                            f"match image chunk length {chunk_len}"
+                                        )
                                     target_start = start + target_offset
-                                    target_end = target_start + slice_len
+                                    target_end = target_start + chunk_len
                                     if target_end > end:
                                         raise ValueError(
                                             f"Visual token target range [{target_start}, {target_end}) "
                                             f"is out of sequence bounds [{start}, {end})"
                                         )
-                                    
-                                    # if not hasattr(self, f'_debug_placeholder_placement_{seq_idx}_logged'):
-                                        # print(
-                                            # f"[DEBUG qwen3vl.forward (fallback)] "
-                                            # f"Sequence {seq_idx}: placing {slice_len} vision tokens "
-                                            # f"at offset {target_offset} (absolute position {target_start})"
-                                        # )
-                                        # setattr(self, f'_debug_placeholder_placement_{seq_idx}_logged', True)
-
-                                    inputs_embeds[target_start:target_end] = seq_vision_tokens
+                                    inputs_embeds[target_start:target_end] = chunk_tokens
                                     visual_pos_mask[target_start:target_end] = True
-                                    total_replaced += slice_len
-                                else:
-                                    # Multiple placeholders - need to split seq_vision_tokens
-                                    # This is rare, but handle it by distributing tokens proportionally
-                                    # if not hasattr(self, f'_debug_multiple_placeholders_{seq_idx}_logged'):
-                                        # print(
-                                            # f"[DEBUG qwen3vl.forward (fallback)] "
-                                            # f"WARNING: Sequence {seq_idx} has {len(placeholders)} placeholders, "
-                                            # f"but we have {len(seq_image_chunks)} image chunks. "
-                                            # f"Using first placeholder only."
-                                        # )
-                                        # setattr(self, f'_debug_multiple_placeholders_{seq_idx}_logged', True)
-
-                                    target_offset, expected_length = placeholders[0]
-                                    target_start = start + target_offset
-                                    target_end = target_start + slice_len
-                                    if target_end > end:
-                                        raise ValueError(
-                                            f"Visual token target range [{target_start}, {target_end}) "
-                                            f"is out of sequence bounds [{start}, {end})"
-                                        )
-                                    inputs_embeds[target_start:target_end] = seq_vision_tokens
-                                    visual_pos_mask[target_start:target_end] = True
-                                    total_replaced += slice_len
+                                    total_replaced += chunk_len
                             else:
                                 # No placeholders for this sequence - fallback to beginning
                                 # if not hasattr(self, f'_debug_no_placeholder_{seq_idx}_logged'):
@@ -1211,15 +1208,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                                         ], dim=0)
                                         deepstack_collect[layer_idx].append(layer_concat)
             else:
-                # Fallback: original logic (assumes one image per sequence)
-                # if not hasattr(self, '_debug_fallback_original_logged'):
-                    # print(
-                        # f"[DEBUG qwen3vl.forward (fallback)] "
-                        # f"WARNING: No seq_image_indices, using original 1:1 mapping "
-                        # f"(assumes one image per sequence)"
-                    # )
-                    # self._debug_fallback_original_logged = True
-
+                # Fallback when per-sequence image indices are unavailable:
+                # assume one image chunk per sequence, in order.
                 image_iter = iter(image_chunks)
                 deepstack_iter = [iter(layer) for layer in deepstack_layers_raw] if deepstack_layers_raw else None
 
@@ -1233,24 +1223,24 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     except StopIteration:
                         break
 
-                token_slice = token_slice.to(inputs_embeds.device, inputs_embeds.dtype)
-                slice_len = token_slice.size(0)
-                if slice_len > seq_length:
-                    raise ValueError("Visual tokens exceed the available sequence length")
+                    token_slice = token_slice.to(inputs_embeds.device, inputs_embeds.dtype)
+                    slice_len = token_slice.size(0)
+                    if slice_len > seq_length:
+                        raise ValueError("Visual tokens exceed the available sequence length")
 
-                inputs_embeds[start : start + slice_len] = token_slice
-                visual_pos_mask[start : start + slice_len] = True
-                total_replaced += slice_len
+                    inputs_embeds[start : start + slice_len] = token_slice
+                    visual_pos_mask[start : start + slice_len] = True
+                    total_replaced += slice_len
 
-                if deepstack_iter:
-                    if deepstack_collect is None:
-                        deepstack_collect = [[] for _ in deepstack_layers_raw]
-                    for layer_idx, iterator in enumerate(deepstack_iter):
-                        try:
-                            layer_slice = next(iterator).to(inputs_embeds.device, inputs_embeds.dtype)
-                        except StopIteration:
-                            continue
-                        deepstack_collect[layer_idx].append(layer_slice)
+                    if deepstack_iter:
+                        if deepstack_collect is None:
+                            deepstack_collect = [[] for _ in deepstack_layers_raw]
+                        for layer_idx, iterator in enumerate(deepstack_iter):
+                            try:
+                                layer_slice = next(iterator).to(inputs_embeds.device, inputs_embeds.dtype)
+                            except StopIteration:
+                                continue
+                            deepstack_collect[layer_idx].append(layer_slice)
 
             if deepstack_collect is not None:
                 hidden_dim = inputs_embeds.size(-1)
@@ -1265,6 +1255,24 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         if vision_token_count == 0:
             visual_pos_mask = None
             deepstack_layers = None
+
+        use_mrope = (
+            vision_token_count
+            and image_grid_thw is not None
+            and sequence_lengths is not None
+            and seq_vision_placeholders is not None
+            and any(seq_vision_placeholders)
+        )
+        if use_mrope:
+            visual_config = getattr(self.visual, "config", None)
+            spatial_merge = getattr(visual_config, "spatial_merge_size", 2) or 2
+            positions = build_mrope_positions(
+                sequence_lengths,
+                seq_vision_placeholders,
+                image_grid_thw,
+                spatial_merge,
+                inputs_embeds.device,
+            )
 
         if positions is None:
             positions = torch.arange(
@@ -1335,7 +1343,6 @@ def load_qwen3_vl_model(model_path, config):
         if weight_name.startswith("model.visual."):
             sub_name = weight_name[len("model.visual.") :]
             return "visual.vision." + sub_name
-            return None
 
     load_model(model, model_path, name_mapping=name_mapping)
     return model

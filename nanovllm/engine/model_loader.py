@@ -1,5 +1,8 @@
 """Model loader for different model types (embedding, reranker, multimodal, text-only)."""
+import importlib
 import logging
+import sys
+
 import torch
 from transformers import AutoConfig
 
@@ -8,121 +11,118 @@ from nanovllm.utils.loader import load_model
 
 logger = logging.getLogger(__name__)
 
-# Import model classes with availability checks
-try:
-    from nanovllm.models.qwen3_vl import load_qwen3_vl_model
-    QWEN3_VL_AVAILABLE = True
-except ImportError:
-    QWEN3_VL_AVAILABLE = False
 
-try:
-    from nanovllm.models.qwen2_vl import load_qwen2_vl_model
-    QWEN2_VL_AVAILABLE = True
-except ImportError:
-    QWEN2_VL_AVAILABLE = False
+# Optional model implementations, imported on demand. Mapping each public symbol
+# to its module lets an unrelated import failure (syntax error, missing
+# third-party package) surface with its original traceback instead of being
+# reported as "model not available".
+_OPTIONAL_SYMBOLS = {
+    "load_qwen3_vl_model": "nanovllm.models.qwen3_vl",
+    "load_qwen2_vl_model": "nanovllm.models.qwen2_vl",
+    "load_qwen2_5_vl_model": "nanovllm.models.qwen2_5_vl",
+    "load_llavanext_model": "nanovllm.models.llavanext",
+    "Qwen3Reranker": "nanovllm.models.qwen3_reranker",
+    "GemmaReranker": "nanovllm.models.gemma_reranker",
+    "GemmaForCausalLM": "nanovllm.models.gemma",
+    "JinaRerankerV3": "nanovllm.models.jina_reranker_v3",
+    "Gemma2Embedding": "nanovllm.models.gemma2_embedding",
+    "Qwen3Embedding": "nanovllm.models.qwen3_embedding",
+    "LLaVANextEmbedding": "nanovllm.models.llavanext_embedding",
+    "Qwen2VLGmeEmbedding": "nanovllm.models.qwen2_vl_gme_embedding",
+    "GmeQwen2VLConfig": "nanovllm.models.qwen2_vl_gme_embedding",
+    "JinaEmbeddingsV4": "nanovllm.models.jina_v4_embedding",
+    "JinaRerankerM0": "nanovllm.models.jina_m0_reranker",
+    "Qwen3VLEmbedding": "nanovllm.models.qwen3_vl_embedding",
+    "Qwen3VLReranker": "nanovllm.models.qwen3_vl_reranker",
+    "load_qwen3_5_model": "nanovllm.models.qwen3_5",
+    "Qwen3_5TextForCausalLM": "nanovllm.models.qwen3_5",
+    "Qwen3NextForCausalLM": "nanovllm.models.qwen3_next",
+}
 
-try:
-    from nanovllm.models.qwen2_5_vl import load_qwen2_5_vl_model
-    QWEN2_5_VL_AVAILABLE = True
-except ImportError:
-    QWEN2_5_VL_AVAILABLE = False
+# Each availability flag maps to a symbol whose import decides it.
+_AVAILABILITY_FLAGS = {
+    "QWEN3_VL_AVAILABLE": "load_qwen3_vl_model",
+    "QWEN2_VL_AVAILABLE": "load_qwen2_vl_model",
+    "QWEN2_5_VL_AVAILABLE": "load_qwen2_5_vl_model",
+    "LLAVANEXT_AVAILABLE": "load_llavanext_model",
+    "QWEN3_RERANKER_AVAILABLE": "Qwen3Reranker",
+    "GEMMA_AVAILABLE": "GemmaReranker",
+    "JINA_V3_AVAILABLE": "JinaRerankerV3",
+    "GEMMA2_AVAILABLE": "Gemma2Embedding",
+    "QWEN3_EMBEDDING_AVAILABLE": "Qwen3Embedding",
+    "LLAVANEXT_EMBEDDING_AVAILABLE": "LLaVANextEmbedding",
+    "QWEN2VL_GME_AVAILABLE": "Qwen2VLGmeEmbedding",
+    "JINA_V4_AVAILABLE": "JinaEmbeddingsV4",
+    "JINA_M0_AVAILABLE": "JinaRerankerM0",
+    "QWEN3_VL_EMBEDDING_AVAILABLE": "Qwen3VLEmbedding",
+    "QWEN3_VL_RERANKER_AVAILABLE": "Qwen3VLReranker",
+    "QWEN3_5_AVAILABLE": "load_qwen3_5_model",
+    "QWEN3_NEXT_AVAILABLE": "Qwen3NextForCausalLM",
+}
 
-try:
-    from nanovllm.models.llavanext import load_llavanext_model
-    LLAVANEXT_AVAILABLE = True
-except ImportError:
-    LLAVANEXT_AVAILABLE = False
+_import_cache: dict[str, object] = {}
+_import_errors: dict[str, Exception] = {}
 
-try:
-    from nanovllm.models.qwen3_reranker import Qwen3Reranker
-    QWEN3_RERANKER_AVAILABLE = True
-except ImportError:
-    QWEN3_RERANKER_AVAILABLE = False
 
-try:
-    from nanovllm.models.gemma_reranker import GemmaReranker
-    from nanovllm.models.gemma import GemmaForCausalLM
-    GEMMA_AVAILABLE = True
-except ImportError:
-    GEMMA_AVAILABLE = False
-
-try:
-    from nanovllm.models.jina_reranker_v3 import JinaRerankerV3
-    JINA_V3_AVAILABLE = True
-except ImportError:
-    JINA_V3_AVAILABLE = False
-
-try:
-    from nanovllm.models.gemma2_embedding import Gemma2Embedding
+def _try_import(symbol: str):
+    """Import an optional symbol, remembering the failure reason."""
+    if symbol in _import_cache:
+        return _import_cache[symbol]
+    if symbol in _import_errors:
+        return None
+    module_name = _OPTIONAL_SYMBOLS[symbol]
     try:
-        from transformers import Gemma2Config
-    except ImportError:
-        from transformers import GemmaConfig as Gemma2Config
-    GEMMA2_AVAILABLE = True
-except ImportError as e:
-    GEMMA2_AVAILABLE = False
+        obj = getattr(importlib.import_module(module_name), symbol)
+    except Exception as exc:  # noqa: BLE001 - reported verbatim below
+        _import_errors[symbol] = exc
+        logger.warning(
+            "Optional model %s is unavailable: %s: %s",
+            symbol,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+    _import_cache[symbol] = obj
+    return obj
 
-try:
-    from nanovllm.models.qwen3_embedding import Qwen3Embedding
-    QWEN3_EMBEDDING_AVAILABLE = True
-except ImportError:
-    QWEN3_EMBEDDING_AVAILABLE = False
 
-try:
-    from nanovllm.models.llavanext_embedding import LLaVANextEmbedding
-    LLAVANEXT_EMBEDDING_AVAILABLE = True
-except ImportError:
-    LLAVANEXT_EMBEDDING_AVAILABLE = False
+def __getattr__(name: str):
+    if name == "MULTIMODAL_AVAILABLE":
+        return any(
+            _try_import(_AVAILABILITY_FLAGS[flag]) is not None
+            for flag in (
+                "QWEN3_VL_AVAILABLE",
+                "QWEN2_VL_AVAILABLE",
+                "QWEN2_5_VL_AVAILABLE",
+                "LLAVANEXT_AVAILABLE",
+                "QWEN3_5_AVAILABLE",
+            )
+        )
+    if name in _AVAILABILITY_FLAGS:
+        return _try_import(_AVAILABILITY_FLAGS[name]) is not None
+    if name in _OPTIONAL_SYMBOLS:
+        obj = _try_import(name)
+        if obj is None:
+            raise ImportError(
+                f"{name} could not be imported from "
+                f"{_OPTIONAL_SYMBOLS[name]}"
+            ) from _import_errors[name]
+        return obj
+    raise AttributeError(name)
 
-try:
-    from nanovllm.models.qwen2_vl_gme_embedding import Qwen2VLGmeEmbedding, GmeQwen2VLConfig
-    QWEN2VL_GME_AVAILABLE = True
-except ImportError as e:
-    QWEN2VL_GME_AVAILABLE = False
 
-try:
-    from nanovllm.models.jina_v4_embedding import JinaEmbeddingsV4
-    JINA_V4_AVAILABLE = True
-except ImportError as e:
-    JINA_V4_AVAILABLE = False
+def import_error_for(symbol: str) -> Exception | None:
+    """Return the exception that made `symbol` unavailable, if any."""
+    _try_import(symbol)
+    return _import_errors.get(symbol)
 
-try:
-    from nanovllm.models.jina_m0_reranker import JinaRerankerM0
-    JINA_M0_AVAILABLE = True
-except ImportError as e:
-    JINA_M0_AVAILABLE = False
-
-try:
-    from nanovllm.models.qwen3_vl_embedding import Qwen3VLEmbedding
-    QWEN3_VL_EMBEDDING_AVAILABLE = True
-except ImportError as e:
-    QWEN3_VL_EMBEDDING_AVAILABLE = False
-
-try:
-    from nanovllm.models.qwen3_vl_reranker import Qwen3VLReranker
-    QWEN3_VL_RERANKER_AVAILABLE = True
-except ImportError as e:
-    QWEN3_VL_RERANKER_AVAILABLE = False
-
-try:
-    from nanovllm.models.qwen3_5 import load_qwen3_5_model, Qwen3_5TextForCausalLM
-    QWEN3_5_AVAILABLE = True
-except ImportError as e:
-    QWEN3_5_AVAILABLE = False
-
-try:
-    from nanovllm.models.qwen3_next import Qwen3NextForCausalLM
-    QWEN3_NEXT_AVAILABLE = True
-except ImportError as e:
-    QWEN3_NEXT_AVAILABLE = False
 
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 
-MULTIMODAL_AVAILABLE = (
-    QWEN3_VL_AVAILABLE or QWEN2_VL_AVAILABLE or
-    QWEN2_5_VL_AVAILABLE or LLAVANEXT_AVAILABLE or
-    QWEN3_5_AVAILABLE
-)
+try:
+    from transformers import Gemma2Config
+except ImportError:  # transformers < 4.42 exposed only GemmaConfig
+    from transformers import GemmaConfig as Gemma2Config
 
 
 def get_torch_dtype(hf_config) -> torch.dtype:
@@ -283,41 +283,57 @@ def create_qwen3_vl_name_mapping():
     return name_mapping
 
 
-def create_jina_m0_name_mapping():
-    """Create name mapping function for Jina Reranker M0 model.
+def create_legacy_qwenvl_name_mapping(
+    skip_lm_head: bool = True,
+    extra_prefixes: tuple[str, ...] = (),
+):
+    """Map legacy flat Qwen-VL checkpoint names onto current module paths.
 
-    The safetensors file uses flat names inherited from Qwen2VL's
-    checkpoint format, while the transformers Qwen2VLForConditionalGeneration
-    model prefixes text model params with model.language_model.*.
+    Older Qwen-VL derived checkpoints store text weights at the top level
+    (``model.layers.*``, ``visual.*``) while current transformers nests them
+    under ``model.language_model.*`` and ``model.visual.*``.
 
-    Key mapping rules:
-    - model.embed_tokens.* → model.language_model.embed_tokens.*
-    - model.layers.* → model.language_model.layers.*
-    - model.norm.* → model.language_model.norm.*
-    - lm_head.* → skip (replaced by nn.Identity in JinaRerankerM0)
-    - visual.* → model.visual.* (direct, just add model. prefix)
-    - score.* → score.* (direct match, no transform)
+    Args:
+        skip_lm_head: Drop ``lm_head.*`` tensors, for heads replaced downstream.
+        extra_prefixes: Top-level prefixes to pass through unchanged, e.g.
+            task-specific projection or scoring heads.
     """
+    text_prefixes = ("model.embed_tokens.", "model.layers.", "model.norm.")
+
     def name_mapping(weight_name: str) -> str | None:
-        # Skip lm_head — replaced by Identity in JinaRerankerM0
-        if weight_name.startswith("lm_head."):
+        if skip_lm_head and weight_name.startswith("lm_head."):
             return None
-        # Text model params: model.{embed_tokens,layers,norm}.* 
-        # → model.language_model.{embed_tokens,layers,norm}.*
-        if weight_name.startswith("model.embed_tokens."):
+        if weight_name.startswith(text_prefixes):
             return "model.language_model." + weight_name[len("model."):]
-        if weight_name.startswith("model.layers."):
-            return "model.language_model." + weight_name[len("model."):]
-        if weight_name.startswith("model.norm."):
-            return "model.language_model." + weight_name[len("model."):]
-        # Visual params: visual.* → model.visual.*
         if weight_name.startswith("visual."):
             return "model." + weight_name
-        # Score MLP: score.* → score.* (direct match)
-        if weight_name.startswith("score."):
+        if weight_name.startswith(("model.language_model.", "model.visual.")):
+            # Already in the nested layout.
+            return weight_name
+        if extra_prefixes and weight_name.startswith(extra_prefixes):
             return weight_name
         return None
+
     return name_mapping
+
+
+def create_jina_m0_name_mapping():
+    """Name mapping for Jina Reranker M0 (legacy Qwen2-VL layout + score head)."""
+    return create_legacy_qwenvl_name_mapping(
+        skip_lm_head=True, extra_prefixes=("score.",)
+    )
+
+
+def create_jina_v4_name_mapping():
+    """Name mapping for Jina Embeddings V4 (legacy layout + projector head)."""
+    return create_legacy_qwenvl_name_mapping(
+        skip_lm_head=True, extra_prefixes=("multi_vector_projector.",)
+    )
+
+
+# Optional model symbols are reached through the module object so that each
+# attribute lookup goes through __getattr__ and triggers the lazy import.
+_lazy = sys.modules[__name__]
 
 
 class ModelLoader:
@@ -328,12 +344,12 @@ class ModelLoader:
                            pooling_type: str, normalize_embeddings: bool,
                            target_dtype: torch.dtype | None) -> torch.nn.Module:
         """Load an embedding model."""
-        if embedding_type == "gemma2" and GEMMA2_AVAILABLE:
+        if embedding_type == "gemma2" and _lazy.GEMMA2_AVAILABLE:
             try:
                 gemma2_config = Gemma2Config.from_pretrained(config.model)
             except Exception:
                 gemma2_config = hf_config
-            model = Gemma2Embedding(
+            model = _lazy.Gemma2Embedding(
                 gemma2_config,
                 pooling_type=pooling_type,
                 normalize=normalize_embeddings,
@@ -343,11 +359,11 @@ class ModelLoader:
             load_model(model, config.model)
             return model
 
-        elif embedding_type == "qwen3" and QWEN3_EMBEDDING_AVAILABLE:
+        elif embedding_type == "qwen3" and _lazy.QWEN3_EMBEDDING_AVAILABLE:
             text_config = getattr(hf_config, "text_config", hf_config)
             from transformers import Qwen3Config
             qwen3_config = Qwen3Config.from_dict(text_config.to_dict())
-            model = Qwen3Embedding(
+            model = _lazy.Qwen3Embedding(
                 qwen3_config,
                 pooling_type=pooling_type,
                 normalize=normalize_embeddings,
@@ -357,8 +373,8 @@ class ModelLoader:
             load_model(model, config.model)
             return model
 
-        elif embedding_type == "llavanext" and LLAVANEXT_EMBEDDING_AVAILABLE:
-            model = LLaVANextEmbedding(
+        elif embedding_type == "llavanext" and _lazy.LLAVANEXT_EMBEDDING_AVAILABLE:
+            model = _lazy.LLaVANextEmbedding(
                 hf_config,
                 pooling_type=pooling_type,
                 normalize=normalize_embeddings,
@@ -368,9 +384,9 @@ class ModelLoader:
             load_model(model, config.model)
             return model
 
-        elif embedding_type == "qwen2_vl_gme" and QWEN2VL_GME_AVAILABLE:
-            gme_config = GmeQwen2VLConfig.from_pretrained(config.model, trust_remote_code=True)
-            model = Qwen2VLGmeEmbedding(
+        elif embedding_type == "qwen2_vl_gme" and _lazy.QWEN2VL_GME_AVAILABLE:
+            gme_config = _lazy.GmeQwen2VLConfig.from_pretrained(config.model, trust_remote_code=True)
+            model = _lazy.Qwen2VLGmeEmbedding(
                 gme_config,
                 pooling_type=pooling_type,
                 normalize=normalize_embeddings,
@@ -380,21 +396,23 @@ class ModelLoader:
             load_model(model, config.model)
             return model
 
-        elif embedding_type == "jina_v4" and JINA_V4_AVAILABLE:
+        elif embedding_type == "jina_v4" and _lazy.JINA_V4_AVAILABLE:
             jina_v4_config = AutoConfig.from_pretrained(config.model, trust_remote_code=True)
-            model = JinaEmbeddingsV4(
+            model = _lazy.JinaEmbeddingsV4(
                 jina_v4_config,
                 pooling_type=pooling_type,
                 normalize=normalize_embeddings,
             )
             if target_dtype is not None:
                 model = model.to(target_dtype)
-            load_model(model, config.model)
+            load_model(
+                model, config.model, name_mapping=create_jina_v4_name_mapping()
+            )
             return model
 
-        elif embedding_type == "qwen3_vl" and QWEN3_VL_EMBEDDING_AVAILABLE:
+        elif embedding_type == "qwen3_vl" and _lazy.QWEN3_VL_EMBEDDING_AVAILABLE:
             qwen3_vl_config = AutoConfig.from_pretrained(config.model, trust_remote_code=True)
-            embedding_model = Qwen3VLEmbedding(
+            embedding_model = _lazy.Qwen3VLEmbedding(
                 qwen3_vl_config,
                 pooling_type=pooling_type,
                 normalize=normalize_embeddings,
@@ -424,7 +442,7 @@ class ModelLoader:
                 is_original = True
             if classifier_tokens is None:
                 classifier_tokens = ["no", "yes"]
-            model = Qwen3Reranker(
+            model = _lazy.Qwen3Reranker(
                 text_config,
                 is_original_reranker=is_original,
                 classifier_from_token=classifier_tokens,
@@ -439,13 +457,13 @@ class ModelLoader:
                 model.convert_from_original_reranker(tokenizer)
             return model
 
-        elif reranker_type == "gemma" and GEMMA_AVAILABLE:
+        elif reranker_type == "gemma" and _lazy.GEMMA_AVAILABLE:
             # gemma rerankers always use "Yes" token logit
             if is_original is None:
                 is_original = True
             if classifier_tokens is None:
                 classifier_tokens = ["Yes"]
-            model = GemmaReranker(
+            model = _lazy.GemmaReranker(
                 text_config,
                 is_original_reranker=is_original,
                 classifier_from_token=classifier_tokens,
@@ -460,10 +478,10 @@ class ModelLoader:
                 model.convert_from_original_reranker(tokenizer)
             return model
 
-        elif reranker_type == "jina_v3" and JINA_V3_AVAILABLE:
+        elif reranker_type == "jina_v3" and _lazy.JINA_V3_AVAILABLE:
             projector_dim = getattr(config, "projector_dim", 512)
             use_flex_attention = getattr(config, "use_flex_attention", True)
-            model = JinaRerankerV3(
+            model = _lazy.JinaRerankerV3(
                 text_config,
                 projector_dim=projector_dim,
                 use_flex_attention=use_flex_attention,
@@ -473,20 +491,20 @@ class ModelLoader:
             load_model(model, config.model)
             return model
 
-        elif reranker_type == "jina_m0" and JINA_M0_AVAILABLE:
+        elif reranker_type == "jina_m0" and _lazy.JINA_M0_AVAILABLE:
             jina_m0_config = AutoConfig.from_pretrained(config.model, trust_remote_code=True)
-            model = JinaRerankerM0(jina_m0_config)
+            model = _lazy.JinaRerankerM0(jina_m0_config)
             if target_dtype is not None:
                 model = model.to(target_dtype)
             name_mapping = create_jina_m0_name_mapping()
             load_model(model, config.model, name_mapping=name_mapping)
             return model
 
-        elif reranker_type == "qwen3_vl" and QWEN3_VL_RERANKER_AVAILABLE:
+        elif reranker_type == "qwen3_vl" and _lazy.QWEN3_VL_RERANKER_AVAILABLE:
             is_original = True  # VL rerankers always use yes/no token logits
             classifier_tokens = getattr(config, "classifier_from_token", ["no", "yes"])
             qwen3_vl_config = AutoConfig.from_pretrained(config.model, trust_remote_code=True)
-            model = Qwen3VLReranker(
+            model = _lazy.Qwen3VLReranker(
                 qwen3_vl_config,
                 is_original_reranker=is_original,
                 classifier_from_token=classifier_tokens,
@@ -508,16 +526,16 @@ class ModelLoader:
     @staticmethod
     def load_multimodal_model(config: Config, multimodal_model_type: str) -> torch.nn.Module:
         """Load a multimodal model."""
-        if multimodal_model_type == "qwen3_5" and QWEN3_5_AVAILABLE:
-            return load_qwen3_5_model(config.model, config)
-        elif multimodal_model_type == "qwen3_vl" and QWEN3_VL_AVAILABLE:
-            return load_qwen3_vl_model(config.model, config)
-        elif multimodal_model_type == "qwen2_vl" and QWEN2_VL_AVAILABLE:
-            return load_qwen2_vl_model(config.model, config)
-        elif multimodal_model_type == "qwen2_5_vl" and QWEN2_5_VL_AVAILABLE:
-            return load_qwen2_5_vl_model(config.model, config)
-        elif multimodal_model_type == "llavanext" and LLAVANEXT_AVAILABLE:
-            return load_llavanext_model(config.model, config)
+        if multimodal_model_type == "qwen3_5" and _lazy.QWEN3_5_AVAILABLE:
+            return _lazy.load_qwen3_5_model(config.model, config)
+        elif multimodal_model_type == "qwen3_vl" and _lazy.QWEN3_VL_AVAILABLE:
+            return _lazy.load_qwen3_vl_model(config.model, config)
+        elif multimodal_model_type == "qwen2_vl" and _lazy.QWEN2_VL_AVAILABLE:
+            return _lazy.load_qwen2_vl_model(config.model, config)
+        elif multimodal_model_type == "qwen2_5_vl" and _lazy.QWEN2_5_VL_AVAILABLE:
+            return _lazy.load_qwen2_5_vl_model(config.model, config)
+        elif multimodal_model_type == "llavanext" and _lazy.LLAVANEXT_AVAILABLE:
+            return _lazy.load_llavanext_model(config.model, config)
         else:
             raise ValueError(
                 f"Unsupported multimodal_model_type: {multimodal_model_type} "
@@ -527,8 +545,8 @@ class ModelLoader:
     @staticmethod
     def load_text_model(config: Config, hf_config) -> torch.nn.Module:
         """Load a text-only model."""
-        if hasattr(hf_config, 'model_type') and hf_config.model_type == 'gemma' and GEMMA_AVAILABLE:
-            model = GemmaForCausalLM(hf_config)
+        if hasattr(hf_config, 'model_type') and hf_config.model_type == 'gemma' and _lazy.GEMMA_AVAILABLE:
+            model = _lazy.GemmaForCausalLM(hf_config)
             load_model(model, config.model)
             return model
         else:
@@ -537,14 +555,14 @@ class ModelLoader:
             if not hasattr(text_config, "tie_word_embeddings") and hasattr(hf_config, "tie_word_embeddings"):
                 text_config.tie_word_embeddings = hf_config.tie_word_embeddings
             text_model_type = getattr(text_config, "model_type", None)
-            # Qwen3.5 text models use Qwen3Next or Qwen3_5TextForCausalLM
+            # Qwen3.5 text models use Qwen3Next or _lazy.Qwen3_5TextForCausalLM
             if text_model_type in ("qwen3_next", "qwen3_5", "qwen3_5_moe"):
-                if QWEN3_NEXT_AVAILABLE:
-                    model = Qwen3NextForCausalLM(text_config)
+                if _lazy.QWEN3_NEXT_AVAILABLE:
+                    model = _lazy.Qwen3NextForCausalLM(text_config)
                     load_model(model, config.model)
                     return model
-                elif QWEN3_5_AVAILABLE:
-                    model = Qwen3_5TextForCausalLM(text_config)
+                elif _lazy.QWEN3_5_AVAILABLE:
+                    model = _lazy.Qwen3_5TextForCausalLM(text_config)
                     load_model(model, config.model)
                     return model
             # Default: Qwen3
