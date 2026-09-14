@@ -148,7 +148,7 @@ class MeanPool(PoolingMethod):
     ) -> torch.Tensor:
         batch_size = cu_seqlens.shape[0] - 1
         hidden_size = hidden_states.shape[-1]
-        seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(hidden_states.dtype)
+        seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.float32)
 
         # Segment-reduce per sequence. A global cumsum would accumulate error
         # proportional to the whole batch rather than one sequence.
@@ -156,10 +156,12 @@ class MeanPool(PoolingMethod):
             torch.arange(batch_size, device=hidden_states.device),
             (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long),
         )
+        # Accumulate in float32 like forward() does: bfloat16 index_add_
+        # drifts by ~1e-3 relative error on long sequences.
         sums = torch.zeros(
             batch_size, hidden_size,
-            dtype=hidden_states.dtype,
+            dtype=torch.float32,
             device=hidden_states.device,
         )
-        sums.index_add_(0, segment_ids, hidden_states)
+        sums.index_add_(0, segment_ids, hidden_states.float())
         return sums / seq_lens.clamp_min(1).unsqueeze(-1)

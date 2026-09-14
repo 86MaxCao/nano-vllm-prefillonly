@@ -108,110 +108,114 @@ class ModelRunner:
         torch.set_default_dtype(torch_dtype)
         torch.set_default_device("cuda")
 
-        # Embedding support (check first, as embedding models can be multimodal)
-        self.is_embedding = getattr(config, "is_embedding", False)
-        embedding_type = getattr(config, "embedding_type", None)
-        pooling_type = getattr(config, "pooling_type", "LAST")
-        normalize_embeddings = getattr(config, "normalize_embeddings", True)
+        try:
+            # Embedding support (check first, as embedding models can be multimodal)
+            self.is_embedding = getattr(config, "is_embedding", False)
+            embedding_type = getattr(config, "embedding_type", None)
+            pooling_type = getattr(config, "pooling_type", "LAST")
+            normalize_embeddings = getattr(config, "normalize_embeddings", True)
         
-        # Reranker support (check second, as reranker models can be multimodal)
-        self.is_reranker = getattr(config, "is_reranker", False)
-        reranker_type = getattr(config, "reranker_type", None)
+            # Reranker support (check second, as reranker models can be multimodal)
+            self.is_reranker = getattr(config, "is_reranker", False)
+            reranker_type = getattr(config, "reranker_type", None)
         
-        # Multimodal support is optional; fall back to text-only runner when
-        # the extended VLM stack is not available.
-        # Note: Only set is_multimodal if NOT embedding/reranker (they handle multimodal separately)
-        self.is_multimodal = (
-            getattr(config, "is_multimodal", False) 
-            and _model_loader.MULTIMODAL_AVAILABLE
-            and not self.is_embedding
-            and not self.is_reranker
-        )
-        
-        # Determine target dtype for embedding/reranker models (before model creation)
-        target_dtype = None
-        if self.is_embedding or self.is_reranker:
-            target_dtype = get_target_dtype_for_embedding_reranker(hf_config)
-            torch.set_default_dtype(target_dtype)
-        
-        # Auto-infer model types if not specified
-        if self.is_embedding and embedding_type is None:
-            embedding_type = infer_embedding_type(config, hf_config)
-            if embedding_type is None:
-                raise ValueError("Cannot infer embedding_type. Please specify it explicitly.")
-        
-        if self.is_reranker and reranker_type is None:
-            reranker_type = infer_reranker_type(config, hf_config)
-            if reranker_type is None:
-                raise ValueError("Cannot infer reranker_type. Please specify it explicitly.")
-        
-        multimodal_model_type = getattr(config, "multimodal_model_type", None)
-        if self.is_multimodal and multimodal_model_type is None:
-            multimodal_model_type = infer_multimodal_model_type(config, hf_config)
-            if multimodal_model_type is None:
-                multimodal_model_type = "qwen3_vl"  # default fallback
-        
-        # Load model based on type
-        if self.is_embedding:
-            self.model = ModelLoader.load_embedding_model(
-                config, hf_config, embedding_type, pooling_type,
-                normalize_embeddings, target_dtype
+            # Multimodal support is optional; fall back to text-only runner when
+            # the extended VLM stack is not available.
+            # Note: Only set is_multimodal if NOT embedding/reranker (they handle multimodal separately)
+            self.is_multimodal = (
+                getattr(config, "is_multimodal", False) 
+                and _model_loader.MULTIMODAL_AVAILABLE
+                and not self.is_embedding
+                and not self.is_reranker
             )
-        elif self.is_reranker:
-            self.model = ModelLoader.load_reranker_model(
-                config, hf_config, reranker_type, target_dtype
-            )
-        elif self.is_multimodal:
-            self.model = ModelLoader.load_multimodal_model(
-                config, multimodal_model_type
-            )
-        else:
-            self.model = ModelLoader.load_text_model(config, hf_config)
+        
+            # Determine target dtype for embedding/reranker models (before model creation)
+            target_dtype = None
+            if self.is_embedding or self.is_reranker:
+                target_dtype = get_target_dtype_for_embedding_reranker(hf_config)
+                torch.set_default_dtype(target_dtype)
+        
+            # Auto-infer model types if not specified
+            if self.is_embedding and embedding_type is None:
+                embedding_type = infer_embedding_type(config, hf_config)
+                if embedding_type is None:
+                    raise ValueError("Cannot infer embedding_type. Please specify it explicitly.")
+        
+            if self.is_reranker and reranker_type is None:
+                reranker_type = infer_reranker_type(config, hf_config)
+                if reranker_type is None:
+                    raise ValueError("Cannot infer reranker_type. Please specify it explicitly.")
+        
+            multimodal_model_type = getattr(config, "multimodal_model_type", None)
+            if self.is_multimodal and multimodal_model_type is None:
+                multimodal_model_type = infer_multimodal_model_type(config, hf_config)
+                if multimodal_model_type is None:
+                    multimodal_model_type = "qwen3_vl"  # default fallback
+        
+            # Load model based on type
+            if self.is_embedding:
+                self.model = ModelLoader.load_embedding_model(
+                    config, hf_config, embedding_type, pooling_type,
+                    normalize_embeddings, target_dtype
+                )
+            elif self.is_reranker:
+                self.model = ModelLoader.load_reranker_model(
+                    config, hf_config, reranker_type, target_dtype
+                )
+            elif self.is_multimodal:
+                self.model = ModelLoader.load_multimodal_model(
+                    config, multimodal_model_type
+                )
+            else:
+                self.model = ModelLoader.load_text_model(config, hf_config)
 
-        embed_module = getattr(self.model, "language_model", self.model)
-        if hasattr(embed_module, "model"):
-            embed_module = embed_module.model
-        if not hasattr(embed_module, "embed_tokens"):
-            # Handle transformers Qwen2VLForConditionalGeneration hierarchy:
-            # model.model.language_model.embed_tokens
-            if hasattr(self.model, "model"):
-                inner = getattr(self.model, "model", None)
-                if inner is not None and hasattr(inner, "language_model"):
-                    embed_module = inner.language_model
-        # Keep a reference dtype so that cached vision embeddings can be copied
-        # back to the GPU without hitting dtype mismatches.
-        self.model_dtype = embed_module.embed_tokens.weight.dtype
-        self._image_token_id = getattr(hf_config, "image_token_id", 151655)
-        self.sampler = Sampler()
+            embed_module = getattr(self.model, "language_model", self.model)
+            if hasattr(embed_module, "model"):
+                embed_module = embed_module.model
+            if not hasattr(embed_module, "embed_tokens"):
+                # Handle transformers Qwen2VLForConditionalGeneration hierarchy:
+                # model.model.language_model.embed_tokens
+                if hasattr(self.model, "model"):
+                    inner = getattr(self.model, "model", None)
+                    if inner is not None and hasattr(inner, "language_model"):
+                        embed_module = inner.language_model
+            # Keep a reference dtype so that cached vision embeddings can be copied
+            # back to the GPU without hitting dtype mismatches.
+            self.model_dtype = embed_module.embed_tokens.weight.dtype
+            self._image_token_id = getattr(hf_config, "image_token_id", 151655)
+            self.sampler = Sampler()
         
-        # Model dtype should already be correct (converted before load_model)
-        # But verify for safety (for embedding/reranker models)
-        if self.is_embedding or self.is_reranker:
-            model_dtype = next(self.model.parameters()).dtype
-            if model_dtype == torch.float32:
-                logger.warning("Model dtype is still %s after loading; converting to float16 for FlashAttention compatibility", model_dtype)
-                self.model = self.model.to(torch.float16)
-                # Explicitly clear cache to free the float32 model memory
-                torch.cuda.empty_cache()
+            # Model dtype should already be correct (converted before load_model)
+            # But verify for safety (for embedding/reranker models)
+            if self.is_embedding or self.is_reranker:
+                model_dtype = next(self.model.parameters()).dtype
+                if model_dtype == torch.float32:
+                    logger.warning("Model dtype is still %s after loading; converting to float16 for FlashAttention compatibility", model_dtype)
+                    self.model = self.model.to(torch.float16)
+                    # Explicitly clear cache to free the float32 model memory
+                    torch.cuda.empty_cache()
         
-        # Initialize GDN layer references before warmup (run_model checks self._gdn_layers)
-        self._gdn_layers = []
-        if hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'model'):
-            for layer in self.model.language_model.model.layers:
-                if hasattr(layer, 'linear_attn') and layer.linear_attn is not None:
-                    self._gdn_layers.append(layer.linear_attn)
-        self._gdn_slot_manager = GDNSlotManager(max_slots=512)
-        self._gdn_slot_tensor = torch.zeros(512, dtype=torch.int64, device="cuda")
+            # Initialize GDN layer references before warmup (run_model checks self._gdn_layers)
+            self._gdn_layers = []
+            if hasattr(self.model, 'language_model') and hasattr(self.model.language_model, 'model'):
+                for layer in self.model.language_model.model.layers:
+                    if hasattr(layer, 'linear_attn') and layer.linear_attn is not None:
+                        self._gdn_layers.append(layer.linear_attn)
+            self._gdn_slot_manager = GDNSlotManager(max_slots=512)
+            self._gdn_slot_tensor = torch.zeros(512, dtype=torch.int64, device="cuda")
         
-        self.warmup_model()
-        # Reset GatedDeltaNet states after warmup to avoid polluting real sequences
-        for gdn in self._gdn_layers:
-            gdn.reset_state()
-        self.allocate_kv_cache()
-        if not self.enforce_eager:
-            self.capture_cudagraph()
-        torch.set_default_device("cpu")
-        torch.set_default_dtype(default_dtype)
+            self.warmup_model()
+            # Reset GatedDeltaNet states after warmup to avoid polluting real sequences
+            for gdn in self._gdn_layers:
+                gdn.reset_state()
+            self.allocate_kv_cache()
+            if not self.enforce_eager:
+                self.capture_cudagraph()
+        finally:
+            # Restore the process-global defaults even if initialisation
+            # fails halfway (model load, warmup, KV allocation, OOM).
+            torch.set_default_device("cpu")
+            torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
             if rank == 0:
@@ -1080,9 +1084,11 @@ class ModelRunner:
                 # Pass sequence_lengths for VL rerankers that need it
                 if attention_mask is not None:
                     kwargs["sequence_lengths"] = attention_mask.sum(dim=1).cpu().tolist()
-                embeddings = self.model(**kwargs)
                 from nanovllm.utils.context import reset_context
-                reset_context()
+                try:
+                    embeddings = self.model(**kwargs)
+                finally:
+                    reset_context()
                 return embeddings
             else:
                 # Native nano-vllm model (e.g. Qwen3VLEmbedding)
@@ -1318,8 +1324,10 @@ class ModelRunner:
                     kwargs["pixel_values"] = pixel_values
                 if image_grid_thw is not None:
                     kwargs["image_grid_thw"] = image_grid_thw
-                scores = self.model(**kwargs)
-                reset_context()
+                try:
+                    scores = self.model(**kwargs)
+                finally:
+                    reset_context()
                 return scores
         
         # For multimodal rerankers, use batch format (transformers models require it)
@@ -1350,10 +1358,12 @@ class ModelRunner:
                 # Pass sequence_lengths for VL rerankers that need it
                 if attention_mask is not None:
                     kwargs["sequence_lengths"] = attention_mask.sum(dim=1).cpu().tolist()
-                
-                scores = self.model(**kwargs)
-                
-                reset_context()
+
+                from nanovllm.utils.context import reset_context
+                try:
+                    scores = self.model(**kwargs)
+                finally:
+                    reset_context()
                 return scores
             else:
                 # Native nano-vllm model (e.g. Qwen3VLReranker)
@@ -1467,72 +1477,71 @@ class ModelRunner:
         if pixel_values is not None and hasattr(self.model, 'forward'):
             # Multimodal reranker with compute_score (e.g., Qwen3VLReranker)
             # Need to pass pixel_values and related params for vision processing
-            seq_image_indices, seq_vision_placeholders = self._build_vision_placeholders(
-                input_ids, attention_mask, image_grid_thw, batch_size
-            )
+            try:
+                seq_image_indices, seq_vision_placeholders = self._build_vision_placeholders(
+                    input_ids, attention_mask, image_grid_thw, batch_size
+                )
 
-            # Call model with multimodal params - it returns scores directly
-            # when sequence_lengths is provided
-            scores = self.model(
-                input_ids=input_ids_flat,
-                positions=positions_flat,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                sequence_lengths=seq_lens,
-                seq_image_indices=seq_image_indices,
-                seq_vision_placeholders=seq_vision_placeholders,
-            )
-            reset_context()
-            return scores
-        
-        hidden_states_varlen = self.model(input_ids_flat, positions_flat)
-
-        # Compute scores directly from varlen hidden states when possible
-        if hasattr(self.model, 'compute_score_varlen'):
-            scores = self.model.compute_score_varlen(
-                hidden_states_varlen, cu_seqlens_q
-            )
-            reset_context()
+                # Call model with multimodal params - it returns scores directly
+                # when sequence_lengths is provided
+                scores = self.model(
+                    input_ids=input_ids_flat,
+                    positions=positions_flat,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    sequence_lengths=seq_lens,
+                    seq_image_indices=seq_image_indices,
+                    seq_vision_placeholders=seq_vision_placeholders,
+                )
+            finally:
+                reset_context()
             return scores
 
-        # Listwise reranker (jina_v3) needs padded format for token search
-        if hasattr(self.model, 'compute_scores'):
-            hidden_size = hidden_states_varlen.shape[-1]
-            hidden_states = torch.zeros(
-                batch_size, seq_len, hidden_size,
-                dtype=hidden_states_varlen.dtype,
-                device=hidden_states_varlen.device
-            )
-            if attention_mask is not None:
-                mask = attention_mask.bool()
-                hidden_states[mask] = hidden_states_varlen
+        try:
+            hidden_states_varlen = self.model(input_ids_flat, positions_flat)
+
+            # Compute scores directly from varlen hidden states when possible
+            if hasattr(self.model, 'compute_score_varlen'):
+                return self.model.compute_score_varlen(
+                    hidden_states_varlen, cu_seqlens_q
+                )
+
+            # Listwise reranker (jina_v3) needs padded format for token search
+            if hasattr(self.model, 'compute_scores'):
+                hidden_size = hidden_states_varlen.shape[-1]
+                hidden_states = torch.zeros(
+                    batch_size, seq_len, hidden_size,
+                    dtype=hidden_states_varlen.dtype,
+                    device=hidden_states_varlen.device
+                )
+                if attention_mask is not None:
+                    mask = attention_mask.bool()
+                    hidden_states[mask] = hidden_states_varlen
+                else:
+                    hidden_states = hidden_states_varlen.view(batch_size, seq_len, -1)
+                return self.model.compute_scores(
+                    hidden_states, input_ids
+                )
+            elif hasattr(self.model, 'compute_score'):
+                # Fallback: pad-back for models without varlen support
+                hidden_size = hidden_states_varlen.shape[-1]
+                hidden_states = torch.zeros(
+                    batch_size, seq_len, hidden_size,
+                    dtype=hidden_states_varlen.dtype,
+                    device=hidden_states_varlen.device
+                )
+                if attention_mask is not None:
+                    mask = attention_mask.bool()
+                    hidden_states[mask] = hidden_states_varlen
+                else:
+                    hidden_states = hidden_states_varlen.view(batch_size, seq_len, -1)
+                return self.model.compute_score(
+                    hidden_states, token_indices, attention_mask
+                )
             else:
-                hidden_states = hidden_states_varlen.view(batch_size, seq_len, -1)
-            scores, query_embeds, doc_embeds = self.model.compute_scores(
-                hidden_states, input_ids
-            )
+                raise ValueError("Model does not support reranking.")
+        finally:
             reset_context()
-            return scores, query_embeds, doc_embeds
-        elif hasattr(self.model, 'compute_score'):
-            # Fallback: pad-back for models without varlen support
-            hidden_size = hidden_states_varlen.shape[-1]
-            hidden_states = torch.zeros(
-                batch_size, seq_len, hidden_size,
-                dtype=hidden_states_varlen.dtype,
-                device=hidden_states_varlen.device
-            )
-            if attention_mask is not None:
-                mask = attention_mask.bool()
-                hidden_states[mask] = hidden_states_varlen
-            else:
-                hidden_states = hidden_states_varlen.view(batch_size, seq_len, -1)
-            scores = self.model.compute_score(
-                hidden_states, token_indices, attention_mask
-            )
-            reset_context()
-            return scores
-        else:
-            raise ValueError("Model does not support reranking.")
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         """Run model forward pass for generation.
@@ -1547,6 +1556,21 @@ class ModelRunner:
         else:
             input_ids, positions = self.prepare_decode(seqs)
 
+        # prepare_prefill/prepare_decode set the global attention context for
+        # this forward; make sure it is cleared even if the forward raises,
+        # otherwise the next request inherits stale cu_seqlens/slot mappings.
+        try:
+            return self._run_forward(seqs, is_prefill, input_ids, positions)
+        finally:
+            reset_context()
+
+    def _run_forward(
+        self,
+        seqs: list[Sequence],
+        is_prefill: bool,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> list[int]:
         # Track how many freshly decoded tokens each sequence contributes; the
         # model uses these lengths to align partial vision slices with text.
         sequence_lengths = (
@@ -1729,7 +1753,6 @@ class ModelRunner:
             token_ids = self.sampler(logits, temperatures, top_p).tolist()
         else:
             token_ids = None
-        reset_context()
         return token_ids
 
     @torch.inference_mode()
@@ -1775,22 +1798,24 @@ class ModelRunner:
                 context_lens=context_lens[:bs],
                 block_tables=block_tables[:bs],
             )
-            extra_kwargs = {}
-            if self._gdn_layers:
-                extra_kwargs["sequence_lengths"] = [1] * bs
-                extra_kwargs["use_graph"] = True
-            outputs[:bs] = self.model(
-                input_ids[:bs], positions[:bs], **extra_kwargs
-            )  # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
+            try:
+                extra_kwargs = {}
+                if self._gdn_layers:
+                    extra_kwargs["sequence_lengths"] = [1] * bs
+                    extra_kwargs["use_graph"] = True
                 outputs[:bs] = self.model(
                     input_ids[:bs], positions[:bs], **extra_kwargs
-                )  # capture
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
-            reset_context()
+                )  # warmup
+                with torch.cuda.graph(graph, self.graph_pool):
+                    outputs[:bs] = self.model(
+                        input_ids[:bs], positions[:bs], **extra_kwargs
+                    )  # capture
+                if self.graph_pool is None:
+                    self.graph_pool = graph.pool()
+                self.graphs[bs] = graph
+                torch.cuda.synchronize()
+            finally:
+                reset_context()
 
         # Final cleanup before serving real requests.
         self._reset_gdn_states()

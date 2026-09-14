@@ -75,6 +75,21 @@ class LLMEngine:
             )
         return self._processor
 
+    @staticmethod
+    def _normalize_pixel_values(pixel_values, num_texts: int):
+        """Normalise processor pixel_values to 2-D (total_patches, channels).
+
+        Some processors return (num_images, num_patches, channels); the model
+        runner expects the patches of all images concatenated along dim 0.
+        """
+        if pixel_values is None:
+            return None
+        if pixel_values.dim() == 3 and pixel_values.shape[0] == num_texts:
+            return pixel_values.reshape(-1, pixel_values.shape[-1])
+        if pixel_values.dim() == 2:
+            return pixel_values
+        return pixel_values.reshape(-1, pixel_values.shape[-1])
+
     def _expand_vision_placeholders(
         self,
         input_ids: list[int],
@@ -592,10 +607,26 @@ class LLMEngine:
             messages_batch = []
             text_only_fallback_indices = []
             
+            # Qwen3-VL embedding models follow the official script
+            # (scripts/qwen3_vl_embedding.py): system instruction +
+            # add_generation_prompt=True, last-token pooling, no anchor.
+            # NOTE: do NOT append the endoftext anchor manually: the Qwen
+            # embedding tokenizers auto-append it via add_special_tokens,
+            # so a manual append doubles it and shifts pooling.
+            embed_type = getattr(self.model_runner.config, "embedding_type", None)
+            is_qwen3_vl_embed = embed_type == "qwen3_vl"
+
             for i, text in enumerate(texts):
-                if images and i < len(images):
+                if images and i < len(images) and images[i] is not None:
                     img = images[i] if isinstance(images[i], list) else [images[i]]
                     messages_batch.append([
+                        *(
+                            [{
+                                "role": "system",
+                                "content": [{"type": "text", "text": "Represent the user's input."}],
+                            }]
+                            if is_qwen3_vl_embed else []
+                        ),
                         {
                             "role": "user",
                             "content": [
@@ -607,29 +638,33 @@ class LLMEngine:
                     all_images_list.append(img[0])
                 else:
                     messages_batch.append([
+                        *(
+                            [{
+                                "role": "system",
+                                "content": [{"type": "text", "text": "Represent the user's input."}],
+                            }]
+                            if is_qwen3_vl_embed else []
+                        ),
                         {"role": "user", "content": [{"type": "text", "text": text}]}
                     ])
                     all_images_list.append(None)
                     text_only_fallback_indices.append(i)
-            
+
             # Batch apply_chat_template (much faster than serial calls)
             try:
                 all_formatted_texts = processor.apply_chat_template(
-                    messages_batch, tokenize=False, add_generation_prompt=False,
+                    messages_batch, tokenize=False,
+                    add_generation_prompt=is_qwen3_vl_embed,
                 )
             except (AttributeError, TypeError):
                 # Fallback to serial if batch not supported
                 all_formatted_texts = []
                 for msgs in messages_batch:
                     all_formatted_texts.append(
-                        processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+                        processor.apply_chat_template(
+                            msgs, tokenize=False, add_generation_prompt=is_qwen3_vl_embed)
                     )
-            
-            # Qwen3 embedding models use <|endoftext|> as pooling anchor
-            embed_type = getattr(self.model_runner.config, "embedding_type", None)
-            if embed_type in ("qwen3", "qwen3_vl"):
-                all_formatted_texts = [t + "<|endoftext|>" for t in all_formatted_texts]
-            
+
             # Filter out None images and process in batches
             # Separate multimodal and text-only samples
             multimodal_texts = []
@@ -727,78 +762,39 @@ class LLMEngine:
                 # Merge in original order
                 input_ids_list = [None] * batch_size
                 attention_mask_list = [None] * batch_size
-                pixel_values_list = [None] * batch_size
-                image_grid_thw_list = [None] * batch_size
-                
+
                 for idx, orig_idx in enumerate(multimodal_indices):
                     input_ids_list[orig_idx] = multimodal_input_ids[idx]
                     if multimodal_attention_mask is not None:
                         attention_mask_list[orig_idx] = multimodal_attention_mask[idx]
-                    if multimodal_pixel_values is not None:
-                        pixel_values_list[orig_idx] = multimodal_pixel_values[idx]
-                    if multimodal_image_grid_thw is not None:
-                        image_grid_thw_list[orig_idx] = multimodal_image_grid_thw[idx]
-                
+
                 for idx, orig_idx in enumerate(text_only_indices):
                     input_ids_list[orig_idx] = text_only_input_ids[idx]
                     if text_only_attention_mask is not None:
                         attention_mask_list[orig_idx] = text_only_attention_mask[idx]
-                
+
                 input_ids_tensor = torch.stack(input_ids_list)
                 if attention_mask_list[0] is not None:
                     attention_mask_tensor = torch.stack(attention_mask_list)
                 else:
                     attention_mask_tensor = None
-                
-                # Handle pixel_values and image_grid_thw
-                if any(pv is not None for pv in pixel_values_list):
-                    # Ensure each pv is 2D (num_patches, cps) before concatenating
-                    pv_list = []
-                    for pv in pixel_values_list:
-                        if pv is not None:
-                            # If 3D, squeeze or reshape to 2D
-                            if pv.dim() == 3:
-                                # (1, num_patches, cps) -> (num_patches, cps)
-                                if pv.shape[0] == 1:
-                                    pv = pv.squeeze(0)
-                                else:
-                                    # (batch, num_patches, cps) -> (batch*num_patches, cps)
-                                    pv = pv.view(-1, pv.shape[-1])
-                            elif pv.dim() > 2:
-                                # Other high-dim cases, reshape to 2D
-                                pv = pv.view(-1, pv.shape[-1])
-                            pv_list.append(pv)
-                    pixel_values_batch = torch.cat(pv_list, dim=0) if pv_list else None
-                else:
-                    pixel_values_batch = None
-                
-                if any(thw is not None for thw in image_grid_thw_list):
-                    image_grid_thw_batch = torch.stack([thw for thw in image_grid_thw_list if thw is not None], dim=0)
-                else:
-                    image_grid_thw_batch = None
+
+                # pixel_values / image_grid_thw from the processor are already
+                # concatenated over the multimodal requests (in order). They are
+                # NOT per-sequence rows: indexing pixel_values[idx] would grab a
+                # single patch row, not a whole image. The model runner assigns
+                # images to sequences by scanning placeholder tokens, so the
+                # concatenated tensors keep the correct mapping.
+                pixel_values_batch = self._normalize_pixel_values(
+                    multimodal_pixel_values, len(multimodal_texts)
+                )
+                image_grid_thw_batch = multimodal_image_grid_thw
             elif multimodal_input_ids is not None:
                 input_ids_tensor = multimodal_input_ids
                 attention_mask_tensor = multimodal_attention_mask
-                # Ensure pixel_values is 2D (total_patches, cps) format
-                if multimodal_pixel_values is not None:
-                    if multimodal_pixel_values.dim() == 3:
-                        # (batch, num_patches, cps) -> (batch*num_patches, cps)
-                        # But wait, this might be wrong - processor might return per-image format
-                        # Check if it's already flattened or needs flattening
-                        if multimodal_pixel_values.shape[0] == len(multimodal_texts):
-                            # Likely (batch, num_patches_per_image, cps) - need to flatten
-                            pixel_values_batch = multimodal_pixel_values.view(-1, multimodal_pixel_values.shape[-1])
-                        else:
-                            # Already in correct format or single image
-                            pixel_values_batch = multimodal_pixel_values
-                    elif multimodal_pixel_values.dim() == 2:
-                        # Already in correct format (total_patches, cps)
-                        pixel_values_batch = multimodal_pixel_values
-                    else:
-                        # Other cases, try to reshape to 2D
-                        pixel_values_batch = multimodal_pixel_values.view(-1, multimodal_pixel_values.shape[-1])
-                else:
-                    pixel_values_batch = None
+                pixel_values_batch = self._normalize_pixel_values(
+                    multimodal_pixel_values, len(multimodal_texts)
+                )
                 image_grid_thw_batch = multimodal_image_grid_thw
             else:
                 input_ids_tensor = text_only_input_ids
@@ -822,11 +818,9 @@ class LLMEngine:
                     # Decode token IDs to string
                     all_texts.append(self.tokenizer.decode(text))
             
-            # Qwen3 embedding models use <|endoftext|> as pooling anchor
-            embed_type = getattr(self.model_runner.config, "embedding_type", None)
-            if embed_type in ("qwen3", "qwen3_vl"):
-                all_texts = [t + "<|endoftext|>" for t in all_texts]
-            
+            # Qwen3-Embedding tokenizers auto-append the endoftext
+            # token via add_special_tokens, matching the official model
+            # card usage; do not append it manually (it would double).
             # Batch tokenize with left padding
             tokenized = self.tokenizer(
                 all_texts,
