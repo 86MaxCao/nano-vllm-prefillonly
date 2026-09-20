@@ -102,6 +102,22 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
+def _interleave_prefix_suffix(prefix_per_seq, k, v, bounds):
+    """Rebuild varlen k/v as [prefix_i ++ suffix_i] per sequence.
+
+    ``prefix_per_seq`` is a list of (k_prefix, v_prefix) per batch row,
+    ``k``/``v`` hold only the suffix tokens in varlen layout, and ``bounds``
+    is the CPU cumulative suffix-length list (len batch+1).
+    """
+    ks, vs = [], []
+    for (k_prefix, v_prefix), start, end in zip(prefix_per_seq, bounds[:-1], bounds[1:]):
+        ks.append(k_prefix)
+        ks.append(k[start:end])
+        vs.append(v_prefix)
+        vs.append(v[start:end])
+    return torch.cat(ks, dim=0), torch.cat(vs, dim=0)
+
+
 class Attention(nn.Module):
 
     def __init__(
@@ -140,6 +156,17 @@ class Attention(nn.Module):
             context.slot_mapping.numel() > 0):
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
+            if context.kv_capture is not None:
+                # Prefix creation: stash this layer's post-RoPE K/V.
+                context.kv_capture.append((k, v))
+            if context.prefix_kv is not None:
+                # Suffix forward: prepend each sequence's cached prefix K/V;
+                # cu_seqlens_k already spans prefix+suffix per sequence.
+                layer = context.attn_call_index
+                context.attn_call_index = layer + 1
+                k, v = _interleave_prefix_suffix(
+                    context.prefix_kv[layer], k, v, context.prefix_kv_bounds
+                )
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,

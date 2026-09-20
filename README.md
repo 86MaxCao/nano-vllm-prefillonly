@@ -8,6 +8,8 @@ A specialized optimization of [nano-vllm](https://github.com/GeeeekExplorer/nano
 
 > **Motivation**: This project addresses the problem described in [vllm-project/vllm#29584](https://github.com/vllm-project/vllm/issues/29584) — vLLM unconditionally allocates KV cache even for non-autoregressive tasks (embedding, reranking, classification), wasting up to **80-98% of GPU memory** on completely unused cache tensors. The vLLM maintainers acknowledged this issue but noted that fixing it "would require modifications to a lot of core code" and closed it as not planned. Our framework solves this by **completely eliminating KV cache allocation** for prefill-only workloads, enabling single-GPU deployment of models that would otherwise require multi-GPU setups under vLLM.
 
+> **Branch `feat/prefill-kv-cache`**: adds an **opt-in prefix KV / GDN state cache** on top of the stateless prefill engine. When many requests share a long common prefix (e.g. the same evidence text or image scored against many questions), the prefix is prefilled **once** into a quota-managed store, deep-copy **forked** per request, and only the short suffixes go through the forward pass — serially or as **one batched suffix forward**. Covers pure-attention models (Qwen3), GatedDeltaNet hybrid models (Qwen3.5: conv + recurrent state fork), and multimodal prefixes (Qwen3-VL / Qwen2.5-VL with M-RoPE offset continuation). The default prefill-only path is unchanged: no state is kept unless you call the prefix API.
+
 ## 🎯 Why Prefill-Only?
 
 Most real-world business scenarios are **prefill-only tasks**, especially in discriminative applications:
@@ -102,6 +104,7 @@ All three tasks — classification, embedding, and reranking — are **prefill-o
 * 🔧 **Based on nano-vllm** - Built on top of the clean, readable nano-vllm codebase
 * 🧩 **[Hybrid Prefilling](https://arxiv.org/abs/2505.07203)** - Chunk MLP execution to reduce peak activation memory by **70%+** for long video understanding (see [`feat/hybrid-prefilling`](../../tree/feat/hybrid-prefilling) branch)
 * 🔢 **M-RoPE Support** - Native multimodal 3D rotary position embedding (t/h/w) for Qwen3-VL and Qwen2.5-VL, covering both the interleaved (`mrope_interleaved`) and chunked layouts — verified bit-exact against HF Transformers
+* 🗂️ **Prefix KV / GDN State Reuse** *(this branch)* - Prefill a shared prefix once, fork it per request, and score only the suffixes — **3.3x faster** than 8x full prefill (Qwen3-0.6B, 2k-token prefix, 8 suffixes). Supports Qwen3, Qwen3.5 (GDN conv/recurrent state fork), and image-bearing prefixes (M-RoPE offset)
 
 ## 📊 Performance Benchmarks
 
@@ -313,6 +316,30 @@ images = [Image.open("photo.jpg")]
 pairs = [("Find a building", "A document about architecture")]
 scores = llm.rerank_batch(pairs, images=images)  # [batch_size]
 ```
+
+### Prefix Reuse (branch `feat/prefill-kv-cache`)
+
+When many requests share a long common prefix, prefill it once and score only the suffixes:
+
+```python
+from nanovllm import LLM
+
+llm = LLM("Qwen/Qwen3-0.6B", enforce_eager=True)
+
+# One shared prefix (e.g. evidence text), N different suffixes (e.g. questions)
+handle = llm.prefill_prefix(prefix_ids)            # prefill once, KV stored
+forks = llm.fork_prefix(handle, len(suffix_ids))   # deep copy per request
+result = llm.prefill_suffix_logits(                # ONE batched suffix forward
+    forks, suffix_ids, candidate_token_ids,
+)
+llm.release_prefix(*forks, handle)                 # quota is returned
+```
+
+- Serial shape: fork 1 copy per request and call `prefill_suffix_logits` with a single row; a repeated prefix hits the stored entry instead of re-prefilling.
+- Shared shape: fork N copies and score all suffixes in one batched forward (example above).
+- Multimodal: `prefill_prefix` also accepts `{"text"/"messages", "images"}` dicts; the recorded M-RoPE end position lets text-only suffixes continue after image tokens. Suffixes must be text-only.
+- Handles are accounted against a byte quota (`max_prefix_cache_bytes`, default 4 GiB); overflow raises instead of evicting, so release handles promptly.
+- Tensor-parallel size > 1 is not supported by the prefix API (raises).
 
 ## 🏗️ Supported Models
 

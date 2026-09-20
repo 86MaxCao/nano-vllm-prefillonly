@@ -21,6 +21,7 @@ from nanovllm.engine.model_loader import (
     infer_multimodal_model_type,
 )
 from nanovllm.engine.multimodal_handler import MultimodalHandler
+from nanovllm.engine.prefix_cache import PrefixCacheStore, PrefixEntry
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 
@@ -105,6 +106,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self._prefix_store = PrefixCacheStore(config.max_prefix_cache_bytes)
 
         # Check if process group is already initialized
         if not dist.is_initialized():
@@ -1735,6 +1737,245 @@ class ModelRunner:
                 return None
             gathered = logits.gather(1, candidate_token_ids)
             return gathered.to("cpu", torch.float32)
+        finally:
+            reset_context()
+            self.cleanup_seq_states(seq_ids)
+
+    @torch.inference_mode()
+    def prefix_create(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        seq_ids: list[int],
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+    ) -> int:
+        """Prefill one sequence and capture per-layer KV into the prefix store.
+
+        Single sequence only: one handle always maps to one prefix. The
+        forward output is discarded; each attention layer's post-RoPE K/V
+        (and each GDN layer's conv/recurrent state) is captured through the
+        context and cloned into a PrefixEntry.
+
+        With ``pixel_values``/``image_grid_thw`` the prefix runs through the
+        vision tower first (same fallback path as ``last_logits``); the
+        model computes M-RoPE positions internally and the resulting M-RoPE
+        end position is recorded in ``multimodal_meta["mrope_end"]`` so
+        suffix forwards can continue the position sequence after the last
+        image.
+        """
+        model_device = next(self.model.parameters()).device
+        input_ids = input_ids.to(model_device)
+        attention_mask = attention_mask.to(model_device)
+        if pixel_values is not None:
+            pixel_values = pixel_values.to(model_device)
+            image_grid_thw = image_grid_thw.to(model_device)
+        if input_ids.shape[0] != 1:
+            raise ValueError("prefix_create handles exactly one sequence")
+        seq_len = int(attention_mask.sum().item())
+        if seq_len < 1:
+            raise ValueError("prefix must contain at least one token")
+
+        ids_flat = input_ids[attention_mask.bool()]
+        positions = torch.arange(seq_len, dtype=torch.int64, device=model_device)
+        cu_seqlens = torch.tensor([0, seq_len], dtype=torch.int32, device=model_device)
+        capture: list = []
+        gdn_capture: list = [] if self._gdn_layers else None
+        slot_mapping = torch.empty(0, dtype=torch.int32, device=model_device)
+        set_context(
+            True,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=seq_len,
+            max_seqlen_k=seq_len,
+            slot_mapping=slot_mapping,
+            kv_capture=capture,
+            gdn_capture=gdn_capture,
+        )
+        multimodal_meta = None
+        try:
+            model_kwargs: dict = {}
+            if self._gdn_layers:
+                # Same routing contract as last_logits: explicit lengths and
+                # ids send every GDN layer down forward_batch_prefill.
+                model_kwargs["sequence_lengths"] = [seq_len]
+                model_kwargs["sequence_ids"] = seq_ids
+            if pixel_values is not None:
+                seq_image_indices, seq_vision_placeholders = (
+                    self._build_vision_placeholders(
+                        input_ids, attention_mask, image_grid_thw, 1
+                    )
+                )
+                model_kwargs["sequence_lengths"] = [seq_len]
+                model_kwargs.update({
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": image_grid_thw,
+                    "seq_image_indices": seq_image_indices,
+                    "seq_vision_placeholders": seq_vision_placeholders,
+                })
+            self.model(ids_flat, positions, **model_kwargs)
+            if pixel_values is not None:
+                # The model's use_mrope branch recomputes these positions
+                # internally from the same inputs; we need the end position
+                # so suffix forwards continue the M-RoPE sequence after the
+                # last image instead of restarting at prefix_len.
+                from nanovllm.layers.rotary_embedding import (
+                    build_mrope_positions,
+                )
+
+                visual_config = getattr(
+                    getattr(self.model, "visual", None), "config", None
+                )
+                spatial_merge = (
+                    getattr(visual_config, "spatial_merge_size", 2) or 2
+                )
+                mrope = build_mrope_positions(
+                    [seq_len],
+                    seq_vision_placeholders,
+                    image_grid_thw,
+                    spatial_merge,
+                    model_device,
+                )
+                multimodal_meta = {
+                    "mrope_end": int(mrope[:, -1].max().item()) + 1
+                }
+        finally:
+            reset_context()
+            self.cleanup_seq_states(seq_ids)
+        if not capture and not self._gdn_layers:
+            raise RuntimeError("no attention KV captured for the prefix")
+        if self._gdn_layers and len(gdn_capture) != len(self._gdn_layers):
+            raise RuntimeError(
+                f"GDN state capture mismatch: {len(gdn_capture)} layers "
+                f"captured, expected {len(self._gdn_layers)}"
+            )
+        entry = PrefixEntry(
+            prefix_len=seq_len,
+            kv=[(k.clone(), v.clone()) for k, v in capture],
+            gdn=[
+                (layer_states[0][0].clone(), layer_states[0][1].clone())
+                for layer_states in (gdn_capture or [])
+            ],
+            multimodal_meta=multimodal_meta,
+        )
+        return self._prefix_store.create(entry)
+
+    def prefix_fork(self, handle: int, n: int) -> list[int]:
+        return self._prefix_store.fork(handle, n)
+
+    def release_prefix(self, *handles: int) -> None:
+        self._prefix_store.release(*handles)
+
+    @torch.inference_mode()
+    def prefix_suffix_logits(
+        self,
+        handles: list[int],
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        candidate_token_ids: torch.Tensor,
+        seq_ids: list[int],
+    ) -> tuple[torch.Tensor | None, list[int]]:
+        """Batched suffix forward over cached prefixes; candidate logits only.
+
+        Each row's attention context is its handle's cached prefix K/V plus
+        its own suffix tokens (positions offset by the prefix length). Readout
+        contract matches ``last_logits``: last real token per row, candidate
+        columns gathered on GPU, [batch, num_candidates] float32 on CPU.
+        """
+        model_device = next(self.model.parameters()).device
+        input_ids = input_ids.to(model_device)
+        attention_mask = attention_mask.to(model_device)
+        candidate_token_ids = candidate_token_ids.to(model_device)
+        if len(handles) != input_ids.shape[0]:
+            raise ValueError(
+                f"handles ({len(handles)}) and suffix batch "
+                f"({input_ids.shape[0]}) must have equal length"
+            )
+        entries = [self._prefix_store.get(h) for h in handles]
+        prefix_lens = [entry.prefix_len for entry in entries]
+        n_layers = len(entries[0].kv)
+        if any(len(entry.kv) != n_layers for entry in entries):
+            raise ValueError("prefix entries have inconsistent layer counts")
+        n_gdn = len(entries[0].gdn)
+        if any(len(entry.gdn) != n_gdn for entry in entries):
+            raise ValueError("prefix entries have inconsistent GDN layer counts")
+        suffix_lens = [int(n) for n in attention_mask.sum(dim=1).tolist()]
+        if any(n < 1 for n in suffix_lens):
+            raise ValueError("every suffix must contain at least one token")
+        max_total = max(p + s for p, s in zip(prefix_lens, suffix_lens))
+        if max_total > self.config.max_model_len:
+            raise ValueError(
+                f"prefix+suffix length {max_total} exceeds "
+                f"max_model_len {self.config.max_model_len}"
+            )
+        # Position of each row's first suffix token. Multimodal prefixes
+        # continue from the recorded M-RoPE end position (images advance
+        # positions by more than their token count); text prefixes simply
+        # continue at prefix_len.
+        pos_starts = [
+            (entry.multimodal_meta or {}).get("mrope_end", entry.prefix_len)
+            for entry in entries
+        ]
+        max_pos = max(st + s for st, s in zip(pos_starts, suffix_lens))
+        if max_pos > self.config.max_model_len:
+            raise ValueError(
+                f"max suffix position {max_pos} exceeds "
+                f"max_model_len {self.config.max_model_len}"
+            )
+
+        mask = attention_mask.bool()
+        ids_flat = input_ids[mask]
+        positions_flat = torch.cat([
+            torch.arange(st, st + s, dtype=torch.int64, device=model_device)
+            for st, s in zip(pos_starts, suffix_lens)
+        ])
+        cu_q = torch.zeros(len(handles) + 1, dtype=torch.int32, device=model_device)
+        cu_q[1:] = torch.cumsum(
+            torch.tensor(suffix_lens, dtype=torch.int32, device=model_device), dim=0
+        )
+        cu_k = torch.zeros(len(handles) + 1, dtype=torch.int32, device=model_device)
+        cu_k[1:] = torch.cumsum(
+            torch.tensor(
+                [p + s for p, s in zip(prefix_lens, suffix_lens)],
+                dtype=torch.int32, device=model_device,
+            ),
+            dim=0,
+        )
+        prefix_kv = [
+            [entry.kv[layer] for entry in entries] for layer in range(n_layers)
+        ]
+        gdn_initial = [
+            [entry.gdn[layer] for entry in entries] for layer in range(n_gdn)
+        ] or None
+        bounds = [0]
+        for suffix_len in suffix_lens:
+            bounds.append(bounds[-1] + suffix_len)
+        slot_mapping = torch.empty(0, dtype=torch.int32, device=model_device)
+        set_context(
+            True,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=max(suffix_lens),
+            max_seqlen_k=max_total,
+            slot_mapping=slot_mapping,
+            prefix_kv=prefix_kv,
+            prefix_kv_bounds=bounds,
+            gdn_initial=gdn_initial,
+        )
+        try:
+            model_kwargs: dict = {}
+            if self._gdn_layers:
+                model_kwargs["sequence_lengths"] = suffix_lens
+                model_kwargs["sequence_ids"] = seq_ids
+            hidden = self.model(ids_flat, positions_flat, **model_kwargs)
+            last_hidden = self._select_last_tokens(hidden)
+            logits = self.model.compute_logits(last_hidden)
+            if self.rank != 0:
+                return None, prefix_lens
+            return (
+                logits.gather(1, candidate_token_ids).to("cpu", torch.float32),
+                prefix_lens,
+            )
         finally:
             reset_context()
             self.cleanup_seq_states(seq_ids)

@@ -50,6 +50,7 @@ class Config:
     prefill_only_mode: bool | None = None  # None = auto (on for embedding/reranker)
     max_tokens_hint: int | None = None  # Longest generation you intend to request
     max_prefill_batch_size: int = 1024  # Max batch size for prefill-only mode
+    max_prefix_cache_bytes: int = 4 << 30  # Quota for the prefix KV/GDN state store
     trust_remote_code: bool = False  # Trust remote code for custom models
     revision: str | None = None  # Pin a Hub commit; local paths record it as a manifest label
     hf_config: AutoConfig | None = None

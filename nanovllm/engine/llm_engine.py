@@ -1485,6 +1485,178 @@ class LLMEngine:
             "backend": "nanovllm",
         }
 
+    def _check_prefix_api_supported(self) -> None:
+        if self.config.tensor_parallel_size > 1:
+            raise NotImplementedError(
+                "prefix cache APIs currently require tensor_parallel_size=1"
+            )
+        # Note: multimodal models are allowed. Text prefixes need no M-RoPE
+        # offset (the text path expands 1D positions linearly across M-RoPE
+        # rows); image-bearing prefixes record mrope_end at capture time and
+        # suffixes continue from it. Suffixes themselves are text-only.
+
+    def _prepare_prefix_request(self, request: dict):
+        """Normalize one prefix request dict to (ids, pixel_values, thw).
+
+        Accepts the same shapes as ``prefill_last_logits_multimodal``:
+        ``{"input_ids": [...]}`` (text-only, vision tensors None) or
+        ``{"messages"/"text"/"images"}`` (processed through the model's
+        processor, vision placeholders expanded).
+        """
+        if "input_ids" in request:
+            ids = list(request["input_ids"])
+            if not ids:
+                raise ValueError("prefix request has empty input_ids")
+            return ids, None, None
+        if not ("messages" in request or "text" in request or "images" in request):
+            raise ValueError(
+                "prefix request must contain 'input_ids' or "
+                "'messages'/'text'/'images'"
+            )
+        if not self.config.is_multimodal:
+            raise ValueError(
+                "multimodal prefix requests require a multimodal model"
+            )
+        processor = self._get_processor()
+        _, ids_list, pv_list, thw_list = self._prepare_multimodal_batch(
+            [request], processor
+        )
+        ids = ids_list[0]
+        if not ids:
+            raise ValueError("multimodal prefix produced empty input_ids")
+        thw = thw_list[0]
+        if thw is None:
+            return ids, None, None
+        thw_2d = thw.squeeze(0) if thw.dim() == 3 else thw
+        ids, _, _ = self._expand_vision_placeholders(ids, thw_2d)
+        return ids, pv_list[0], thw_2d
+
+    def prefill_prefix(self, prompt: str | list[int] | dict) -> int:
+        """Prefill one prompt and cache its per-layer KV; returns a handle.
+
+        The prompt is a single sequence: a string (encoded with
+        ``add_special_tokens=False``), pre-tokenized ids, or a multimodal
+        request dict (``{"messages"/"text"/"images"}``) whose images are
+        encoded before KV capture. The returned handle stays valid until
+        ``release_prefix``.
+        """
+        self._check_prefix_api_supported()
+        pixel_values = None
+        image_grid_thw = None
+        if isinstance(prompt, str):
+            ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+        elif isinstance(prompt, (list, tuple)):
+            ids = list(prompt)
+        elif isinstance(prompt, dict):
+            ids, pixel_values, image_grid_thw = self._prepare_prefix_request(
+                prompt
+            )
+        else:
+            raise TypeError(
+                "prompt must be a string, a token id list, or a request dict"
+            )
+        if not ids:
+            raise ValueError("prefix prompt is empty after tokenization")
+        if len(ids) > self.config.max_model_len:
+            raise ValueError(
+                f"prefix length {len(ids)} exceeds max_model_len "
+                f"{self.config.max_model_len}"
+            )
+        input_ids = torch.tensor([ids], dtype=torch.int64)
+        attention_mask = torch.ones((1, len(ids)), dtype=torch.int64)
+        seq_ids = self._next_last_logits_seq_ids(1)
+        return self.model_runner.call(
+            "prefix_create",
+            input_ids,
+            attention_mask,
+            seq_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
+
+    def fork_prefix(self, handle: int, n: int) -> list[int]:
+        """Deep-copy a cached prefix n times; returns the new handles."""
+        self._check_prefix_api_supported()
+        return self.model_runner.call("prefix_fork", handle, n)
+
+    def release_prefix(self, *handles: int) -> None:
+        """Release prefix handles created by prefill_prefix/fork_prefix."""
+        self.model_runner.call("release_prefix", *handles)
+
+    def prefill_suffix_logits(
+        self,
+        handles: list[int],
+        suffix_token_ids: list[list[int]],
+        candidate_token_ids: list[list[int]],
+    ) -> dict:
+        """Batched suffix forward over cached prefixes; candidate logits only.
+
+        Row i attends over prefix ``handles[i]`` plus its own suffix; the
+        return dict mirrors ``prefill_last_logits`` except
+        ``sequence_lengths`` reports suffix lengths and ``prefix_lengths``
+        reports each row's cached prefix length.
+        """
+        self._check_prefix_api_supported()
+        if not handles:
+            raise ValueError("handles must be nonempty")
+        if not (len(handles) == len(suffix_token_ids) == len(candidate_token_ids)):
+            raise ValueError(
+                f"handles ({len(handles)}), suffix_token_ids "
+                f"({len(suffix_token_ids)}) and candidate_token_ids "
+                f"({len(candidate_token_ids)}) must have equal length"
+            )
+        vocab_size = self._vocab_size()
+        self._validate_candidates(candidate_token_ids, vocab_size)
+        suffixes = [list(ids) for ids in suffix_token_ids]
+        if any(not ids for ids in suffixes):
+            raise ValueError("every suffix must contain at least one token")
+        image_token_id = getattr(self.config.hf_config, "image_token_id", None)
+        if image_token_id is not None and any(
+            image_token_id in ids for ids in suffixes
+        ):
+            raise ValueError(
+                "suffixes must be text-only; images belong in the prefix"
+            )
+
+        max_len = max(len(ids) for ids in suffixes)
+        max_cand = max(len(cands) for cands in candidate_token_ids)
+        input_ids = torch.zeros((len(suffixes), max_len), dtype=torch.int64)
+        attention_mask = torch.zeros((len(suffixes), max_len), dtype=torch.int64)
+        candidate_mask = torch.zeros(
+            (len(candidate_token_ids), max_cand), dtype=torch.bool
+        )
+        candidate_ids = torch.zeros(
+            (len(candidate_token_ids), max_cand), dtype=torch.int64
+        )
+        for i, (ids, cands) in enumerate(zip(suffixes, candidate_token_ids)):
+            # Left padding, matching prefill_last_logits; the runner flattens
+            # by mask, so padding side only affects this assembly step.
+            input_ids[i, max_len - len(ids):] = torch.tensor(ids, dtype=torch.int64)
+            attention_mask[i, max_len - len(ids):] = 1
+            candidate_ids[i, : len(cands)] = torch.tensor(cands, dtype=torch.int64)
+            candidate_mask[i, : len(cands)] = True
+
+        seq_ids = self._next_last_logits_seq_ids(len(handles))
+        gathered, prefix_lengths = self.model_runner.call(
+            "prefix_suffix_logits",
+            list(handles),
+            input_ids,
+            attention_mask,
+            candidate_ids,
+            seq_ids,
+        )
+        return {
+            "logits": gathered,
+            "candidate_mask": candidate_mask,
+            "candidate_token_ids": [list(c) for c in candidate_token_ids],
+            "sequence_lengths": [len(ids) for ids in suffixes],
+            "prefix_lengths": prefix_lengths,
+            "model": self.config.model,
+            "revision": self.config.model_revision,
+            "dtype": str(next(self.model_runner.model.parameters()).dtype),
+            "backend": "nanovllm",
+        }
+
     def prefill_last_logits_multimodal(
         self,
         requests: list[dict],

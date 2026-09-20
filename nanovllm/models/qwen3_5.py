@@ -722,6 +722,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         total_tokens = hidden_states.size(0)
         hidden_states = hidden_states.to(self.in_proj_qkv.weight.dtype)
 
+        # --- Prefix-fork capture/replay channel (feat/prefill-kv-cache) ---
+        # Same call-order discipline as the attention layers: replay consumes
+        # one entry per GDN layer per forward; capture appends one.
+        from nanovllm.utils.context import get_context
+        context = get_context()
+        gdn_capture = context.gdn_capture
+        gdn_initial_list = None
+        if context.gdn_initial is not None:
+            gdn_index = context.gdn_call_index
+            context.gdn_call_index = gdn_index + 1
+            gdn_initial_list = context.gdn_initial[gdn_index]
+
         # --- Linear projections (element-wise, no seq boundary needed) ---
         mixed_qkv = self.in_proj_qkv(hidden_states)
         z = self.in_proj_z(hidden_states)
@@ -752,12 +764,43 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
         ).unsqueeze(1)  # (conv_dim, 1, kernel_size)
 
+        if gdn_initial_list is not None and len(gdn_initial_list) != num_seqs:
+            raise ValueError(
+                f"gdn initial states ({len(gdn_initial_list)}) must match "
+                f"the sequence count ({num_seqs})"
+            )
+
+        # Conv state capture: a causal conv's "state" after a sequence is its
+        # last `pad` pre-conv input tokens (zero-left-padded when the sequence
+        # is shorter than the window).
+        conv_states = None
+        if gdn_capture is not None:
+            conv_states = []
+            offset = 0
+            for seq_len in sequence_lengths:
+                segment = mixed_qkv_conv_flat[offset:offset + seq_len]
+                offset += seq_len
+                state = torch.zeros(
+                    self.conv_dim_tp, pad,
+                    dtype=segment.dtype, device=segment.device,
+                )
+                tail = min(seq_len, pad)
+                state[:, pad - tail:] = segment[seq_len - tail:].t()
+                conv_states.append(state)
+
         if len(set(sequence_lengths)) == 1:
             # Fast path: all same length → single batched conv1d, no loops
             seq_len = sequence_lengths[0]
             batched = mixed_qkv_conv_flat.view(num_seqs, seq_len, self.conv_dim_tp)
             batched = batched.permute(0, 2, 1)  # (N, conv_dim, seq_len)
-            batched_padded = F.pad(batched, (pad, 0))  # (N, conv_dim, seq_len + pad)
+            if gdn_initial_list is not None:
+                # Replay: cached conv states replace the zero left padding.
+                conv_context = torch.stack(
+                    [conv_state for conv_state, _ in gdn_initial_list]
+                ).to(batched.dtype)
+                batched_padded = torch.cat([conv_context, batched], dim=-1)
+            else:
+                batched_padded = F.pad(batched, (pad, 0))  # (N, conv_dim, seq_len + pad)
             conv_out = F.conv1d(batched_padded, conv_w, self.conv1d.bias, groups=self.conv_dim_tp)
             if self.activation == "silu":
                 conv_out = F.silu(conv_out)
@@ -772,6 +815,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             offset = 0
             for i, seq_len in enumerate(sequence_lengths):
+                if gdn_initial_list is not None:
+                    # Replay: cached conv state replaces the zero left padding.
+                    padded_seqs[i, :, :pad] = gdn_initial_list[i][0].to(padded_seqs.dtype)
                 padded_seqs[i, :, pad:pad + seq_len] = mixed_qkv_conv_flat[offset:offset + seq_len].t()
                 offset += seq_len
             conv_out = F.conv1d(padded_seqs, conv_w, self.conv1d.bias, groups=self.conv_dim_tp)
@@ -824,15 +870,26 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and hidden_states.dtype != torch.float32
         )
 
+        # Recurrent state replay/capture. The fla kernel uses (N, H, V, K)
+        # while the torch fallback uses (N, H, K, V); the two never mix
+        # because use_triton is fixed per model/dtype/process, so a state is
+        # always captured and replayed by the same backend.
+        recurrent_initial = None
+        if gdn_initial_list is not None:
+            recurrent_initial = torch.stack(
+                [rec_state for _, rec_state in gdn_initial_list]
+            ).contiguous()
+        want_final_state = gdn_capture is not None
+
         if use_triton:
-            core_attn_out_batch, _ = fla_chunk_gated_delta_rule(
+            core_attn_out_batch, final_state = fla_chunk_gated_delta_rule(
                 q=q_batch,
                 k=k_batch,
                 v=v_batch,
                 g=g_batch,
                 beta=beta_batch,
-                initial_state=None,
-                output_final_state=False,
+                initial_state=recurrent_initial,
+                output_final_state=want_final_state,
                 cu_seqlens=cu_seqlens,
                 use_qk_l2norm_in_kernel=True,
             )
@@ -840,22 +897,35 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         else:
             # Fallback: per-sequence torch path
             outputs = []
+            final_states = [] if want_final_state else None
             offset = 0
             for i, seq_len in enumerate(sequence_lengths):
-                out_s, _ = torch_chunk_gated_delta_rule(
+                out_s, fin_s = torch_chunk_gated_delta_rule(
                     query_conv[offset:offset+seq_len],
                     key_conv[offset:offset+seq_len],
                     value_conv[offset:offset+seq_len],
                     g[offset:offset+seq_len],
                     beta[offset:offset+seq_len],
                     chunk_size=64,
-                    initial_state=None,
-                    output_final_state=False,
+                    initial_state=(
+                        recurrent_initial[i:i + 1]
+                        if recurrent_initial is not None else None
+                    ),
+                    output_final_state=want_final_state,
                     use_qk_l2norm_in_kernel=True,
                 )
                 outputs.append(out_s)
+                if want_final_state:
+                    final_states.append(fin_s)
                 offset += seq_len
             core_attn_out = torch.cat(outputs, dim=0)
+            if want_final_state:
+                final_state = torch.cat(final_states, dim=0)
+
+        if gdn_capture is not None:
+            gdn_capture.append([
+                (conv_states[i], final_state[i]) for i in range(num_seqs)
+            ])
 
         # --- Output projection with gate ---
         core_attn_out_flat = core_attn_out.reshape(-1, core_attn_out.shape[-1])
