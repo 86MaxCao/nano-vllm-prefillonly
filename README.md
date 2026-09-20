@@ -8,6 +8,8 @@ A specialized optimization of [nano-vllm](https://github.com/GeeeekExplorer/nano
 
 > **Motivation**: This project addresses the problem described in [vllm-project/vllm#29584](https://github.com/vllm-project/vllm/issues/29584) — vLLM unconditionally allocates KV cache even for non-autoregressive tasks (embedding, reranking, classification), wasting up to **80-98% of GPU memory** on completely unused cache tensors. The vLLM maintainers acknowledged this issue but noted that fixing it "would require modifications to a lot of core code" and closed it as not planned. Our framework solves this by **completely eliminating KV cache allocation** for prefill-only workloads, enabling single-GPU deployment of models that would otherwise require multi-GPU setups under vLLM.
 
+> **Real-world showcase**: [NanoJev](https://github.com/86MaxCao/NanoJev) — a fork of the [parallel decision model](https://github.com/TianyuCodings/NanoJev) that scores all candidate action paths in a single prefill (zero output-token decoding) — runs its Qwen3-0.6B backbone on this engine: **2.0x–4.7x faster** end-to-end than the HF transformers backend (growing with batch size), with verified numerical parity (probability max abs diff ≤ 0.009 on 300 real held-out states; argmax 298/300, both flips near-ties). Parity tables, benchmarks and integration details are in the fork's README.
+
 ## 🎯 Why Prefill-Only?
 
 Most real-world business scenarios are **prefill-only tasks**, especially in discriminative applications:
