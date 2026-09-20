@@ -1238,8 +1238,9 @@ class Qwen3_5TextDecoderLayer(nn.Module):
             if use_graph:
                 # CUDA graph mode: process entire batch at once using persistent state buffers
                 hidden_states = self.linear_attn(hidden_states, positions, use_graph=True)
-            elif sequence_lengths is not None and len(sequence_lengths) > 1 and sequence_ids is not None:
-                # Batched prefill: single Triton kernel call with cu_seqlens
+            elif sequence_lengths is not None and sequence_ids is not None:
+                # Batched prefill (incl. batch=1): single Triton kernel call
+                # with cu_seqlens, fresh state, no state_cache persistence.
                 hidden_states = self.linear_attn.forward_batch_prefill(
                     hidden_states, positions,
                     sequence_lengths=sequence_lengths,

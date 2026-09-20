@@ -140,13 +140,6 @@ def test_prefill_last_logits_batch_invariance(model_key):
 
 
 @pytest.mark.parametrize("model_key", ["qwen3_5"])
-@pytest.mark.xfail(
-    reason="Qwen3.5 GDN: single-sequence forward() and batch "
-    "forward_batch_prefill() are numerically inequivalent (pre-existing, "
-    "never covered by the parity suite). Tracked in "
-    "docs/nano-vllm-prefillonly/prefill-last-logits-issues.md",
-    strict=True,
-)
 def test_prefill_last_logits_gdn_batch_invariance(model_key):
     """GDN (linear-attention) state isolation: batching must not leak state
     across sequences, and results must be permutation-invariant."""

@@ -523,6 +523,36 @@ class TestGDNSlotPool:
         assert gdn._pool_conv_state.shape[0] == 768
 
 
+class TestGdnKernelDeterminism:
+    """chunk_scaled_dot_kkt_fwd must be deterministic on identical inputs.
+
+    Regression guard: autotune configs with BK < K were non-deterministic on
+    H20/sm90 (Triton 3.6.0), which made every Qwen3.5 forward pass irreproducible
+    (~0.1-0.5 logits run-to-run after 36 layers). The configs are now pinned to
+    BK=128; this test fails if a racy config is ever reintroduced.
+    """
+
+    def test_kkt_bit_identical_across_calls(self):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is required")
+        ops = pytest.importorskip("nanovllm.layers.ops.chunk_scaled_dot_kkt")
+
+        torch.manual_seed(0)
+        T, H, K = 96, 4, 128  # T spans two 64-token chunks
+        k = torch.randn(1, T, H, K, dtype=torch.bfloat16, device="cuda")
+        # g is always the fp32 output of chunk_local_cumsum in the real pipeline
+        g = (torch.randn(1, T, H, device="cuda") * 0.1 - 1.0).float()
+        beta = torch.rand(1, T, H, dtype=torch.bfloat16, device="cuda")
+
+        first = ops.chunk_scaled_dot_kkt_fwd(k=k, beta=beta, g=g)
+        for _ in range(3):
+            again = ops.chunk_scaled_dot_kkt_fwd(k=k, beta=beta, g=g)
+            assert torch.equal(first, again), (
+                "chunk_scaled_dot_kkt_fwd is non-deterministic; check the "
+                "autotune configs in nanovllm/layers/ops/chunk_scaled_dot_kkt.py"
+            )
+
+
 class TestEngineConstructionInputValidation:
     """Public Config inputs must raise ValueError, not assert (python -O)."""
 

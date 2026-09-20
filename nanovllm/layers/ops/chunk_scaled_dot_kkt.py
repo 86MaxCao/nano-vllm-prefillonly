@@ -23,10 +23,17 @@ from nanovllm.layers.ops.op import exp
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
     }
 )
+# NOTE: autotune configs are restricted to BK=128 on purpose. With BK < K the
+# i_k loop below runs multiple iterations, and on H20 (sm90) with
+# Triton 3.6.0 / torch 2.11.0+cu130 those configs are NON-DETERMINISTIC:
+# identical inputs produce outputs differing by ~0.05 across calls (pipelined
+# tl.dot + tl.trans race in the multi-iteration loop). BK=128 == K for
+# Qwen3.5/Qwen3Next (head_k_dim=128), so the loop runs exactly once and the
+# kernel is bit-stable. Do not re-add BK < K configs without re-running a
+# determinism check on the target GPU/Triton combination.
 @triton.autotune(
     configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
+        triton.Config({"BK": 128}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
