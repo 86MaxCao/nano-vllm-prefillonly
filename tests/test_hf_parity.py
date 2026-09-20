@@ -165,6 +165,22 @@ def test_multimodal_reranker_ranks_consistently(model_key):
         text_scores = llm.rerank_batch(PAIRS)
         image = Image.new("RGB", (224, 224), color=(120, 120, 120))
         image_scores = llm.rerank_batch(PAIRS, images=[image] * len(PAIRS))
+
+        # Mixed batch: an image pair, a multi-image pair, and a text-only
+        # pair (images[i] is None) in one forward pass.
+        gray = Image.new("RGB", (224, 224), color=(120, 120, 120))
+        blue = Image.new("RGB", (224, 224), color=(30, 30, 200))
+        mixed_scores = llm.rerank_batch(PAIRS, images=[gray, [gray, blue], None])
+        if isinstance(mixed_scores, tuple):
+            mixed_scores = mixed_scores[0]
+        mixed_scores = mixed_scores.float().cpu()
+        # The text-only pair must match the pure-text path for the same pair.
+        solo = llm.rerank_batch([PAIRS[2]])
+        if isinstance(solo, tuple):
+            solo = solo[0]
+        # Length mismatch between pairs and images is rejected.
+        with pytest.raises(ValueError, match="images length"):
+            llm.rerank_batch(PAIRS, images=[gray])
     finally:
         llm.exit()
 
@@ -181,6 +197,11 @@ def test_multimodal_reranker_ranks_consistently(model_key):
     # fp32 sigmoid: strong matches must not saturate to exactly 1.0.
     assert text_scores.max() < 1.0, text_scores.tolist()
     assert image_scores.max() < 1.0, image_scores.tolist()
+    assert mixed_scores.shape[0] == len(PAIRS)
+    assert mixed_scores.max() < 1.0, mixed_scores.tolist()
+    torch.testing.assert_close(
+        mixed_scores[2], solo[0].float().cpu(), atol=0.05, rtol=0.05
+    )
 
 
 @pytest.mark.parametrize("model_key", ["qwen3_reranker"])

@@ -995,7 +995,10 @@ class LLMEngine:
 
         Args:
             query_doc_pairs: List of (query, document) pairs
-            images: Optional list of images for multimodal reranking
+            images: Optional per-pair images for multimodal reranking; must
+                match the pairs length. Each entry may be a single image, a
+                list of images (all attached to that pair's message), or None
+                (a text-only pair inside an image batch).
             use_tqdm: Whether to show progress bar
 
         Returns:
@@ -1044,26 +1047,36 @@ class LLMEngine:
 
         # Batch processing: collect all inputs first
         if images and processor:
-            # Multimodal reranking: use batch apply_chat_template
+            # Multimodal reranking: use batch apply_chat_template.
+            # images[i] may be a single image, a list of images, or None
+            # (a text-only pair inside an image batch).
+            if len(images) != batch_size:
+                raise ValueError(
+                    f"images length {len(images)} != number of pairs {batch_size}"
+                )
             all_images_list = []
             messages_batch = []
-            
+
             for i, (query, doc) in enumerate(query_doc_pairs):
+                pair_images = images[i]
+                if pair_images is None:
+                    pair_images = []
+                elif not isinstance(pair_images, (list, tuple)):
+                    pair_images = [pair_images]
+                content = [{"type": "image", "image": image} for image in pair_images]
+                content.append({
+                    "type": "text",
+                    "text": f"<query>{query}</query>\n<document>{doc}</document>",
+                })
                 messages_batch.append([
                     {
                         "role": "system",
                         "content": 'Judge whether the Document is relevant to the Query. Answer only "yes" or "no".',
                     },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "image": images[i]},
-                            {"type": "text", "text": f"<query>{query}</query>\n<document>{doc}</document>"},
-                        ],
-                    }
+                    {"role": "user", "content": content},
                 ])
-                all_images_list.append(images[i])
-            
+                all_images_list.extend(pair_images)
+
             # Batch apply_chat_template (much faster than serial calls)
             try:
                 all_formatted_texts = processor.apply_chat_template(
@@ -1076,11 +1089,11 @@ class LLMEngine:
                     all_formatted_texts.append(
                         processor.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
                     )
-            
+
             # Batch process all multimodal inputs at once
             processor_outputs = processor(
                 text=all_formatted_texts,
-                images=all_images_list,
+                images=all_images_list if all_images_list else None,
                 return_tensors="pt",
                 padding=True,  # Processor will handle batch padding
             )
