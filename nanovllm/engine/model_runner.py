@@ -1953,8 +1953,14 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
-        # Skip cudagraph capture for embedding and reranker models
-        if self.is_embedding or self.is_reranker:
+        # Skip cudagraph capture for embedding and reranker models, and for
+        # prefill-only engines: they never decode, and the captured decode
+        # path raises on flash-attn builds without working paged KV decode.
+        if (
+            self.is_embedding
+            or self.is_reranker
+            or self.config.prefill_only_mode
+        ):
             return
         config = self.config
         hf_config = config.hf_config
