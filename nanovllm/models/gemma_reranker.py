@@ -95,8 +95,9 @@ class GemmaReranker(GemmaForCausalLM):
         raw_scores = self.score_head(selected_states).squeeze(-1)
         
         # Apply sigmoid to convert to probability (matching transformers
-        # baseline)
-        scores = torch.sigmoid(raw_scores)
+        # baseline). float32: in bf16, sigmoid(x > ~5) rounds to exactly 1.0,
+        # destroying the precision callers need to invert back to log-odds.
+        scores = torch.sigmoid(raw_scores.float())
         return scores
     
     def compute_score_varlen(
@@ -115,7 +116,8 @@ class GemmaReranker(GemmaForCausalLM):
         last_indices = cu_seqlens[1:] - 1
         selected_states = hidden_states[last_indices]
         raw_scores = self.score_head(selected_states).squeeze(-1)
-        return torch.sigmoid(raw_scores)
+        # float32 sigmoid; see compute_score for why.
+        return torch.sigmoid(raw_scores.float())
 
     def convert_from_original_reranker(self, tokenizer):
         """Convert original Gemma-Reranker weights to score_head.

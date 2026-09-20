@@ -115,14 +115,21 @@ def test_embedding_matches_transformers(model_key, embedding_type):
     assert sims.min() > 0.99, f"cosine similarity too low: {sims.tolist()}"
 
 
-@pytest.mark.parametrize("model_key", ["qwen3_reranker"])
-def test_reranker_ranks_consistently(model_key):
+@pytest.mark.parametrize(
+    "model_key,reranker_type",
+    [
+        ("qwen3_reranker", "qwen3"),
+        ("gemma_reranker", "gemma"),
+        ("jina_reranker_m0", "jina_m0"),
+    ],
+)
+def test_reranker_ranks_consistently(model_key, reranker_type):
     """Relevant pairs must outrank the deliberately irrelevant one."""
     requires_cuda()
     from nanovllm import LLM
 
     path = model_path(model_key)
-    llm = LLM(path, is_reranker=True, reranker_type="qwen3", enforce_eager=True)
+    llm = LLM(path, is_reranker=True, reranker_type=reranker_type, enforce_eager=True)
     try:
         scores = llm.rerank_batch(PAIRS)
     finally:
@@ -134,6 +141,46 @@ def test_reranker_ranks_consistently(model_key):
     assert scores.shape[0] == len(PAIRS)
     # The third pair is unrelated and must score lowest.
     assert scores[2] < scores[0] and scores[2] < scores[1], scores.tolist()
+    # Scores are float32: a strong match must not round to exactly 1.0
+    # (bf16 sigmoid saturation would collapse distinct scores).
+    assert scores.max() < 1.0, scores.tolist()
+
+
+@pytest.mark.parametrize("model_key", ["qwen3_vl_reranker"])
+def test_multimodal_reranker_ranks_consistently(model_key):
+    """Qwen3-VL reranker: ranking contract and fp32 scores, text and image."""
+    requires_cuda()
+    from PIL import Image
+
+    from nanovllm import LLM
+
+    path = model_path(model_key)
+    llm = LLM(
+        path,
+        is_reranker=True,
+        reranker_type="qwen3_vl",
+        enforce_eager=True,
+    )
+    try:
+        text_scores = llm.rerank_batch(PAIRS)
+        image = Image.new("RGB", (224, 224), color=(120, 120, 120))
+        image_scores = llm.rerank_batch(PAIRS, images=[image] * len(PAIRS))
+    finally:
+        llm.exit()
+
+    if isinstance(text_scores, tuple):
+        text_scores = text_scores[0]
+    if isinstance(image_scores, tuple):
+        image_scores = image_scores[0]
+    text_scores = text_scores.float().cpu()
+    image_scores = image_scores.float().cpu()
+    assert text_scores.shape[0] == len(PAIRS)
+    assert image_scores.shape[0] == len(PAIRS)
+    # The unrelated pair must score lowest on the text path.
+    assert text_scores[2] < text_scores[0] and text_scores[2] < text_scores[1], text_scores.tolist()
+    # fp32 sigmoid: strong matches must not saturate to exactly 1.0.
+    assert text_scores.max() < 1.0, text_scores.tolist()
+    assert image_scores.max() < 1.0, image_scores.tolist()
 
 
 @pytest.mark.parametrize("model_key", ["qwen3_reranker"])

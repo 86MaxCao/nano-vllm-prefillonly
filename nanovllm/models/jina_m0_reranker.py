@@ -107,5 +107,7 @@ class JinaRerankerM0(Qwen2VLForConditionalGeneration):
         pooled_logits = self.score(last_token_hidden)
         raw_scores = pooled_logits.squeeze(-1)
         
-        # Apply sigmoid normalization: sigmoid(raw - bias) → [0, 1]
-        return torch.sigmoid(raw_scores.float() - self.logit_bias).to(raw_scores.dtype)
+        # Apply sigmoid normalization: sigmoid(raw - bias) → [0, 1].
+        # Keep float32: bf16 ulp near 1.0 (~0.008) destroys the precision
+        # callers need to invert back to log-odds.
+        return torch.sigmoid(raw_scores.float() - self.logit_bias)

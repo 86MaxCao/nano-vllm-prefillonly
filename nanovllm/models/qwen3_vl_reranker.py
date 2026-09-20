@@ -120,7 +120,9 @@ class Qwen3VLReranker(Qwen3VLForConditionalGeneration):
             )
 
         raw_scores = self.score_head(last_token_states).squeeze(-1)
-        scores = torch.sigmoid(raw_scores)
+        # float32: in bf16, sigmoid(x > ~5) rounds to exactly 1.0, destroying
+        # the precision callers need to invert back to log-odds.
+        scores = torch.sigmoid(raw_scores.float())
         return scores
 
     def compute_score(
@@ -152,7 +154,8 @@ class Qwen3VLReranker(Qwen3VLForConditionalGeneration):
             )
 
         raw_scores = self.score_head(selected_states).squeeze(-1)
-        scores = torch.sigmoid(raw_scores)
+        # float32 sigmoid; see the varlen path for why.
+        scores = torch.sigmoid(raw_scores.float())
         return scores
 
     def convert_from_original_reranker(self, tokenizer):

@@ -15,6 +15,7 @@ MODELS = {
     "qwen3_vl_reranker": "Qwen3-VL-Reranker-2B",
     "gemma2_embedding": "bge-multilingual-gemma2",
     "gemma_reranker": "bge-reranker-v2-gemma",
+    "jina_reranker_m0": "jina-reranker-m0",
     "qwen3_5": "Qwen3.5-0.8B",
 }
 
