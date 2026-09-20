@@ -5,7 +5,6 @@ strictness, block-size propagation, sequence pickling, and config auto-detection
 """
 import inspect
 import pickle
-import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -468,16 +467,23 @@ class TestTensorParallelRendezvous:
 
 
 class TestSharedMemoryIsolation:
-    def test_shm_name_is_generated_not_fixed(self):
-        """A fixed "nanovllm" segment let concurrent engines share RPC state."""
+    def test_shm_name_derived_from_master_port(self):
+        """The segment name must be rank-shared yet per-instance.
+
+        MASTER_PORT is set once by the parent engine, so every rank
+        derives the same name; two engines on one host get different
+        ports and therefore different segments. A per-rank uuid used
+        to make rank 1 open a name rank 0 never created.
+        """
         from nanovllm.engine import model_runner
 
         source = inspect.getsource(model_runner.ModelRunner.__init__)
-        assert "uuid.uuid4()" in source
+        assert 'os.environ.get("MASTER_PORT"' in source
+        assert "uuid.uuid4()" not in source
         assert 'name="nanovllm"' not in source
 
     def test_shm_names_differ_across_instances(self):
-        names = {f"nanovllm-{uuid.uuid4().hex}" for _ in range(2)}
+        names = {f"nanovllm-{port}" for port in ("29500", "29501")}
         assert len(names) == 2
 
 

@@ -105,7 +105,9 @@ def test_embedding_matches_transformers(model_key, embedding_type):
 
     llm = LLM(path, is_embedding=True, embedding_type=embedding_type, enforce_eager=True)
     try:
-        got = llm.embed_batch(TEXTS)
+        # Same input string as the HF reference: the EOS suffix is part of
+        # the embedding template and must be appended on both sides.
+        got = llm.embed_batch([t + suffix for t in TEXTS])
     finally:
         llm.exit()
 

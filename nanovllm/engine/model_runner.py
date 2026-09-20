@@ -1,7 +1,7 @@
 import logging
 import os
 import pickle
-import uuid
+import time
 from datetime import timedelta
 
 import torch
@@ -266,9 +266,14 @@ class ModelRunner:
             torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
-            # A unique per-instance name: a fixed "nanovllm" segment let two
-            # engines on one host read each other's RPC payloads.
-            self.shm_name = f"nanovllm-{uuid.uuid4().hex}"
+            # The RPC segment name must agree across ranks AND be unique per
+            # engine instance. Derive it from MASTER_PORT: the parent sets it
+            # once (shared by every rank, distinct per instance on the host).
+            # A per-rank uuid used to make rank 1 open a name rank 0 never
+            # created, and a fixed "nanovllm" let concurrent engines read
+            # each other's payloads.
+            master_port = os.environ.get("MASTER_PORT", "0")
+            self.shm_name = f"nanovllm-{master_port}"
             if rank == 0:
                 self.shm = SharedMemory(
                     name=self.shm_name,
@@ -280,7 +285,18 @@ class ModelRunner:
             else:
                 if dist.is_initialized():
                     dist.barrier()
-                self.shm = SharedMemory(name=self.shm_name)
+                # A worker can pass the barrier before rank 0 finishes
+                # creating the segment (init_process_group may complete on
+                # rank 1 first); retry briefly until the segment appears.
+                self.shm = None
+                deadline = time.monotonic() + 60
+                while self.shm is None:
+                    try:
+                        self.shm = SharedMemory(name=self.shm_name)
+                    except FileNotFoundError:
+                        if time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.05)
                 self.loop()
 
     def exit(self):
@@ -491,6 +507,11 @@ class ModelRunner:
         text_config = getattr(hf_config, "text_config", hf_config)
         free, total = torch.cuda.mem_get_info()
         used = total - free
+        # The historical peak never falls, so a large model released earlier
+        # in the same process (e.g. an HF reference model in a test) would
+        # make available_memory negative forever. Reset it and measure only
+        # the current allocation before this engine's KV cache.
+        torch.cuda.reset_peak_memory_stats()
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         # Handle models that may not have num_key_value_heads (e.g., some older models)
