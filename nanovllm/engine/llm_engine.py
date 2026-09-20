@@ -1,4 +1,5 @@
 import atexit
+import itertools
 import os
 import socket
 from contextlib import contextmanager
@@ -83,6 +84,9 @@ class LLMEngine:
                     p.terminate()
                 p.join()
             raise
+        # config.model is always a local directory by this point (Config
+        # resolves Hub ids via snapshot_download with the pinned revision),
+        # so no revision kwarg is needed here.
         self.tokenizer = AutoTokenizer.from_pretrained(
             config.model,
             use_fast=True,
@@ -122,9 +126,15 @@ class LLMEngine:
         """Lazily load and cache the AutoProcessor for multimodal inputs."""
         if self._processor is None:
             from transformers import AutoProcessor
+            # config.model is always a local directory (Config resolves Hub
+            # ids via snapshot_download with the pinned revision), so no
+            # revision kwarg is needed here.
+            processor_kwargs = {
+                "trust_remote_code": self.model_runner.config.trust_remote_code,
+            }
             self._processor = AutoProcessor.from_pretrained(
                 self.model_runner.config.model,
-                trust_remote_code=self.model_runner.config.trust_remote_code,
+                **processor_kwargs,
             )
         return self._processor
 
@@ -379,27 +389,13 @@ class LLMEngine:
             pbar.close()
         return outputs
 
-    def generate_multimodal(
-        self,
-        requests: list[dict],
-        sampling_params: SamplingParams | list[SamplingParams],
-        processor,
-        use_tqdm: bool = True,
-    ) -> list[str]:
-        if use_tqdm:
-            pbar = tqdm(
-                total=len(requests),
-                desc="Generating",
-                dynamic_ncols=True,
-            )
+    def _prepare_multimodal_batch(self, requests: list[dict], processor):
+        """Shared multimodal preprocessing for generation and logits APIs.
 
-        if not isinstance(sampling_params, list):
-            sampling_params = [sampling_params] * len(requests)
-        else:
-            _check_batch_lengths(
-                {"requests": len(requests), "sampling_params": len(sampling_params)}
-            )
-
+        Extracts text/images from requests, runs the processor batch, and
+        unbatches the results back per request. Pure extraction from the
+        former generate_multimodal body; behaviour is unchanged.
+        """
         # Phase 1: Extract text and images from all requests
         all_texts = []
         all_images = []  # per-request image list (None if no images)
@@ -573,6 +569,41 @@ class LLMEngine:
                 else:
                     ids = text_input_ids[batch_idx].tolist()
                 per_request_input_ids[req_idx] = ids
+
+        return (
+            all_texts,
+            per_request_input_ids,
+            per_request_pixel_values,
+            per_request_image_grid_thw,
+        )
+
+    def generate_multimodal(
+        self,
+        requests: list[dict],
+        sampling_params: SamplingParams | list[SamplingParams],
+        processor,
+        use_tqdm: bool = True,
+    ) -> list[str]:
+        if use_tqdm:
+            pbar = tqdm(
+                total=len(requests),
+                desc="Generating",
+                dynamic_ncols=True,
+            )
+
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(requests)
+        else:
+            _check_batch_lengths(
+                {"requests": len(requests), "sampling_params": len(sampling_params)}
+            )
+
+        (
+            _,
+            per_request_input_ids,
+            per_request_pixel_values,
+            per_request_image_grid_thw,
+        ) = self._prepare_multimodal_batch(requests, processor)
 
         # Phase 3: Expand vision placeholders and add_request for each sequence
         for req_idx, sp in enumerate(sampling_params):
@@ -1266,3 +1297,261 @@ class LLMEngine:
             pbar.close()
 
         return [outputs[seq_id] for seq_id in sorted(outputs)]
+
+    # ------------------------------------------------------------------
+    # Deterministic last-position logits API (no sampling, no scheduler).
+    # ------------------------------------------------------------------
+
+    _last_logits_seq_counter = itertools.count(1_000_000_000)
+
+    def _next_last_logits_seq_ids(self, count: int) -> list[int]:
+        """Fresh sequence ids for one last_logits call; far from the
+        scheduler's small Sequence ids so GDN state slots never collide."""
+        return [next(self._last_logits_seq_counter) for _ in range(count)]
+
+    def _vocab_size(self) -> int:
+        """Vocabulary size from the HF config (text_config for multimodal)."""
+        hf_config = self.model_runner.config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+        return int(text_config.vocab_size)
+
+    @staticmethod
+    def _validate_candidates(candidate_token_ids, vocab_size: int) -> None:
+        if candidate_token_ids is None:
+            raise ValueError(
+                "candidate_token_ids is required; pass explicit candidate "
+                "tokens instead of relying on full-vocabulary logits"
+            )
+        if not isinstance(candidate_token_ids, (list, tuple)):
+            raise TypeError("candidate_token_ids must be a list of token id lists")
+        for row in candidate_token_ids:
+            if not isinstance(row, (list, tuple)) or not row:
+                raise ValueError(
+                    "Each request needs a nonempty candidate_token_ids list"
+                )
+            for token in row:
+                if not isinstance(token, int) or not 0 <= token < vocab_size:
+                    raise ValueError(
+                        f"Candidate token {token!r} is out of the vocabulary "
+                        f"range [0, {vocab_size})"
+                    )
+
+    def prefill_last_logits(
+        self,
+        prompts: list[str] | list[list[int]],
+        candidate_token_ids: list[list[int]],
+    ) -> dict:
+        """One batched prefill; return last-position candidate logits.
+
+        Deterministic: no sampling, one logit row per prompt, result order
+        equals input order. String prompts are encoded with
+        ``add_special_tokens=False``; pre-tokenized id lists skip the
+        tokenizer entirely (SemIf-style callers should pass ids to keep
+        parity with their own encoding).
+        """
+        if not prompts:
+            raise ValueError("prompts must be nonempty")
+        if len(prompts) != len(candidate_token_ids):
+            raise ValueError(
+                f"prompts ({len(prompts)}) and candidate_token_ids "
+                f"({len(candidate_token_ids)}) must have equal length"
+            )
+        vocab_size = self._vocab_size()
+        self._validate_candidates(candidate_token_ids, vocab_size)
+
+        encoded = []
+        for prompt in prompts:
+            if isinstance(prompt, str):
+                # No chat template, no special tokens: the caller owns the
+                # exact prompt text (parity with Transformers encoding).
+                encoded.append(self.tokenizer.encode(prompt, add_special_tokens=False))
+            elif isinstance(prompt, (list, tuple)):
+                encoded.append(list(prompt))
+            else:
+                raise TypeError("Each prompt must be a string or a token id list")
+            if not encoded[-1]:
+                raise ValueError("A prompt is empty after tokenization")
+
+        max_len = max(len(ids) for ids in encoded)
+        max_cand = max(len(cands) for cands in candidate_token_ids)
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = 0
+
+        input_ids = torch.full((len(encoded), max_len), pad_id, dtype=torch.int64)
+        attention_mask = torch.zeros((len(encoded), max_len), dtype=torch.int64)
+        candidate_mask = torch.zeros(
+            (len(candidate_token_ids), max_cand), dtype=torch.bool
+        )
+        candidate_ids = torch.zeros(
+            (len(candidate_token_ids), max_cand), dtype=torch.int64
+        )
+        for i, (ids, cands) in enumerate(zip(encoded, candidate_token_ids)):
+            # Left padding: real tokens at the end, pad at the start.
+            input_ids[i, max_len - len(ids):] = torch.tensor(ids, dtype=torch.int64)
+            attention_mask[i, max_len - len(ids):] = 1
+            candidate_ids[i, : len(cands)] = torch.tensor(cands, dtype=torch.int64)
+            candidate_mask[i, : len(cands)] = True
+
+        seq_ids = self._next_last_logits_seq_ids(len(encoded))
+        gathered = self.model_runner.call(
+            "last_logits",
+            input_ids,
+            None,  # positions: last_logits derives per-sequence positions
+            attention_mask,
+            candidate_ids,
+            seq_ids,
+        )
+
+        return {
+            "logits": gathered,
+            "candidate_mask": candidate_mask,
+            "candidate_token_ids": [list(c) for c in candidate_token_ids],
+            "sequence_lengths": [len(ids) for ids in encoded],
+            "model": self.config.model,
+            "revision": self.config.model_revision,
+            "dtype": str(next(self.model_runner.model.parameters()).dtype),
+            "backend": "nanovllm",
+        }
+
+    def prefill_last_logits_multimodal(
+        self,
+        requests: list[dict],
+        candidate_token_ids: list[list[int]],
+    ) -> dict:
+        """Batched prefill over mixed multimodal/text requests; last-position
+        candidate logits, no sampling.
+
+        Each request is a dict in one of two shapes:
+
+        - ``{"messages": [...], "images": [PIL.Image, ...]}`` (or
+          ``{"text": ..., "images": [...]}``): processed through the model's
+          processor; vision placeholders are expanded exactly like
+          ``generate_multimodal``.
+        - ``{"input_ids": [...]}``: pre-tokenized text; the tokenizer is
+          bypassed so the caller owns the exact encoding.
+
+        Result order equals request order. Returned contract matches
+        ``prefill_last_logits``.
+        """
+        if not requests:
+            raise ValueError("requests must be nonempty")
+        if len(requests) != len(candidate_token_ids):
+            raise ValueError(
+                f"requests ({len(requests)}) and candidate_token_ids "
+                f"({len(candidate_token_ids)}) must have equal length"
+            )
+        vocab_size = self._vocab_size()
+        self._validate_candidates(candidate_token_ids, vocab_size)
+
+        encoded: list[list[int] | None] = [None] * len(requests)
+        per_request_pixel_values: list = [None] * len(requests)
+        per_request_image_grid_thw: list = [None] * len(requests)
+
+        mm_requests = []
+        mm_positions = []
+        for i, request in enumerate(requests):
+            if not isinstance(request, dict):
+                raise TypeError("Each request must be a dict")
+            if "input_ids" in request:
+                ids = list(request["input_ids"])
+                if not ids:
+                    raise ValueError("A request has empty input_ids")
+                encoded[i] = ids
+            elif "messages" in request or "text" in request or "images" in request:
+                mm_requests.append(request)
+                mm_positions.append(i)
+            else:
+                raise ValueError(
+                    "Each request must contain 'input_ids' or "
+                    "'messages'/'text'/'images'"
+                )
+
+        if mm_requests:
+            processor = self._get_processor()
+            (
+                _,
+                mm_input_ids,
+                mm_pixel_values,
+                mm_image_grid_thw,
+            ) = self._prepare_multimodal_batch(mm_requests, processor)
+            for j, i in enumerate(mm_positions):
+                ids = mm_input_ids[j]
+                if not ids:
+                    raise ValueError("A multimodal request produced empty input_ids")
+                thw = mm_image_grid_thw[j]
+                if thw is not None:
+                    thw_2d = thw.squeeze(0) if thw.dim() == 3 else thw
+                    expanded, _, _ = self._expand_vision_placeholders(ids, thw_2d)
+                    ids = expanded
+                encoded[i] = ids
+                per_request_pixel_values[i] = mm_pixel_values[j]
+                per_request_image_grid_thw[i] = thw
+
+        # Merge per-request vision tensors in request order. Qwen-VL style
+        # pixel_values are [total_patches, hidden]; concatenating along dim 0
+        # reproduces the processor's original batch layout, which is what
+        # _build_vision_placeholders expects (it assigns images to sequences
+        # by scanning placeholder tokens).
+        pixel_values_batch = None
+        pv_parts = [pv for pv in per_request_pixel_values if pv is not None]
+        if pv_parts:
+            if not all(isinstance(pv, torch.Tensor) for pv in pv_parts):
+                raise NotImplementedError(
+                    "list-style pixel_values (e.g. LlavaNext) are not "
+                    "supported by prefill_last_logits_multimodal"
+                )
+            pixel_values_batch = torch.cat(pv_parts, dim=0)
+        image_grid_thw_batch = None
+        thw_parts = [
+            (t.squeeze(0) if t.dim() == 3 else t)
+            for t in per_request_image_grid_thw
+            if t is not None
+        ]
+        if thw_parts:
+            image_grid_thw_batch = torch.cat(thw_parts, dim=0)
+
+        # Left-padded batch assembly, identical to prefill_last_logits.
+        max_len = max(len(ids) for ids in encoded)
+        max_cand = max(len(cands) for cands in candidate_token_ids)
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = 0
+
+        input_ids = torch.full((len(requests), max_len), pad_id, dtype=torch.int64)
+        attention_mask = torch.zeros((len(requests), max_len), dtype=torch.int64)
+        candidate_mask = torch.zeros(
+            (len(candidate_token_ids), max_cand), dtype=torch.bool
+        )
+        candidate_ids = torch.zeros(
+            (len(candidate_token_ids), max_cand), dtype=torch.int64
+        )
+        for i, (ids, cands) in enumerate(zip(encoded, candidate_token_ids)):
+            # Left padding: real tokens at the end, pad at the start.
+            input_ids[i, max_len - len(ids):] = torch.tensor(ids, dtype=torch.int64)
+            attention_mask[i, max_len - len(ids):] = 1
+            candidate_ids[i, : len(cands)] = torch.tensor(cands, dtype=torch.int64)
+            candidate_mask[i, : len(cands)] = True
+
+        seq_ids = self._next_last_logits_seq_ids(len(requests))
+        gathered = self.model_runner.call(
+            "last_logits",
+            input_ids,
+            None,  # positions: last_logits derives per-sequence positions
+            attention_mask,
+            candidate_ids,
+            seq_ids,
+            pixel_values=pixel_values_batch,
+            image_grid_thw=image_grid_thw_batch,
+        )
+
+        return {
+            "logits": gathered,
+            "candidate_mask": candidate_mask,
+            "candidate_token_ids": [list(c) for c in candidate_token_ids],
+            "sequence_lengths": [len(ids) for ids in encoded],
+            "model": self.config.model,
+            "revision": self.config.model_revision,
+            "dtype": str(next(self.model_runner.model.parameters()).dtype),
+            "backend": "nanovllm",
+        }

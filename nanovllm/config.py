@@ -4,11 +4,13 @@ from dataclasses import dataclass, field
 from transformers import AutoConfig
 
 
-def _resolve_model_path(model: str, trust_remote_code: bool) -> str:
+def _resolve_model_path(model: str, trust_remote_code: bool, revision: str | None = None) -> str:
     """Return a local directory for `model`, downloading from the Hub if needed.
 
     Accepting Hub ids keeps the documented ``LLM("Qwen/Qwen3-0.6B")`` usage
-    working instead of failing on a local-directory assertion.
+    working instead of failing on a local-directory assertion. Pass
+    ``revision`` to pin a Hub commit; ``None`` keeps the legacy
+    latest-available behaviour.
     """
     if os.path.isdir(model):
         return model
@@ -20,7 +22,7 @@ def _resolve_model_path(model: str, trust_remote_code: bool) -> str:
             f"is not installed, so it cannot be downloaded. Install "
             f"huggingface_hub or pass a local path."
         ) from exc
-    return snapshot_download(model)
+    return snapshot_download(model, revision=revision)
 
 
 @dataclass
@@ -49,6 +51,7 @@ class Config:
     max_tokens_hint: int | None = None  # Longest generation you intend to request
     max_prefill_batch_size: int = 1024  # Max batch size for prefill-only mode
     trust_remote_code: bool = False  # Trust remote code for custom models
+    revision: str | None = None  # Pin a Hub commit; local paths record it as a manifest label
     hf_config: AutoConfig | None = None
     eos: int | list[int] = -1
     kvcache_block_size: int = 256
@@ -65,10 +68,14 @@ class Config:
                 "tensor_parallel_size must be between 1 and 8, got "
                 f"{self.tensor_parallel_size}"
             )
-        self.model = _resolve_model_path(self.model, self.trust_remote_code)
+        self._original_model = self.model
+        self.model = _resolve_model_path(
+            self.model, self.trust_remote_code, self.revision
+        )
         self.hf_config = AutoConfig.from_pretrained(
             self.model, trust_remote_code=self.trust_remote_code
         )
+        self.model_revision = self._resolve_model_revision()
 
         # Multimodal models (e.g. Qwen3-VL) store the text settings in
         # hf_config.text_config.
@@ -102,6 +109,27 @@ class Config:
             # A caller that only ever asks for one token also never decodes, so
             # the KV cache can be skipped entirely.
             self.prefill_only_mode = self.max_tokens_hint == 1
+
+    def _resolve_model_revision(self) -> str | None:
+        """Audit label for the exact weights in use.
+
+        Local directories keep the caller-supplied revision string (a
+        manifest label). Hub downloads resolve the cached commit hash so a
+        floating ``revision=None`` still records what actually loaded.
+        """
+        if os.path.isdir(self._original_model):
+            return self.revision
+        try:
+            from huggingface_hub import snapshot_download
+            path = snapshot_download(
+                self._original_model, revision=self.revision
+            )
+            commit = os.path.basename(path)
+            if len(commit) == 40 and all(c in "0123456789abcdef" for c in commit):
+                return commit
+        except Exception:
+            pass
+        return self.revision
 
     def _resolve_multimodal(self):
         """Auto-detect multimodal support unless the caller was explicit.

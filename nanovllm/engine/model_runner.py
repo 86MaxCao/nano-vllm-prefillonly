@@ -1628,6 +1628,117 @@ class ModelRunner:
         finally:
             reset_context()
 
+    @torch.inference_mode()
+    def last_logits(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        candidate_token_ids: torch.Tensor,
+        seq_ids: list[int],
+        pixel_values: torch.Tensor | None = None,
+        image_grid_thw: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Deterministic last-position candidate logits, no sampling.
+
+        One batched prefill over a left-padded batch; computes full-vocabulary
+        logits for the last real token of each sequence, then gathers the
+        requested candidate columns on the GPU and returns them as a CPU
+        float32 tensor of shape [batch, num_candidates]. Row order equals
+        input order. GDN models get per-sequence state isolation via
+        ``sequence_ids``; states are released in a finally block either way.
+
+        ``attention_mask`` carries the per-sequence lengths; when it is None,
+        every row is assumed full-length and ``positions`` must be a
+        [batch, seq] grid.
+        """
+        from nanovllm.utils.context import set_context, reset_context
+
+        model_device = next(self.model.parameters()).device
+        input_ids = input_ids.to(model_device)
+        if positions is not None:
+            positions = positions.to(model_device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(model_device)
+        candidate_token_ids = candidate_token_ids.to(model_device)
+        if pixel_values is not None:
+            pixel_values = pixel_values.to(model_device)
+        if image_grid_thw is not None:
+            image_grid_thw = image_grid_thw.to(model_device)
+
+        if attention_mask is None and positions is None:
+            raise ValueError(
+                "last_logits requires attention_mask (per-sequence lengths) "
+                "or an explicit [batch, seq] positions grid"
+            )
+
+        batch_size = input_ids.shape[0]
+        if attention_mask is not None:
+            seq_lens = attention_mask.sum(dim=1).cpu().tolist()
+        else:
+            seq_lens = [input_ids.shape[1]] * batch_size
+
+        cu_seqlens = torch.zeros(batch_size + 1, dtype=torch.int32, device=model_device)
+        cu_seqlens[1:] = torch.cumsum(
+            torch.tensor(seq_lens, dtype=torch.int32, device=model_device), dim=0
+        )
+        max_seqlen = max(seq_lens) if seq_lens else input_ids.shape[1]
+
+        if attention_mask is not None:
+            mask = attention_mask.bool()
+            input_ids_flat = input_ids[mask]
+            # Per-sequence positions [0..len_i-1]; positions[mask] would be
+            # offset by the left padding.
+            positions_flat = torch.cat([
+                torch.arange(sl, dtype=torch.int64, device=input_ids.device)
+                for sl in seq_lens
+            ])
+        else:
+            input_ids_flat = input_ids.flatten()
+            positions_flat = positions.flatten()
+
+        slot_mapping = torch.empty(0, dtype=torch.int32, device=model_device)
+        set_context(
+            True,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            slot_mapping=slot_mapping,
+        )
+        try:
+            model_kwargs: dict = {}
+            # GDN models: always pass per-sequence ids, including batch=1.
+            # Otherwise the single-sequence path caches state under the None
+            # key, which cleanup_seq_states cannot release — the next call
+            # would silently reuse the previous sequence's recurrent state.
+            if self._gdn_layers:
+                model_kwargs["sequence_lengths"] = seq_lens
+                model_kwargs["sequence_ids"] = seq_ids
+            if pixel_values is not None:
+                seq_image_indices, seq_vision_placeholders = (
+                    self._build_vision_placeholders(
+                        input_ids, attention_mask, image_grid_thw, batch_size
+                    )
+                )
+                model_kwargs["sequence_lengths"] = seq_lens
+                model_kwargs.update({
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": image_grid_thw,
+                    "seq_image_indices": seq_image_indices,
+                    "seq_vision_placeholders": seq_vision_placeholders,
+                })
+            hidden = self.model(input_ids_flat, positions_flat, **model_kwargs)
+            last_hidden = self._select_last_tokens(hidden)
+            logits = self.model.compute_logits(last_hidden)  # [batch, vocab]
+            if self.rank != 0:
+                return None
+            gathered = logits.gather(1, candidate_token_ids)
+            return gathered.to("cpu", torch.float32)
+        finally:
+            reset_context()
+            self.cleanup_seq_states(seq_ids)
+
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         """Run model forward pass for generation.
         
