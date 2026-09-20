@@ -427,12 +427,16 @@ def test_batch_invariance_for_embeddings():
 
 
 def test_kv_cache_is_not_allocated_for_single_token_generation():
-    """The headline memory claim: no KV cache for prefill-only workloads."""
+    """The headline memory claim: no KV cache for prefill-only workloads.
+
+    prefill_only_mode is auto-enabled by max_tokens_hint=1; without the hint
+    the engine allocates a KV cache and the no-cache assertion would fail.
+    """
     requires_cuda()
     from nanovllm import LLM, SamplingParams
 
     path = model_path("qwen3")
-    llm = LLM(path, enforce_eager=True)
+    llm = LLM(path, enforce_eager=True, max_tokens_hint=1)
     try:
         assert llm.model_runner.kv_cache is None
         assert llm.model_runner.config.num_kvcache_blocks == 0
@@ -440,6 +444,20 @@ def test_kv_cache_is_not_allocated_for_single_token_generation():
             PROMPTS, SamplingParams(temperature=0.0, max_tokens=1)
         )
         assert len(out) == len(PROMPTS)
+    finally:
+        llm.exit()
+
+
+def test_kv_cache_is_allocated_without_single_token_hint():
+    """Without max_tokens_hint=1 the engine must keep full decode capability."""
+    requires_cuda()
+    from nanovllm import LLM
+
+    path = model_path("qwen3")
+    llm = LLM(path, enforce_eager=True)
+    try:
+        assert llm.model_runner.kv_cache is not None
+        assert llm.model_runner.config.num_kvcache_blocks > 0
     finally:
         llm.exit()
 

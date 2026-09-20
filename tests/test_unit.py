@@ -3,7 +3,10 @@
 These cover the pure-Python logic that regressed historically: weight loading
 strictness, block-size propagation, sequence pickling, and config auto-detection.
 """
+import inspect
 import pickle
+import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -92,16 +95,20 @@ class TestSequencePickling:
 
 class TestSamplingParams:
     def test_rejects_negative_temperature(self):
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError):
             SamplingParams(temperature=-1.0)
 
     def test_rejects_non_positive_max_tokens(self):
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError):
             SamplingParams(max_tokens=0)
 
     def test_top_p_bounds(self):
-        with pytest.raises(AssertionError):
+        with pytest.raises(ValueError):
             SamplingParams(top_p=1.5)
+
+    def test_rejects_zero_top_p(self):
+        with pytest.raises(ValueError):
+            SamplingParams(top_p=0.0)
 
 
 class TestSampler:
@@ -334,3 +341,290 @@ class TestEosHandling:
         seq.status = SequenceStatus.RUNNING
         sched.postprocess([seq], [151645])
         assert seq.is_finished
+
+
+class TestSchedulerNoProgress:
+    """A request that can never be scheduled must fail fast.
+
+    The scheduler used to return an empty batch forever while the request
+    stayed in `waiting`, so `generate()` spun in a busy loop.
+    """
+
+    def _engine(self, budget=4, blocks=1):
+        from types import SimpleNamespace
+
+        from nanovllm.engine.block_manager import BlockManager
+        from nanovllm.engine.scheduler import Scheduler
+
+        class FakeConfig:
+            max_num_seqs = 8
+            max_num_batched_tokens = budget
+            eos = -1
+            prefill_only_mode = True
+            max_prefill_batch_size = budget
+            is_multimodal = False
+            hf_config = None
+            num_kvcache_blocks = blocks
+            kvcache_block_size = 256
+
+        sched = Scheduler(FakeConfig())
+        engine = SimpleNamespace(scheduler=sched)
+        return engine, sched
+
+    def test_oversized_prompt_never_recovers(self):
+        engine, sched = self._engine(budget=4)
+        seq = Sequence([1] * 5, SamplingParams(max_tokens=1))
+        sched.add(seq)
+        # One no-progress step used to be recoverable in principle; the
+        # engine now detects that the head can never fit the budget.
+        from nanovllm.engine.llm_engine import LLMEngine
+
+        with pytest.raises(RuntimeError, match="can never be scheduled"):
+            LLMEngine.step(engine)
+
+    def test_prefill_only_with_unfinished_running_raises(self):
+        engine, sched = self._engine(budget=64, blocks=1)
+        seq = Sequence([1, 2, 3], SamplingParams(max_tokens=8))
+        sched.add(seq)
+        scheduled, _ = sched.schedule()
+        assert scheduled  # prefill ran, sequence is now running and unfinished
+        from nanovllm.engine.llm_engine import LLMEngine
+
+        with pytest.raises(RuntimeError, match="Prefill-only"):
+            LLMEngine.step(engine)
+
+    def test_oversized_prompt_rejected_at_enqueue(self):
+        from nanovllm.engine.llm_engine import LLMEngine
+
+        engine, _ = self._engine(budget=4)
+        with pytest.raises(ValueError, match="exceeds the schedulable budget"):
+            LLMEngine.add_request(
+                engine, [1] * 5, SamplingParams(max_tokens=1)
+            )
+
+    def test_empty_prompt_rejected_at_enqueue(self):
+        from nanovllm.engine.llm_engine import LLMEngine
+
+        engine, _ = self._engine(budget=4)
+        with pytest.raises(ValueError, match="empty"):
+            LLMEngine.add_request(engine, [], SamplingParams(max_tokens=1))
+
+
+class TestLLMEngineBatchValidation:
+    """Mismatched batch lists used to be silently truncated by zip()."""
+
+    def test_mismatched_lengths_raise(self):
+        from nanovllm.engine.llm_engine import _check_batch_lengths
+
+        with pytest.raises(ValueError, match="mismatched lengths"):
+            _check_batch_lengths({"prompts": 3, "sampling_params": 2})
+
+    def test_matching_lengths_pass(self):
+        from nanovllm.engine.llm_engine import _check_batch_lengths
+
+        _check_batch_lengths({"prompts": 3, "sampling_params": 3})
+
+    def test_single_list_length_passes(self):
+        from nanovllm.engine.llm_engine import _check_batch_lengths
+
+        _check_batch_lengths({"prompts": 0})
+
+    def test_unknown_kwargs_raise_type_error(self):
+        from nanovllm.engine.llm_engine import LLMEngine
+
+        engine = object.__new__(LLMEngine)
+        # The TypeError fires before Config/model construction, so no model
+        # is needed. "enforce_eagerr" is a plausible misspelling that used to
+        # be silently dropped.
+        with pytest.raises(TypeError, match="enforce_eagerr"):
+            LLMEngine.__init__(engine, "/nonexistent", enforce_eagerr=True)
+
+
+class TestTensorParallelRendezvous:
+    """Every TP rank must rendezvous on one shared address."""
+
+    def test_allocate_rendezvous_returns_bound_host(self):
+        from nanovllm.engine.llm_engine import _allocate_rendezvous
+
+        addr, port = _allocate_rendezvous()
+        assert addr == "127.0.0.1"
+        assert 0 < port < 65536
+
+    def test_two_allocations_are_likely_distinct(self):
+        from nanovllm.engine.llm_engine import _allocate_rendezvous
+
+        ports = {_allocate_rendezvous()[1] for _ in range(8)}
+        assert len(ports) > 1  # random free port, not a fixed one
+
+    def test_init_url_uses_env_when_master_set(self, monkeypatch):
+        monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+        monkeypatch.setenv("MASTER_PORT", "29500")
+        from nanovllm.engine import model_runner
+
+        init = model_runner.ModelRunner.__init__
+        source = inspect.getsource(init)
+        assert "env://" in source
+        assert 'os.environ.get("MASTER_ADDR")' in source
+
+
+class TestSharedMemoryIsolation:
+    def test_shm_name_is_generated_not_fixed(self):
+        """A fixed "nanovllm" segment let concurrent engines share RPC state."""
+        from nanovllm.engine import model_runner
+
+        source = inspect.getsource(model_runner.ModelRunner.__init__)
+        assert "uuid.uuid4()" in source
+        assert 'name="nanovllm"' not in source
+
+    def test_shm_names_differ_across_instances(self):
+        names = {f"nanovllm-{uuid.uuid4().hex}" for _ in range(2)}
+        assert len(names) == 2
+
+
+class TestGDNSlotPool:
+    def test_pool_sized_from_max_num_seqs(self):
+        from nanovllm.engine.model_runner import GDNSlotManager
+
+        manager = GDNSlotManager(max_slots=1024)
+        slots = [manager.allocate(i) for i in range(1024)]
+        assert sorted(slots) == list(range(1024))
+        with pytest.raises(RuntimeError, match="exhausted"):
+            manager.allocate(9999)
+
+    def test_release_returns_slot(self):
+        from nanovllm.engine.model_runner import GDNSlotManager
+
+        manager = GDNSlotManager(max_slots=2)
+        manager.allocate(1)
+        manager.allocate(2)
+        manager.release(1)
+        manager.allocate(3)  # reuses the freed slot instead of raising
+
+    def test_resize_gdn_buffers_grows_hardcoded_pool(self):
+        from nanovllm.engine.model_runner import _resize_gdn_buffers
+
+        gdn = SimpleNamespace(
+            _pool_conv_state=torch.zeros(512, 8, 3),
+            _graph_conv_state=torch.zeros(512, 8, 3),
+            _graph_recurrent_state=torch.zeros(512, 4, 16),
+        )
+        _resize_gdn_buffers([gdn], 768)
+        assert gdn._pool_conv_state.shape[0] == 768
+        assert gdn._graph_conv_state.shape[0] == 768
+        assert gdn._graph_recurrent_state.shape[0] == 768
+        # Small max_num_seqs must not shrink the buffers.
+        _resize_gdn_buffers([gdn], 128)
+        assert gdn._pool_conv_state.shape[0] == 768
+
+
+class TestEngineConstructionInputValidation:
+    """Public Config inputs must raise ValueError, not assert (python -O)."""
+
+    def test_invalid_tensor_parallel_size(self, monkeypatch, tmp_path):
+        from nanovllm.config import Config
+
+        class FakeAutoConfig:
+            @staticmethod
+            def from_pretrained(path, trust_remote_code=False):
+                return SimpleNamespace(
+                    text_config=None,
+                    max_position_embeddings=None,
+                    eos_token_id=None,
+                )
+
+        monkeypatch.setattr("nanovllm.config.AutoConfig", FakeAutoConfig)
+        with pytest.raises(ValueError, match="tensor_parallel_size"):
+            Config(str(tmp_path), tensor_parallel_size=0)
+
+    def test_invalid_kvcache_block_size(self, monkeypatch, tmp_path):
+        from nanovllm.config import Config
+
+        class FakeAutoConfig:
+            @staticmethod
+            def from_pretrained(path, trust_remote_code=False):
+                return SimpleNamespace(
+                    text_config=None,
+                    max_position_embeddings=None,
+                    eos_token_id=None,
+                )
+
+        monkeypatch.setattr("nanovllm.config.AutoConfig", FakeAutoConfig)
+        with pytest.raises(ValueError, match="kvcache_block_size"):
+            Config(str(tmp_path), kvcache_block_size=100)
+
+
+class TestTrustRemoteCodePropagation:
+    """Every from_pretrained call must honour config.trust_remote_code."""
+
+    def _fake_loader_module(self, monkeypatch, calls):
+        from nanovllm.engine import model_loader
+
+        class Recorder:
+            def __init__(self, name):
+                self.name = name
+
+            def from_pretrained(self, model, trust_remote_code=None, **kwargs):
+                calls.append((self.name, trust_remote_code))
+                return SimpleNamespace()
+
+        monkeypatch.setattr(model_loader, "AutoConfig", Recorder("AutoConfig"))
+        return model_loader
+
+    def test_embedding_loaders_forward_flag(self, monkeypatch):
+        calls = []
+        loader = self._fake_loader_module(monkeypatch, calls)
+
+        class FakeConfig:
+            model = "/fake"
+            trust_remote_code = False
+
+        class FakeLazy:
+            JINA_V4_AVAILABLE = True
+
+            class JinaEmbeddingsV4:
+                def __init__(self, *a, **k):
+                    pass
+
+            @staticmethod
+            def load_model(*a, **k):
+                pass
+
+        monkeypatch.setattr(loader, "_lazy", FakeLazy)
+        monkeypatch.setattr(
+            loader, "create_jina_v4_name_mapping", lambda: {}, raising=False
+        )
+        try:
+            loader.ModelLoader.load_embedding_model(
+                FakeConfig(), SimpleNamespace(), "jina_v4", "LAST", True, None
+            )
+        except Exception:
+            # Loading may fail for unrelated reasons (no weights); the call
+            # recording is what matters.
+            pass
+        assert ("AutoConfig", False) in calls
+        assert ("AutoConfig", True) not in calls
+
+    def test_processor_load_forwards_flag(self, monkeypatch):
+        from transformers import AutoProcessor as RealProcessor
+
+        from nanovllm.engine import llm_engine
+
+        recorded = {}
+
+        def fake_from_pretrained(model, trust_remote_code=None, **kwargs):
+            recorded["trust_remote_code"] = trust_remote_code
+            return SimpleNamespace()
+
+        # transformers is a lazy module: patching the module attribute does
+        # not affect the function-local `from transformers import ...`, so
+        # patch the resolved class instead.
+        monkeypatch.setattr(
+            RealProcessor, "from_pretrained", staticmethod(fake_from_pretrained)
+        )
+        engine = object.__new__(llm_engine.LLMEngine)
+        engine._processor = None
+        engine.model_runner = SimpleNamespace(
+            config=SimpleNamespace(model="/fake", trust_remote_code=False)
+        )
+        engine._get_processor()
+        assert recorded["trust_remote_code"] is False

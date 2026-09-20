@@ -1,5 +1,9 @@
 import logging
+import os
 import pickle
+import uuid
+from datetime import timedelta
+
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -57,6 +61,31 @@ class GDNSlotManager:
             self._free_slots.append(slot)
 
 
+def _resize_gdn_buffers(gdn_layers: list, max_num_seqs: int) -> None:
+    """Grow GDN pool buffers whose hardcoded 512 rows cannot hold max_num_seqs.
+
+    Buffers are fresh zeros at this point (before warmup/capture), so
+    reallocation loses nothing; assignment keeps them registered buffers.
+    """
+    for gdn in gdn_layers:
+        for name in (
+            "_pool_conv_state",
+            "_graph_conv_state",
+            "_graph_recurrent_state",
+        ):
+            buf = getattr(gdn, name, None)
+            if buf is not None and buf.shape[0] < max_num_seqs:
+                setattr(
+                    gdn,
+                    name,
+                    torch.zeros(
+                        (max_num_seqs, *buf.shape[1:]),
+                        dtype=buf.dtype,
+                        device=buf.device,
+                    ),
+                )
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -80,19 +109,31 @@ class ModelRunner:
         # Check if process group is already initialized
         if not dist.is_initialized():
             # Always initialize process group (even for world_size=1) because
-            # code components like VocabParallelEmbedding call dist.get_rank()
-            # Use socket-based port allocation to avoid conflicts
-            import socket
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.bind(('', 0))
-            port = sock.getsockname()[1]
-            sock.close()
-            dist.init_process_group(
-                "nccl",
-                f"tcp://localhost:{port}",
-                world_size=self.world_size,
-                rank=rank,
-            )
+            # code components like VocabParallelEmbedding call dist.get_rank().
+            if self.world_size > 1:
+                # All ranks must join the *same* store. The parent process
+                # picked MASTER_ADDR/MASTER_PORT once; per-rank random ports
+                # used to create unrelated stores and deadlock initialization.
+                if os.environ.get("MASTER_ADDR") and os.environ.get("MASTER_PORT"):
+                    init_url = "env://"
+                else:
+                    # Fallback when spawned outside LLMEngine (e.g. torchrun):
+                    # derive one deterministic address per config.
+                    master_port = 29500 + (rank % 1000)
+                    init_url = f"tcp://127.0.0.1:{master_port}"
+                dist.init_process_group(
+                    "nccl",
+                    init_url,
+                    world_size=self.world_size,
+                    rank=rank,
+                    timeout=timedelta(minutes=10),
+                )
+            else:
+                # Single rank: a private store is fine.
+                init_url = "tcp://127.0.0.1:0"
+                dist.init_process_group(
+                    "nccl", init_url, world_size=1, rank=0
+                )
         elif self.world_size > 1:
             # If already initialized, verify it matches our requirements
             current_world_size = dist.get_world_size()
@@ -202,8 +243,14 @@ class ModelRunner:
                 for layer in self.model.language_model.model.layers:
                     if hasattr(layer, 'linear_attn') and layer.linear_attn is not None:
                         self._gdn_layers.append(layer.linear_attn)
-            self._gdn_slot_manager = GDNSlotManager(max_slots=512)
-            self._gdn_slot_tensor = torch.zeros(512, dtype=torch.int64, device="cuda")
+            # GDN slot pool must cover the configured batch; a hardcoded 512
+            # used to exhaust (and crash) when max_num_seqs > 512.
+            _resize_gdn_buffers(self._gdn_layers, config.max_num_seqs)
+            gdn_slots = max(config.max_num_seqs, 1)
+            self._gdn_slot_manager = GDNSlotManager(max_slots=gdn_slots)
+            self._gdn_slot_tensor = torch.zeros(
+                gdn_slots, dtype=torch.int64, device="cuda"
+            )
         
             self.warmup_model()
             # Reset GatedDeltaNet states after warmup to avoid polluting real sequences
@@ -219,22 +266,21 @@ class ModelRunner:
             torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
+            # A unique per-instance name: a fixed "nanovllm" segment let two
+            # engines on one host read each other's RPC payloads.
+            self.shm_name = f"nanovllm-{uuid.uuid4().hex}"
             if rank == 0:
-                try:
-                    self.shm = SharedMemory(
-                        name="nanovllm",
-                        create=True,
-                        size=SHM_SIZE,
-                    )
-                except FileExistsError:
-                    # Shared memory already exists, try to open it
-                    self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(
+                    name=self.shm_name,
+                    create=True,
+                    size=SHM_SIZE,
+                )
                 if dist.is_initialized():
                     dist.barrier()
             else:
                 if dist.is_initialized():
                     dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(name=self.shm_name)
                 self.loop()
 
     def exit(self):

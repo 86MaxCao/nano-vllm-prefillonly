@@ -385,7 +385,7 @@ class ModelLoader:
             return model
 
         elif embedding_type == "qwen2_vl_gme" and _lazy.QWEN2VL_GME_AVAILABLE:
-            gme_config = _lazy.GmeQwen2VLConfig.from_pretrained(config.model, trust_remote_code=True)
+            gme_config = _lazy.GmeQwen2VLConfig.from_pretrained(config.model, trust_remote_code=config.trust_remote_code)
             model = _lazy.Qwen2VLGmeEmbedding(
                 gme_config,
                 pooling_type=pooling_type,
@@ -397,7 +397,7 @@ class ModelLoader:
             return model
 
         elif embedding_type == "jina_v4" and _lazy.JINA_V4_AVAILABLE:
-            jina_v4_config = AutoConfig.from_pretrained(config.model, trust_remote_code=True)
+            jina_v4_config = AutoConfig.from_pretrained(config.model, trust_remote_code=config.trust_remote_code)
             model = _lazy.JinaEmbeddingsV4(
                 jina_v4_config,
                 pooling_type=pooling_type,
@@ -411,7 +411,7 @@ class ModelLoader:
             return model
 
         elif embedding_type == "qwen3_vl" and _lazy.QWEN3_VL_EMBEDDING_AVAILABLE:
-            qwen3_vl_config = AutoConfig.from_pretrained(config.model, trust_remote_code=True)
+            qwen3_vl_config = AutoConfig.from_pretrained(config.model, trust_remote_code=config.trust_remote_code)
             embedding_model = _lazy.Qwen3VLEmbedding(
                 qwen3_vl_config,
                 pooling_type=pooling_type,
@@ -492,7 +492,7 @@ class ModelLoader:
             return model
 
         elif reranker_type == "jina_m0" and _lazy.JINA_M0_AVAILABLE:
-            jina_m0_config = AutoConfig.from_pretrained(config.model, trust_remote_code=True)
+            jina_m0_config = AutoConfig.from_pretrained(config.model, trust_remote_code=config.trust_remote_code)
             model = _lazy.JinaRerankerM0(jina_m0_config)
             if target_dtype is not None:
                 model = model.to(target_dtype)
@@ -503,7 +503,7 @@ class ModelLoader:
         elif reranker_type == "qwen3_vl" and _lazy.QWEN3_VL_RERANKER_AVAILABLE:
             is_original = True  # VL rerankers always use yes/no token logits
             classifier_tokens = getattr(config, "classifier_from_token", ["no", "yes"])
-            qwen3_vl_config = AutoConfig.from_pretrained(config.model, trust_remote_code=True)
+            qwen3_vl_config = AutoConfig.from_pretrained(config.model, trust_remote_code=config.trust_remote_code)
             model = _lazy.Qwen3VLReranker(
                 qwen3_vl_config,
                 is_original_reranker=is_original,
@@ -516,7 +516,7 @@ class ModelLoader:
 
             if is_original:
                 from transformers import AutoTokenizer
-                tokenizer = AutoTokenizer.from_pretrained(config.model, trust_remote_code=True)
+                tokenizer = AutoTokenizer.from_pretrained(config.model, trust_remote_code=config.trust_remote_code)
                 model.convert_from_original_reranker(tokenizer)
             return model
 

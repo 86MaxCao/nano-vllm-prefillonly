@@ -55,8 +55,16 @@ class Config:
     num_kvcache_blocks: int = -1
 
     def __post_init__(self):
-        assert self.kvcache_block_size % 256 == 0
-        assert 1 <= self.tensor_parallel_size <= 8
+        if self.kvcache_block_size <= 0 or self.kvcache_block_size % 256 != 0:
+            raise ValueError(
+                "kvcache_block_size must be a positive multiple of 256, got "
+                f"{self.kvcache_block_size}"
+            )
+        if not 1 <= self.tensor_parallel_size <= 8:
+            raise ValueError(
+                "tensor_parallel_size must be between 1 and 8, got "
+                f"{self.tensor_parallel_size}"
+            )
         self.model = _resolve_model_path(self.model, self.trust_remote_code)
         self.hf_config = AutoConfig.from_pretrained(
             self.model, trust_remote_code=self.trust_remote_code
@@ -77,7 +85,12 @@ class Config:
         if eos_token_id is not None:
             self.eos = eos_token_id
 
-        assert self.max_num_batched_tokens >= self.max_model_len
+        if self.max_num_batched_tokens < self.max_model_len:
+            raise ValueError(
+                f"max_num_batched_tokens ({self.max_num_batched_tokens}) must "
+                f"be >= max_model_len ({self.max_model_len}); otherwise a "
+                "max-length prompt could never be scheduled."
+            )
 
         self._resolve_multimodal()
 

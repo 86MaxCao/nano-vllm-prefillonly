@@ -1,4 +1,6 @@
 import atexit
+import os
+import socket
 from contextlib import contextmanager
 from dataclasses import fields, replace
 from time import perf_counter
@@ -15,22 +17,72 @@ from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
 
+def _allocate_rendezvous() -> tuple[str, int]:
+    """Pick the MASTER_ADDR/MASTER_PORT all ranks will rendezvous on.
+
+    Every rank must join the *same* process-group store; a per-rank random
+    port used to create N unrelated stores and deadlock initialization.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", 0))
+        return "127.0.0.1", sock.getsockname()[1]
+    finally:
+        sock.close()
+
+
+def _check_batch_lengths(lengths: dict[str, int]) -> None:
+    """Reject mismatched per-request lists instead of silently truncating.
+
+    `zip(prompts, sampling_params)` used to drop requests when one list was
+    shorter, returning a short batch that looked successful.
+    """
+    unique = set(lengths.values())
+    if len(unique) > 1:
+        details = ", ".join(f"{name}={n}" for name, n in lengths.items())
+        raise ValueError(
+            f"Batch inputs have mismatched lengths ({details}); requests "
+            "would be silently dropped."
+        )
+
+
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
-        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        config = Config(model, **config_kwargs)
+        unknown_kwargs = {k for k in kwargs if k not in config_fields}
+        if unknown_kwargs:
+            raise TypeError(
+                f"Unknown LLMEngine arguments: {sorted(unknown_kwargs)}. "
+                f"Valid arguments are: {sorted(config_fields)}."
+            )
+        config = Config(model, **kwargs)
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
+        if config.tensor_parallel_size > 1:
+            # One rendezvous address shared by every rank; per-rank random
+            # ports used to create unrelated stores and deadlock init.
+            master_addr, master_port = _allocate_rendezvous()
+            os.environ["MASTER_ADDR"] = master_addr
+            os.environ["MASTER_PORT"] = str(master_port)
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
             process.start()
             self.ps.append(process)
             self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+        try:
+            self.model_runner = ModelRunner(config, 0, self.events)
+        except Exception:
+            # Rank 0 failed after workers were spawned; without this cleanup
+            # the workers would block forever on their rendezvous/barrier.
+            for p in self.ps:
+                if p.is_alive():
+                    p.terminate()
+                p.join()
+            raise
         self.tokenizer = AutoTokenizer.from_pretrained(
             config.model,
             use_fast=True,
@@ -71,7 +123,8 @@ class LLMEngine:
         if self._processor is None:
             from transformers import AutoProcessor
             self._processor = AutoProcessor.from_pretrained(
-                self.model_runner.config.model, trust_remote_code=True
+                self.model_runner.config.model,
+                trust_remote_code=self.model_runner.config.trust_remote_code,
             )
         return self._processor
 
@@ -192,6 +245,14 @@ class LLMEngine:
     ):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        if not prompt:
+            raise ValueError("Prompt is empty after tokenization.")
+        if len(prompt) > self.scheduler.max_num_batched_tokens:
+            raise ValueError(
+                f"Prompt of {len(prompt)} tokens exceeds the schedulable "
+                f"budget of {self.scheduler.max_num_batched_tokens} tokens "
+                f"(max_num_batched_tokens); it can never be scheduled."
+            )
         seq = Sequence(
             prompt,
             sampling_params,
@@ -206,6 +267,35 @@ class LLMEngine:
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
         if not seqs:
+            sched = self.scheduler
+            # An empty decode batch after preemption is recoverable: the
+            # preempted sequences go back to waiting and prefill reschedules
+            # them next step. Only truly dead states raise.
+            if sched.prefill_only_mode and sched.running:
+                raise RuntimeError(
+                    "Prefill-only engine has unfinished sequences but never "
+                    "decodes; use max_tokens=1 (generate_single_token) or "
+                    "construct the engine without prefill_only_mode / with a "
+                    "larger max_tokens_hint."
+                )
+            head = sched.waiting[0] if sched.waiting else None
+            if (
+                head is not None
+                and not sched.running
+                and (
+                    len(head) > sched.max_num_batched_tokens
+                    or not sched.block_manager.can_allocate(head)
+                )
+            ):
+                raise RuntimeError(
+                    "Request can never be scheduled: the waiting head needs "
+                    f"{len(head)} tokens (budget "
+                    f"{sched.max_num_batched_tokens}) and "
+                    f"{head.num_blocks} KV blocks (free "
+                    f"{len(sched.block_manager.free_block_ids)}). "
+                    "Lower max_model_len or raise max_num_batched_tokens / "
+                    "gpu_memory_utilization."
+                )
             # Nothing runnable this step; the caller loops again once the
             # scheduler frees blocks or new requests arrive.
             return [], 0
@@ -244,6 +334,10 @@ class LLMEngine:
             )
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
+        else:
+            _check_batch_lengths(
+                {"prompts": len(prompts), "sampling_params": len(sampling_params)}
+            )
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
         outputs = {}
@@ -301,6 +395,10 @@ class LLMEngine:
 
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(requests)
+        else:
+            _check_batch_lengths(
+                {"requests": len(requests), "sampling_params": len(sampling_params)}
+            )
 
         # Phase 1: Extract text and images from all requests
         all_texts = []
@@ -1102,6 +1200,9 @@ class LLMEngine:
         if sampling_params is None:
             base_params = [SamplingParams(max_tokens=1)] * len(prompts)
         elif isinstance(sampling_params, list):
+            _check_batch_lengths(
+                {"prompts": len(prompts), "sampling_params": len(sampling_params)}
+            )
             base_params = sampling_params
         else:
             base_params = [sampling_params] * len(prompts)
@@ -1110,6 +1211,9 @@ class LLMEngine:
         params = [replace(sp, max_tokens=1) for sp in base_params]
 
         if images:
+            _check_batch_lengths(
+                {"prompts": len(prompts), "images": len(images)}
+            )
             # Images must go through the processor to become vision tokens;
             # add_request cannot do that on its own.
             requests = []

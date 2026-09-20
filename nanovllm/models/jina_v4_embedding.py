@@ -237,11 +237,11 @@ class JinaEmbeddingsV4(Qwen2_5_VLForConditionalGeneration):
         # Multi-vector embeddings can be added if needed
         return single_vec_emb
     
-    def set_processor(self, model_name: str):
+    def set_processor(self, model_name: str, trust_remote_code: bool = False):
         """Set the processor for data preprocessing."""
         from transformers import AutoProcessor
         self.processor = AutoProcessor.from_pretrained(
-            model_name, trust_remote_code=True, use_fast=True
+            model_name, trust_remote_code=trust_remote_code, use_fast=True
         )
         return self.processor
 
