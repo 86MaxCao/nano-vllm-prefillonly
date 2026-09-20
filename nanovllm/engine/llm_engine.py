@@ -1213,6 +1213,64 @@ class LLMEngine:
 
         return result
 
+    def rerank_ids(
+        self,
+        input_ids: list[list[int]],
+        pad_token_id: int | None = None,
+    ) -> torch.Tensor:
+        """Rerank pre-encoded prompts (prefill-only).
+
+        Args:
+            input_ids: One full-prompt token id list per pair. The prompt
+                template is the caller's responsibility; the engine skips
+                its built-in templates entirely.
+            pad_token_id: Left-padding id; defaults to the tokenizer's pad
+                token, falling back to eos.
+
+        Returns:
+            Scores tensor [batch_size] (pointwise rerankers).
+        """
+        if not self.model_runner.is_reranker:
+            msg = "Model is not configured for reranking. Set is_reranker=True."
+            raise ValueError(msg)
+        if not input_ids or any(not ids for ids in input_ids):
+            raise ValueError("input_ids must be a nonempty list of nonempty id lists")
+
+        pad = pad_token_id
+        if pad is None:
+            pad = self.tokenizer.pad_token_id
+        if pad is None:
+            pad = self.tokenizer.eos_token_id
+        if pad is None:
+            raise ValueError("rerank_ids requires pad_token_id or a tokenizer pad/eos token")
+
+        device = next(self.model_runner.model.parameters()).device
+        width = max(len(ids) for ids in input_ids)
+        input_ids_tensor = torch.tensor(
+            [[pad] * (width - len(ids)) + list(ids) for ids in input_ids],
+            dtype=torch.int64,
+            device=device,
+        )
+        attention_mask_tensor = torch.tensor(
+            [[0] * (width - len(ids)) + [1] * len(ids) for ids in input_ids],
+            dtype=torch.int64,
+            device=device,
+        )
+        batch_size = len(input_ids)
+        positions_tensor = torch.arange(width, dtype=torch.int64, device=device) \
+            .unsqueeze(0).expand(batch_size, -1)
+
+        return self.model_runner.call(
+            "rerank",
+            input_ids_tensor,
+            positions_tensor,
+            None,  # token_indices
+            attention_mask_tensor,
+            False,  # use_flex_attention
+            None,  # pixel_values
+            None,  # image_grid_thw
+        )
+
     def generate_single_token(
         self,
         prompts: list[str] | list[list[int]],

@@ -136,6 +136,70 @@ def test_reranker_ranks_consistently(model_key):
     assert scores[2] < scores[0] and scores[2] < scores[1], scores.tolist()
 
 
+@pytest.mark.parametrize("model_key", ["qwen3_reranker"])
+def test_rerank_ids_matches_rerank_batch(model_key):
+    """rerank_ids on caller-encoded prompts must reproduce rerank_batch."""
+    requires_cuda()
+    from transformers import AutoTokenizer
+
+    from nanovllm import LLM
+
+    path = model_path(model_key)
+    tok = AutoTokenizer.from_pretrained(path)
+    # Reproduce the engine's built-in qwen3 reranker template byte for byte.
+    texts = []
+    for query, doc in PAIRS:
+        messages = [
+            {
+                "role": "system",
+                "content": 'Judge whether the Document is relevant to the Query. Answer only "yes" or "no".',
+            },
+            {
+                "role": "user",
+                "content": f"<query>{query}</query>\n<document>{doc}</document>",
+            },
+        ]
+        texts.append(
+            tok.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        )
+    encoded = [tok.encode(t, add_special_tokens=False) for t in texts]
+
+    llm = LLM(path, is_reranker=True, reranker_type="qwen3", enforce_eager=True)
+    try:
+        batched = llm.rerank_batch(PAIRS)
+        from_ids = llm.rerank_ids(encoded)
+    finally:
+        llm.exit()
+
+    if isinstance(batched, tuple):
+        batched = batched[0]
+    batched = batched.float().cpu()
+    from_ids = from_ids.float().cpu()
+    assert from_ids.shape == batched.shape
+    torch.testing.assert_close(from_ids, batched, atol=0.02, rtol=0.02)
+    # The ranking contract still holds through the ids path.
+    assert from_ids[2] < from_ids[0] and from_ids[2] < from_ids[1], from_ids.tolist()
+
+
+def test_rerank_ids_input_validation():
+    """rerank_ids rejects empty input without touching CUDA (no model load)."""
+    pytest.importorskip("nanovllm")
+    from nanovllm.engine.llm_engine import LLMEngine
+
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.model_runner = type("R", (), {"is_reranker": False})()
+    with pytest.raises(ValueError, match="not configured for reranking"):
+        engine.rerank_ids([[1, 2, 3]])
+
+    engine.model_runner = type("R", (), {"is_reranker": True})()
+    with pytest.raises(ValueError, match="nonempty"):
+        engine.rerank_ids([])
+    with pytest.raises(ValueError, match="nonempty"):
+        engine.rerank_ids([[1, 2], []])
+
+
 @pytest.mark.parametrize("model_key", ["qwen3_vl", "qwen2_5_vl"])
 def test_multimodal_generation_matches_transformers(model_key):
     requires_cuda()
